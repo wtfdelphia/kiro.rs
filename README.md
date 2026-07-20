@@ -69,6 +69,7 @@
 - [模型映射](#模型映射)
 - [Admin（可选）](#admin可选)
 - [注意事项](#注意事项)
+- [SpecCoding / OpenSpec 工作流](#speccoding--openspec-工作流)
 - [项目结构](#项目结构)
 - [技术栈](#技术栈)
 - [License](#license)
@@ -469,6 +470,31 @@ Sonnet 5 的 thinking 行为与已知限制见 [docs/claude-sonnet-5.md](docs/cl
 1. **凭证安全**: 请妥善保管 `credentials.json` 文件，不要提交到版本控制
 2. **Token 刷新**: 服务会自动刷新过期的 Token，无需手动干预
 3. **WebSearch 工具**: 当 `tools` 列表仅包含一个 `web_search` 工具时，会走内置 WebSearch 转换逻辑
+
+
+## SpecCoding / OpenSpec 工作流
+
+本仓库的 AI 辅助开发入口以项目内规则为准：
+
+- [AGENTS.md](AGENTS.md)：Codex / 通用 Agent 主规则，包含 OpenSpec 条件、门禁 skill、验证纪律与安全要求
+- [CLAUDE.md](CLAUDE.md)：Claude Code 最小入口，指向同一套主规则
+- [spec/](spec/)：长期需求、设计、目录归属事实
+- [openspec/changes/<change-name>/](openspec/changes/)：单次变更 proposal / design / tasks / specs / evidence
+- [docs/tooling-sources.md](docs/tooling-sources.md)：OpenSpec、CodeGraph、rg、Node、Rust、pnpm 等工具来源与核验版本
+- [docs/AI 辅助开发工程化落地白皮书.md](docs/AI%20辅助开发工程化落地白皮书.md)：本次工程化落地参考
+
+推荐闭环：
+
+```text
+openspec new change / 补齐工件
+  -> openspec-superpowers-bridge（Bridge Plan）
+  -> 小步实现并更新 tasks.md
+  -> spec-compliance-check
+  -> openspec-verify-change
+  -> README/AGENTS/spec 同步判断
+  -> verification-before-completion
+  -> openspec archive（人工确认后）
+```
 
 ## 项目结构
 

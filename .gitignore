@@ -1,6 +1,4 @@
 /target
-/CLAUDE.md
-/AGENTS.md
 /config.json
 /credentials.json
 /.idea
@@ -11,3 +9,9 @@
 /credentials.*
 /kiro_balance_cache.json
 /kiro_stats.json
+
+# AI engineering local caches / isolation
+.codegraph/
+.worktrees/
+.claude/settings.local.json
+*.log
