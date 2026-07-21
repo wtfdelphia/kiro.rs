@@ -10,7 +10,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
-import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
+import { getCredentialBalance, getCredentials, setCredentialDisabled } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 
 interface KamImportDialogProps {
@@ -29,6 +29,8 @@ interface KamAccount {
     clientSecret?: string
     region?: string
     authMethod?: string
+    provider?: string
+    profileArn?: string
     startUrl?: string
   }
   machineId?: string
@@ -37,11 +39,14 @@ interface KamAccount {
 
 interface VerificationResult {
   index: number
-  status: 'pending' | 'checking' | 'verifying' | 'verified' | 'duplicate' | 'failed' | 'skipped'
+  status: 'pending' | 'checking' | 'verifying' | 'verified' | 'verified_warn' | 'duplicate' | 'failed' | 'skipped'
   error?: string
   usage?: string
   email?: string
   credentialId?: number
+  hasProfileArn?: boolean
+  provider?: string | null
+  profileWarning?: string
   rollbackStatus?: 'success' | 'failed' | 'skipped'
   rollbackError?: string
 }
@@ -69,6 +74,8 @@ function normalizeKamAccount(item: unknown): unknown {
     const clientSecret = typeof obj.clientSecret === 'string' ? obj.clientSecret : undefined
     const region = typeof obj.region === 'string' ? obj.region : undefined
     const authMethod = typeof obj.authMethod === 'string' ? obj.authMethod : undefined
+    const provider = typeof obj.provider === 'string' ? obj.provider : undefined
+    const profileArn = typeof obj.profileArn === 'string' ? obj.profileArn : undefined
     const startUrl = typeof obj.startUrl === 'string' ? obj.startUrl : undefined
 
     return {
@@ -83,6 +90,8 @@ function normalizeKamAccount(item: unknown): unknown {
         clientSecret,
         region,
         authMethod,
+        provider,
+        profileArn,
         startUrl,
       },
     }
@@ -274,9 +283,14 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
           }
 
+          const provider =
+            cred.provider?.trim() ||
+            (authMethod === 'idc' ? 'BuilderId' : undefined)
           const addedCred = await addCredential({
             refreshToken: token,
             authMethod,
+            provider,
+            profileArn: cred.profileArn?.trim() || undefined,
             authRegion: cred.region?.trim() || undefined,
             clientId,
             clientSecret,
@@ -289,17 +303,40 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
           const balance = await getCredentialBalance(addedCred.credentialId)
 
+          // Balance success alone is not full health: surface missing profileArn
+          let hasProfileArn = false
+          let providerName: string | null | undefined = provider
+          try {
+            const latest = await getCredentials()
+            const item = latest.credentials.find(c => c.id === addedCred.credentialId)
+            hasProfileArn = !!item?.hasProfileArn
+            providerName = item?.provider ?? provider
+          } catch {
+            // keep defaults; do not fail import on status fetch
+          }
+
+          const profileWarning = hasProfileArn
+            ? undefined
+            : '余额可用，但 profileArn 未解析；对话可能仍 403，请强制刷新或检查 provider/凭证'
+
           successCount++
           existingTokenHashes.add(tokenHash)
-          setCurrentProcessing(`验活成功: ${addedCred.email || account.email || `账号 ${i + 1}`}`)
+          setCurrentProcessing(
+            hasProfileArn
+              ? `验活成功: ${addedCred.email || account.email || `账号 ${i + 1}`}`
+              : `验活警告: ${addedCred.email || account.email || `账号 ${i + 1}`}（缺 profileArn）`
+          )
           setResults(prev => {
             const next = [...prev]
             next[i] = {
               ...next[i],
-              status: 'verified',
+              status: hasProfileArn ? 'verified' : 'verified_warn',
               usage: `${balance.currentUsage}/${balance.usageLimit}`,
               email: addedCred.email || account.email,
               credentialId: addedCred.credentialId,
+              hasProfileArn,
+              provider: providerName,
+              profileWarning,
             }
             return next
           })
@@ -334,15 +371,20 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         setProgress({ current: i + 1, total: validAccounts.length })
       }
 
-      // 汇总
+      // 汇总（余额成功 ≠ 完全健康）
+      const fullOk = results.filter(r => r.status === 'verified').length
+      const profileWarnCount = results.filter(r => r.status === 'verified_warn').length
       const parts: string[] = []
-      if (successCount > 0) parts.push(`成功 ${successCount}`)
+      if (fullOk > 0) parts.push(`完全成功 ${fullOk}`)
+      if (profileWarnCount > 0) parts.push(`余额可用但缺 profile ${profileWarnCount}`)
       if (duplicateCount > 0) parts.push(`重复 ${duplicateCount}`)
       if (failCount > 0) parts.push(`失败 ${failCount}`)
       if (skippedCount > 0) parts.push(`跳过 ${skippedCount}`)
 
-      if (failCount === 0 && duplicateCount === 0 && skippedCount === 0) {
-        toast.success(`成功导入并验活 ${successCount} 个凭据`)
+      if (failCount === 0 && duplicateCount === 0 && skippedCount === 0 && profileWarnCount === 0) {
+        toast.success(`成功导入并验活 ${fullOk} 个凭据`)
+      } else if (profileWarnCount > 0 && failCount === 0) {
+        toast.warning(`导入完成：${parts.join('，')}（对话前请确认 profileArn）`)
       } else {
         toast.info(`导入完成：${parts.join('，')}`)
       }
@@ -362,6 +404,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         return <Loader2 className="w-5 h-5 animate-spin text-blue-500" />
       case 'verified':
         return <CheckCircle2 className="w-5 h-5 text-green-500" />
+      case 'verified_warn':
+        return <AlertCircle className="w-5 h-5 text-amber-500" />
       case 'duplicate':
         return <AlertCircle className="w-5 h-5 text-yellow-500" />
       case 'skipped':
@@ -377,6 +421,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       case 'checking': return '检查重复...'
       case 'verifying': return '验活中...'
       case 'verified': return '验活成功'
+      case 'verified_warn': return '余额可用（profile 未解析）'
       case 'duplicate': return '重复凭据'
       case 'skipped': return '已跳过（error 状态）'
       case 'failed':
@@ -471,6 +516,9 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
                 <span className="text-green-600 dark:text-green-400">
                   ✓ 成功: {results.filter(r => r.status === 'verified').length}
                 </span>
+                <span className="text-amber-600 dark:text-amber-400">
+                  ⚠ profile: {results.filter(r => r.status === 'verified_warn').length}
+                </span>
                 <span className="text-yellow-600 dark:text-yellow-400">
                   ⚠ 重复: {results.filter(r => r.status === 'duplicate').length}
                 </span>
@@ -498,6 +546,12 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
                         </div>
                         {result.usage && (
                           <div className="text-xs text-muted-foreground mt-1">用量: {result.usage}</div>
+                        )}
+                        {result.profileWarning && (
+                          <div className="text-xs text-amber-600 dark:text-amber-400 mt-1">{result.profileWarning}</div>
+                        )}
+                        {result.hasProfileArn === true && (
+                          <div className="text-xs text-muted-foreground mt-1">profileArn: 已就绪{result.provider ? ` · ${result.provider}` : ''}</div>
                         )}
                         {result.error && (
                           <div className="text-xs text-red-600 dark:text-red-400 mt-1">{result.error}</div>

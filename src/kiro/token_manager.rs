@@ -460,6 +460,9 @@ pub struct CredentialEntrySnapshot {
     pub auth_method: Option<String>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
+    /// Identity provider（如 BuilderId）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// Token 过期时间
     pub expires_at: Option<String>,
     /// refreshToken 的 SHA-256 哈希（仅 OAuth 凭据，用于前端去重）
@@ -675,6 +678,52 @@ impl MultiTokenManager {
     /// 获取配置的引用
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// 全局代理配置（供 profile 解析等复用）
+    pub fn global_proxy(&self) -> Option<&crate::http_client::ProxyConfig> {
+        self.proxy.as_ref()
+    }
+
+    /// 读取凭据当前 profile_arn（若有）
+    pub fn profile_arn_of(&self, id: u64) -> Option<String> {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| e.credentials.profile_arn.clone())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// 写回 profile_arn / provider 并尝试持久化（多凭据格式）
+    pub fn set_profile_arn(
+        &self,
+        id: u64,
+        profile_arn: Option<String>,
+        provider: Option<String>,
+    ) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if let Some(arn) = profile_arn {
+                let arn = arn.trim().to_string();
+                if !arn.is_empty() {
+                    entry.credentials.profile_arn = Some(arn);
+                }
+            }
+            if let Some(p) = provider {
+                let p = p.trim().to_string();
+                if !p.is_empty() {
+                    entry.credentials.provider = Some(p);
+                }
+            }
+        }
+        let _ = self.persist_credentials()?;
+        Ok(())
     }
 
     /// 获取凭据总数
@@ -1419,6 +1468,7 @@ impl MultiTokenManager {
                         })
                     },
                     has_profile_arn: e.credentials.profile_arn.is_some(),
+                    provider: e.credentials.provider.clone(),
                     expires_at: if e.credentials.is_api_key_credential() {
                         None // API Key 凭据本地不维护过期时间（服务端策略未知）
                     } else {
@@ -1592,7 +1642,7 @@ impl MultiTokenManager {
             }
         };
 
-        let credentials = {
+        let mut credentials = {
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -1600,6 +1650,22 @@ impl MultiTokenManager {
                 .map(|e| e.credentials.clone())
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
+
+        // Best-effort profile resolve before usage limits (align Kiro-Go)
+        if let Err(e) = crate::kiro::profile::ensure_profile_arn_for_request(
+            self,
+            id,
+            &mut credentials,
+            &token,
+        )
+        .await
+        {
+            tracing::warn!(
+                "凭据 #{} 查询余额前 profileArn 解析失败（继续裸查）: {}",
+                id,
+                e
+            );
+        }
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
         let usage_limits = get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
@@ -1733,6 +1799,13 @@ impl MultiTokenManager {
             } else {
                 m
             }
+        });
+        // Prefer caller-provided profileArn; keep refresh result if input empty.
+        if new_cred.profile_arn.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
+            validated_cred.profile_arn = new_cred.profile_arn.clone();
+        }
+        validated_cred.provider = new_cred.provider.clone().or_else(|| {
+            crate::kiro::profile::infer_provider(&validated_cred)
         });
         validated_cred.client_id = new_cred.client_id;
         validated_cred.client_secret = new_cred.client_secret;

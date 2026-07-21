@@ -38,6 +38,11 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<String>,
 
+    /// Identity provider name (e.g. BuilderId, Github, Google, Enterprise)
+    /// Used for fixed profileArn resolution and supports_profiles decisions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+
     /// OIDC Client ID (IdC 认证需要)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
@@ -328,6 +333,7 @@ mod tests {
             profile_arn: None,
             expires_at: None,
             auth_method: Some("social".to_string()),
+            provider: None,
             client_id: None,
             client_secret: None,
             priority: 0,
@@ -446,6 +452,7 @@ mod tests {
             profile_arn: None,
             expires_at: None,
             auth_method: None,
+            provider: None,
             client_id: None,
             client_secret: None,
             priority: 0,
@@ -477,6 +484,7 @@ mod tests {
             profile_arn: None,
             expires_at: None,
             auth_method: None,
+            provider: None,
             client_id: None,
             client_secret: None,
             priority: 0,
@@ -591,6 +599,7 @@ mod tests {
             profile_arn: None,
             expires_at: None,
             auth_method: Some("social".to_string()),
+            provider: None,
             client_id: None,
             client_secret: None,
             priority: 3,
@@ -869,5 +878,30 @@ mod tests {
         let creds = KiroCredentials::default();
         let result = creds.effective_proxy(None);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_provider_field_roundtrip() {
+        let mut original = KiroCredentials::default();
+        original.refresh_token = Some("rt".to_string());
+        original.auth_method = Some("idc".to_string());
+        original.provider = Some("BuilderId".to_string());
+        original.profile_arn = Some(
+            "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX".to_string(),
+        );
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("provider"));
+        assert!(json.contains("BuilderId"));
+        assert!(json.contains("profileArn"));
+        let parsed: KiroCredentials = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.provider, original.provider);
+        assert_eq!(parsed.profile_arn, original.profile_arn);
+    }
+
+    #[test]
+    fn test_provider_field_missing_backward_compat() {
+        let json = r#"{"refreshToken": "t", "authMethod": "idc"}"#;
+        let creds: KiroCredentials = serde_json::from_str(json).unwrap();
+        assert_eq!(creds.provider, None);
     }
 }

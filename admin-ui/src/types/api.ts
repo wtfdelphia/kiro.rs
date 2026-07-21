@@ -16,6 +16,7 @@ export interface CredentialStatusItem {
   expiresAt: string | null
   authMethod: string | null
   hasProfileArn: boolean
+  provider?: string | null
   email?: string
   refreshTokenHash?: string
   apiKeyHash?: string
@@ -67,6 +68,8 @@ export interface SetPriorityRequest {
 export interface AddCredentialRequest {
   refreshToken?: string
   authMethod?: 'social' | 'idc' | 'api_key'
+  provider?: string
+  profileArn?: string
   clientId?: string
   clientSecret?: string
   priority?: number

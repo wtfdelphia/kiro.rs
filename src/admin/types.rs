@@ -38,6 +38,9 @@ pub struct CredentialStatusItem {
     pub auth_method: Option<String>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
+    /// Identity provider（BuilderId / Github / ...）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// refreshToken 的 SHA-256 哈希（仅 OAuth 凭据，用于前端去重）
     pub refresh_token_hash: Option<String>,
     /// kiroApiKey 的 SHA-256 哈希（仅 API Key 凭据，用于前端去重）
@@ -92,6 +95,12 @@ pub struct AddCredentialRequest {
     /// 认证方式（可选，默认 social）
     #[serde(default = "default_auth_method")]
     pub auth_method: String,
+
+    /// Identity provider（可选，IdC 导入默认 BuilderId）
+    pub provider: Option<String>,
+
+    /// Profile ARN（可选，导入时若已知应保留）
+    pub profile_arn: Option<String>,
 
     /// OIDC Client ID（IdC 认证需要）
     pub client_id: Option<String>,

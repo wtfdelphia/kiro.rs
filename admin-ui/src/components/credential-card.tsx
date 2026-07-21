@@ -170,6 +170,9 @@ export function CredentialCard({
                      credential.authMethod}
                   </Badge>
                 )}
+                {credential.provider && (
+                  <Badge variant="outline">{credential.provider}</Badge>
+                )}
                 {credential.endpoint && (
                   <Badge variant="outline">{credential.endpoint}</Badge>
                 )}
@@ -287,11 +290,21 @@ export function CredentialCard({
                 <span className="font-medium">{credential.proxyUrl}</span>
               </div>
             )}
-            {credential.hasProfileArn && (
-              <div className="col-span-2">
-                <Badge variant="secondary">有 Profile ARN</Badge>
-              </div>
-            )}
+            <div className="col-span-2 flex items-center gap-2">
+              <span className="text-muted-foreground">Profile：</span>
+              {credential.hasProfileArn ? (
+                <Badge variant="secondary">已就绪</Badge>
+              ) : credential.authMethod === 'api_key' ? (
+                <span className="text-sm text-muted-foreground">不适用</span>
+              ) : (
+                <Badge variant="outline" className="text-amber-700 border-amber-500/50">
+                  未解析
+                </Badge>
+              )}
+              {credential.provider && !credential.hasProfileArn && (
+                <span className="text-xs text-muted-foreground">provider={credential.provider}</span>
+              )}
+            </div>
           </div>
 
           {/* 操作按钮 */}

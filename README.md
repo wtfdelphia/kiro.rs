@@ -235,6 +235,7 @@ docker-compose up
 | `profileArn`   | string | AWS Profile ARN（可选，登录时返回）                   |
 | `expiresAt`    | string | Token 过期时间 (RFC3339)                        |
 | `authMethod`   | string | 认证方式：`social` 或 `idc`                       |
+| `provider`     | string | 身份提供方：`BuilderId` / `Github` / `Google` / `Enterprise` 等（可选，用于 profileArn 固定表） |
 | `clientId`     | string | IdC 登录的客户端 ID（IdC 认证必填）                     |
 | `clientSecret` | string | IdC 登录的客户端密钥（IdC 认证必填）                      |
 | `priority`     | number | 凭据优先级，数字越小越优先，默认为 0                         |
@@ -251,6 +252,7 @@ docker-compose up
 说明：
 - IdC / Builder-ID / IAM 在本项目里属于同一种登录方式，配置时统一使用 `authMethod: "idc"`
 - 为兼容旧配置，`builder-id` / `iam` 仍可被识别，但会按 `idc` 处理
+- KAM 导入的 IdC 账号建议带 `provider`（缺省按 `BuilderId`）与可选 `profileArn`；服务会在请求前自动解析并缓存 `profileArn`（固定表 / ListAvailableProfiles / refresh fallback）
 
 #### 单凭据格式（旧格式，向后兼容）
 

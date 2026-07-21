@@ -15,6 +15,7 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::profile;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
@@ -134,13 +135,25 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
+            let mut ctx = match self.token_manager.acquire_context(None).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
                     continue;
                 }
             };
+
+            // Resolve profileArn before MCP (best-effort; unsupported is ok)
+            if let Err(e) = profile::ensure_profile_arn_for_request(
+                &self.token_manager,
+                ctx.id,
+                &mut ctx.credentials,
+                &ctx.token,
+            )
+            .await
+            {
+                tracing::warn!("凭据 #{} profileArn 解析失败（MCP 继续）: {}", ctx.id, e);
+            }
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -218,9 +231,34 @@ impl KiroProvider {
 
             // 401/403 凭据问题
             if matches!(status.as_u16(), 401 | 403) {
-                // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
+                // bearer invalid: if request lacked profileArn, try resolve first; else force-refresh once.
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
+                    let has_profile = ctx
+                        .credentials
+                        .profile_arn
+                        .as_ref()
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false);
+                    if !has_profile {
+                        tracing::info!(
+                            "凭据 #{} bearer invalid 且无 profileArn，尝试 resolve 后重试",
+                            ctx.id
+                        );
+                        if profile::ensure_profile_arn_for_request(
+                            &self.token_manager,
+                            ctx.id,
+                            &mut ctx.credentials,
+                            &ctx.token,
+                        )
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some()
+                        {
+                            continue;
+                        }
+                    }
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
                     if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
@@ -292,13 +330,38 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let mut ctx = match self.token_manager.acquire_context(model.as_deref()).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
                     continue;
                 }
             };
+
+            // Resolve profileArn before generateAssistantResponse
+            match profile::ensure_profile_arn_for_request(
+                &self.token_manager,
+                ctx.id,
+                &mut ctx.credentials,
+                &ctx.token,
+            )
+            .await
+            {
+                Ok(Some(_)) | Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!("凭据 #{} profileArn 解析失败: {}", ctx.id, e);
+                    // soft failure: count failure without permanent refresh invalidation
+                    let has_available = self.token_manager.report_failure(ctx.id);
+                    last_error = Some(e);
+                    if !has_available {
+                        anyhow::bail!(
+                            "{} API 请求失败（所有凭据已用尽）: profileArn 无法解析",
+                            api_type
+                        );
+                    }
+                    continue;
+                }
+            }
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -404,9 +467,34 @@ impl KiroProvider {
                     body
                 );
 
-                // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
+                // bearer invalid: if request lacked profileArn, try resolve first; else force-refresh once.
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
+                    let has_profile = ctx
+                        .credentials
+                        .profile_arn
+                        .as_ref()
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false);
+                    if !has_profile {
+                        tracing::info!(
+                            "凭据 #{} bearer invalid 且无 profileArn，尝试 resolve 后重试",
+                            ctx.id
+                        );
+                        if profile::ensure_profile_arn_for_request(
+                            &self.token_manager,
+                            ctx.id,
+                            &mut ctx.credentials,
+                            &ctx.token,
+                        )
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some()
+                        {
+                            continue;
+                        }
+                    }
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
                     if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
