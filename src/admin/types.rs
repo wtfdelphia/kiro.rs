@@ -49,6 +49,12 @@ pub struct CredentialStatusItem {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// Kiro 稳定用户 ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// 展示名
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nickname: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -129,6 +135,18 @@ pub struct AddCredentialRequest {
     /// 用户邮箱（可选，用于前端显示）
     pub email: Option<String>,
 
+    /// Kiro 稳定用户 ID（可选，用于 upsert）
+    pub user_id: Option<String>,
+
+    /// 展示名（可选）
+    pub nickname: Option<String>,
+
+    /// IAM SSO start URL（可选）
+    pub start_url: Option<String>,
+
+    /// 冲突策略：reject | upsert | replace_token_only（可选）
+    pub on_conflict: Option<String>,
+
     /// 凭据级代理 URL（可选，特殊值 "direct" 表示不使用代理）
     pub proxy_url: Option<String>,
 
@@ -163,6 +181,12 @@ pub struct AddCredentialResponse {
     /// 用户邮箱（如果获取成功）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+    /// created | updated
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// Kiro 稳定用户 ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
 }
 
 // ============ 余额查询 ============
@@ -264,5 +288,195 @@ impl AdminErrorResponse {
 
     pub fn internal_error(message: impl Into<String>) -> Self {
         Self::new("internal_error", message)
+    }
+}
+
+
+// ============ 批量导入 ============
+
+/// 批量导入选项
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchImportOptions {
+    #[serde(default)]
+    pub on_conflict: Option<String>,
+    #[serde(default)]
+    pub stop_on_error: Option<bool>,
+    #[serde(default)]
+    pub fetch_balance: Option<bool>,
+    #[serde(default)]
+    pub concurrency: Option<u32>,
+}
+
+/// 批量导入请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchImportRequest {
+    pub items: Vec<AddCredentialRequest>,
+    #[serde(default)]
+    pub options: Option<BatchImportOptions>,
+}
+
+/// 批量导入单条结果
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchImportItemResult {
+    pub index: usize,
+    /// created | updated | duplicate | failed
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance: Option<BalanceResponse>,
+    /// profile 未解析等非致命警告
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+/// 批量导入汇总
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchImportSummary {
+    pub created: usize,
+    pub updated: usize,
+    pub duplicate: usize,
+    pub failed: usize,
+}
+
+/// 批量导入响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchImportResponse {
+    pub success: bool,
+    pub summary: BatchImportSummary,
+    pub results: Vec<BatchImportItemResult>,
+}
+
+
+
+// ============ 在线授权 ============
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuilderIdStartRequest {
+    #[serde(default)]
+    pub region: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuilderIdPollRequest {
+    pub session_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct BuilderIdPollCompletedResponse {
+    pub success: bool,
+    pub completed: bool,
+    pub credential_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IamSsoStartRequest {
+    pub start_url: String,
+    #[serde(default)]
+    pub region: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IamSsoCompleteRequest {
+    pub session_id: String,
+    pub callback_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SsoTokenImportRequest {
+    pub bearer_token: String,
+    #[serde(default)]
+    pub region: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SsoTokenImportResponse {
+    pub success: bool,
+    pub accounts: Vec<SsoTokenAccountResult>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SsoTokenAccountResult {
+    pub credential_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_import_request_deserializes_items() {
+        let token = "x".repeat(150);
+        let json = format!(
+            r#"{{"items":[{{"refreshToken":"{}","authMethod":"social"}}]}}"#,
+            token
+        );
+        let req: BatchImportRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req.items.len(), 1);
+        assert!(req.options.is_none());
+        assert_eq!(req.items[0].auth_method, "social");
+    }
+
+    #[test]
+    fn add_credential_request_accepts_identity_fields() {
+        let token = "y".repeat(150);
+        let json = format!(
+            r#"{{"refreshToken":"{}","authMethod":"idc","userId":"u-1","nickname":"n1","startUrl":"https://example.awsapps.com/start","onConflict":"upsert","provider":"BuilderId","profileArn":"arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"}}"#,
+            token
+        );
+        let req: AddCredentialRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req.user_id.as_deref(), Some("u-1"));
+        assert_eq!(req.nickname.as_deref(), Some("n1"));
+        assert_eq!(req.on_conflict.as_deref(), Some("upsert"));
+        assert_eq!(req.provider.as_deref(), Some("BuilderId"));
+        assert!(req.profile_arn.is_some());
+    }
+
+    #[test]
+    fn add_credential_response_serializes_action() {
+        let resp = AddCredentialResponse {
+            success: true,
+            message: "ok".into(),
+            credential_id: 3,
+            email: Some("a@b.c".into()),
+            action: Some("created".into()),
+            user_id: Some("u".into()),
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["action"], "created");
+        assert_eq!(v["userId"], "u");
+        assert_eq!(v["credentialId"], 3);
     }
 }

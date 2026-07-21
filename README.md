@@ -223,6 +223,8 @@ docker-compose up
 
 ### credentials.json
 
+可选身份字段：`userId`、`nickname`、`startUrl`（Admin 展示与导入 upsert）。Admin 另提供 `POST /api/admin/credentials/import`（默认按 userId upsert；裸 `POST /credentials` 默认 reject 重复）。
+
 支持单对象格式（向后兼容）或数组格式（多凭据）。
 
 #### 字段说明

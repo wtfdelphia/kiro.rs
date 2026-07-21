@@ -9,8 +9,8 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
-import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
-import { getCredentialBalance, getCredentials, setCredentialDisabled } from '@/api/credentials'
+import { useCredentials } from '@/hooks/use-credentials'
+import { importCredentialsBatch } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 
 interface KamImportDialogProps {
@@ -158,23 +158,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
   const [results, setResults] = useState<VerificationResult[]>([])
 
-  const { data: existingCredentials } = useCredentials()
-  const { mutateAsync: addCredential } = useAddCredential()
-  const { mutateAsync: deleteCredential } = useDeleteCredential()
 
-  const rollbackCredential = async (id: number): Promise<{ success: boolean; error?: string }> => {
-    try {
-      await setCredentialDisabled(id, true)
-    } catch (error) {
-      return { success: false, error: `禁用失败: ${extractErrorMessage(error)}` }
-    }
-    try {
-      await deleteCredential(id)
-      return { success: true }
-    } catch (error) {
-      return { success: false, error: `删除失败: ${extractErrorMessage(error)}` }
-    }
-  }
+  const { data: existingCredentials, refetch } = useCredentials()
 
   const resetForm = () => {
     setJsonInput('')
@@ -184,16 +169,13 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   }
 
   const handleImport = async () => {
-    // 先单独解析 JSON，给出精准的错误提示
     let validAccounts: KamAccount[]
     try {
       const accounts = parseKamJson(jsonInput)
-
       if (accounts.length === 0) {
         toast.error('没有可导入的账号')
         return
       }
-
       validAccounts = accounts.filter(a => a.credentials?.refreshToken)
       if (validAccounts.length === 0) {
         toast.error('没有包含有效 refreshToken 的账号')
@@ -205,11 +187,9 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     }
 
     try {
-
       setImporting(true)
       setProgress({ current: 0, total: validAccounts.length })
 
-      // 初始化结果，标记 error 状态的账号
       const initialResults: VerificationResult[] = validAccounts.map((account, i) => {
         if (skipErrorAccounts && account.status === 'error') {
           return { index: i + 1, status: 'skipped' as const, email: account.email || account.nickname }
@@ -218,175 +198,145 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       })
       setResults(initialResults)
 
-      // 重复检测
       const existingTokenHashes = new Set(
         existingCredentials?.credentials
           .map(c => c.refreshTokenHash)
           .filter((hash): hash is string => Boolean(hash)) || []
       )
 
-      let successCount = 0
+      const payloadItems: import('@/types/api').AddCredentialRequest[] = []
+      const indexMap: number[] = []
+      const resultsArr = [...initialResults]
+
+      let skippedCount = 0
       let duplicateCount = 0
       let failCount = 0
-      let skippedCount = 0
 
       for (let i = 0; i < validAccounts.length; i++) {
         const account = validAccounts[i]
-
-        // 跳过 error 状态的账号
         if (skipErrorAccounts && account.status === 'error') {
           skippedCount++
-          setProgress({ current: i + 1, total: validAccounts.length })
           continue
         }
-
         const cred = account.credentials
         const token = cred.refreshToken.trim()
         const tokenHash = await sha256Hex(token)
+        resultsArr[i] = { ...resultsArr[i], status: 'checking' }
+        setResults([...resultsArr])
+        setCurrentProcessing('预检 ' + (account.email || account.nickname || ('账号 ' + (i + 1))))
 
-        setCurrentProcessing(`正在处理 ${account.email || account.nickname || `账号 ${i + 1}`}`)
-        setResults(prev => {
-          const next = [...prev]
-          next[i] = { ...next[i], status: 'checking' }
-          return next
-        })
-
-        // 检查重复
         if (existingTokenHashes.has(tokenHash)) {
           duplicateCount++
           const existingCred = existingCredentials?.credentials.find(c => c.refreshTokenHash === tokenHash)
-          setResults(prev => {
-            const next = [...prev]
-            next[i] = { ...next[i], status: 'duplicate', error: '该凭据已存在', email: existingCred?.email || account.email }
-            return next
-          })
-          setProgress({ current: i + 1, total: validAccounts.length })
+          resultsArr[i] = {
+            ...resultsArr[i],
+            status: 'duplicate',
+            error: '该凭据已存在',
+            email: existingCred?.email || account.email,
+          }
           continue
         }
 
-        // 验活中
-        setResults(prev => {
-          const next = [...prev]
-          next[i] = { ...next[i], status: 'verifying' }
-          return next
-        })
-
-        let addedCredId: number | null = null
-
-        try {
-          const clientId = cred.clientId?.trim() || undefined
-          const clientSecret = cred.clientSecret?.trim() || undefined
-          const authMethod = clientId && clientSecret ? 'idc' : 'social'
-
-          // idc 模式下必须同时提供 clientId 和 clientSecret
-          if (authMethod === 'social' && (clientId || clientSecret)) {
-            throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
-          }
-
-          const provider =
-            cred.provider?.trim() ||
-            (authMethod === 'idc' ? 'BuilderId' : undefined)
-          const addedCred = await addCredential({
-            refreshToken: token,
-            authMethod,
-            provider,
-            profileArn: cred.profileArn?.trim() || undefined,
-            authRegion: cred.region?.trim() || undefined,
-            clientId,
-            clientSecret,
-            machineId: account.machineId?.trim() || undefined,
-          })
-
-          addedCredId = addedCred.credentialId
-
-          await new Promise(resolve => setTimeout(resolve, 1000))
-
-          const balance = await getCredentialBalance(addedCred.credentialId)
-
-          // Balance success alone is not full health: surface missing profileArn
-          let hasProfileArn = false
-          let providerName: string | null | undefined = provider
-          try {
-            const latest = await getCredentials()
-            const item = latest.credentials.find(c => c.id === addedCred.credentialId)
-            hasProfileArn = !!item?.hasProfileArn
-            providerName = item?.provider ?? provider
-          } catch {
-            // keep defaults; do not fail import on status fetch
-          }
-
-          const profileWarning = hasProfileArn
-            ? undefined
-            : '余额可用，但 profileArn 未解析；对话可能仍 403，请强制刷新或检查 provider/凭证'
-
-          successCount++
-          existingTokenHashes.add(tokenHash)
-          setCurrentProcessing(
-            hasProfileArn
-              ? `验活成功: ${addedCred.email || account.email || `账号 ${i + 1}`}`
-              : `验活警告: ${addedCred.email || account.email || `账号 ${i + 1}`}（缺 profileArn）`
-          )
-          setResults(prev => {
-            const next = [...prev]
-            next[i] = {
-              ...next[i],
-              status: hasProfileArn ? 'verified' : 'verified_warn',
-              usage: `${balance.currentUsage}/${balance.usageLimit}`,
-              email: addedCred.email || account.email,
-              credentialId: addedCred.credentialId,
-              hasProfileArn,
-              provider: providerName,
-              profileWarning,
-            }
-            return next
-          })
-        } catch (error) {
-          let rollbackStatus: VerificationResult['rollbackStatus'] = 'skipped'
-          let rollbackError: string | undefined
-
-          if (addedCredId) {
-            const result = await rollbackCredential(addedCredId)
-            if (result.success) {
-              rollbackStatus = 'success'
-            } else {
-              rollbackStatus = 'failed'
-              rollbackError = result.error
-            }
-          }
-
+        const clientId = cred.clientId?.trim() || undefined
+        const clientSecret = cred.clientSecret?.trim() || undefined
+        const authMethod = (clientId && clientSecret ? 'idc' : 'social') as 'idc' | 'social'
+        if (authMethod === 'social' && (clientId || clientSecret)) {
           failCount++
-          setResults(prev => {
-            const next = [...prev]
-            next[i] = {
-              ...next[i],
-              status: 'failed',
-              error: extractErrorMessage(error),
-              rollbackStatus,
-              rollbackError,
-            }
-            return next
-          })
+          resultsArr[i] = {
+            ...resultsArr[i],
+            status: 'failed',
+            error: 'idc 模式需要同时提供 clientId 和 clientSecret',
+          }
+          continue
         }
 
-        setProgress({ current: i + 1, total: validAccounts.length })
+        const provider =
+          cred.provider?.trim() ||
+          (authMethod === 'idc' ? 'BuilderId' : undefined)
+
+        payloadItems.push({
+          refreshToken: token,
+          authMethod,
+          provider,
+          profileArn: cred.profileArn?.trim() || undefined,
+          authRegion: cred.region?.trim() || undefined,
+          clientId,
+          clientSecret,
+          machineId: account.machineId?.trim() || undefined,
+          email: account.email,
+          userId: typeof account.userId === 'string' ? account.userId : undefined,
+          nickname: account.nickname,
+          startUrl: cred.startUrl?.trim() || undefined,
+        })
+        indexMap.push(i)
+        existingTokenHashes.add(tokenHash)
+      }
+      setResults([...resultsArr])
+
+      let successCount = 0
+      const CHUNK = 20
+      for (let offset = 0; offset < payloadItems.length; offset += CHUNK) {
+        const chunk = payloadItems.slice(offset, offset + CHUNK)
+        const chunkIdx = indexMap.slice(offset, offset + CHUNK)
+        setCurrentProcessing(
+          '服务端导入 ' + (offset + 1) + '-' + Math.min(offset + chunk.length, payloadItems.length)
+        )
+        for (const oi of chunkIdx) {
+          resultsArr[oi] = { ...resultsArr[oi], status: 'verifying' }
+        }
+        setResults([...resultsArr])
+
+        const resp = await importCredentialsBatch({
+          items: chunk,
+          options: { onConflict: 'upsert', stopOnError: false, fetchBalance: true, concurrency: 1 },
+        })
+
+        for (const r of resp.results) {
+          const oi = chunkIdx[r.index]
+          const hasWarn = !!r.warning
+          let status: VerificationResult['status'] = 'failed'
+          if (r.status === 'duplicate') status = 'duplicate'
+          else if (r.status === 'updated' || r.status === 'created') status = hasWarn ? 'verified_warn' : 'verified'
+          else if (r.credentialId) status = hasWarn ? 'verified_warn' : 'verified'
+
+          if (status === 'verified' || status === 'verified_warn') successCount++
+          else if (status === 'duplicate') duplicateCount++
+          else failCount++
+
+          resultsArr[oi] = {
+            ...resultsArr[oi],
+            status,
+            error: r.error,
+            email: r.email || resultsArr[oi].email,
+            credentialId: r.credentialId,
+            usage: r.balance ? r.balance.currentUsage + '/' + r.balance.usageLimit : undefined,
+            profileWarning: r.warning || undefined,
+            hasProfileArn: r.warning ? false : r.credentialId ? true : undefined,
+          }
+        }
+        setResults([...resultsArr])
+        setProgress({
+          current: Math.min(validAccounts.length, offset + chunk.length + skippedCount),
+          total: validAccounts.length,
+        })
       }
 
-      // 汇总（余额成功 ≠ 完全健康）
-      const fullOk = results.filter(r => r.status === 'verified').length
-      const profileWarnCount = results.filter(r => r.status === 'verified_warn').length
-      const parts: string[] = []
-      if (fullOk > 0) parts.push(`完全成功 ${fullOk}`)
-      if (profileWarnCount > 0) parts.push(`余额可用但缺 profile ${profileWarnCount}`)
-      if (duplicateCount > 0) parts.push(`重复 ${duplicateCount}`)
-      if (failCount > 0) parts.push(`失败 ${failCount}`)
-      if (skippedCount > 0) parts.push(`跳过 ${skippedCount}`)
+      setProgress({ current: validAccounts.length, total: validAccounts.length })
+      setCurrentProcessing('')
+      await refetch()
 
-      if (failCount === 0 && duplicateCount === 0 && skippedCount === 0 && profileWarnCount === 0) {
-        toast.success(`成功导入并验活 ${fullOk} 个凭据`)
-      } else if (profileWarnCount > 0 && failCount === 0) {
-        toast.warning(`导入完成：${parts.join('，')}（对话前请确认 profileArn）`)
+      if (successCount > 0) {
+        toast.success(
+          'KAM 导入完成：成功 ' +
+            successCount +
+            '，重复 ' +
+            duplicateCount +
+            '，失败 ' +
+            failCount +
+            (skippedCount ? '，跳过 ' + skippedCount : '')
+        )
       } else {
-        toast.info(`导入完成：${parts.join('，')}`)
+        toast.error('KAM 导入失败：重复 ' + duplicateCount + '，失败 ' + failCount)
       }
     } catch (error) {
       toast.error('导入失败: ' + extractErrorMessage(error))

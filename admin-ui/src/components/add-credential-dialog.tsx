@@ -93,7 +93,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       },
       {
         onSuccess: (data) => {
-          toast.success(data.message)
+          const act = data.action === 'updated' ? '已更新' : '已添加'
+          toast.success(data.message || act)
           onOpenChange(false)
           resetForm()
         },

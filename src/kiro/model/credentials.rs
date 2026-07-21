@@ -74,9 +74,21 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
 
-    /// 用户邮箱（从 Anthropic API 获取）
+    /// 用户邮箱（从 Anthropic API 获取 / GetUserInfo）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+
+    /// Kiro 稳定用户 ID（用于 upsert 去重）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+
+    /// 展示名（KAM nickname / label）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nickname: Option<String>,
+
+    /// IAM SSO start URL（便于再次登录）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_url: Option<String>,
 
     /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -342,6 +354,9 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
+            user_id: None,
+            nickname: None,
+            start_url: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -461,6 +476,9 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
+            user_id: None,
+            nickname: None,
+            start_url: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -493,6 +511,9 @@ mod tests {
             api_region: None,
             machine_id: None,
             email: None,
+            user_id: None,
+            nickname: None,
+            start_url: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -608,6 +629,9 @@ mod tests {
             api_region: None,
             machine_id: Some("c".repeat(64)),
             email: None,
+            user_id: None,
+            nickname: None,
+            start_url: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -904,4 +928,32 @@ mod tests {
         let creds: KiroCredentials = serde_json::from_str(json).unwrap();
         assert_eq!(creds.provider, None);
     }
+
+    #[test]
+    fn test_identity_fields_roundtrip() {
+        let json = r#"{
+            "refreshToken": "rt",
+            "email": "a@example.com",
+            "userId": "user-123",
+            "nickname": "nick",
+            "startUrl": "https://sso.example.com/start"
+        }"#;
+        let creds = KiroCredentials::from_json(json).unwrap();
+        assert_eq!(creds.email.as_deref(), Some("a@example.com"));
+        assert_eq!(creds.user_id.as_deref(), Some("user-123"));
+        assert_eq!(creds.nickname.as_deref(), Some("nick"));
+        assert_eq!(creds.start_url.as_deref(), Some("https://sso.example.com/start"));
+
+        let out = creds.to_pretty_json().unwrap();
+        assert!(out.contains("userId"));
+        assert!(out.contains("nickname"));
+        assert!(out.contains("startUrl"));
+
+        let legacy = r#"{"refreshToken": "rt"}"#;
+        let legacy_creds = KiroCredentials::from_json(legacy).unwrap();
+        assert!(legacy_creds.user_id.is_none());
+        assert!(legacy_creds.nickname.is_none());
+        assert!(legacy_creds.start_url.is_none());
+    }
+
 }

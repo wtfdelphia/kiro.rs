@@ -81,6 +81,8 @@ impl AdminService {
                 api_key_hash: entry.api_key_hash,
                 masked_api_key: entry.masked_api_key,
                 email: entry.email,
+                user_id: entry.user_id,
+                nickname: entry.nickname,
                 success_count: entry.success_count,
                 last_used_at: entry.last_used_at.clone(),
                 has_proxy: entry.has_proxy,
@@ -199,7 +201,24 @@ impl AdminService {
         &self,
         req: AddCredentialRequest,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
-        // 校验端点名：未指定则默认合法，指定则必须已注册
+        self.ingest_from_request(req).await
+    }
+
+    /// 导入入口：默认 onConflict=upsert（当请求未指定时）
+    pub async fn import_credential(
+        &self,
+        mut req: AddCredentialRequest,
+    ) -> Result<AddCredentialResponse, AdminServiceError> {
+        if req.on_conflict.is_none() {
+            req.on_conflict = Some("upsert".to_string());
+        }
+        self.ingest_from_request(req).await
+    }
+
+    async fn ingest_from_request(
+        &self,
+        req: AddCredentialRequest,
+    ) -> Result<AddCredentialResponse, AdminServiceError> {
         if let Some(ref name) = req.endpoint {
             if !self.known_endpoints.contains(name) {
                 let mut known: Vec<&str> =
@@ -212,8 +231,10 @@ impl AdminService {
             }
         }
 
-        // 构建凭据对象
-        let email = req.email.clone();
+        let on_conflict =
+            crate::kiro::token_manager::OnConflict::parse(req.on_conflict.as_deref());
+        let opts = crate::kiro::token_manager::IngestOptions { on_conflict };
+
         let new_cred = KiroCredentials {
             id: None,
             access_token: None,
@@ -230,34 +251,159 @@ impl AdminService {
             api_region: req.api_region,
             machine_id: req.machine_id,
             email: req.email,
-            subscription_title: None, // 将在首次获取使用额度时自动更新
+            user_id: req.user_id,
+            nickname: req.nickname,
+            start_url: req.start_url,
+            subscription_title: None,
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
-            disabled: false, // 新添加的凭据默认启用
+            disabled: false,
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
         };
 
-        // 调用 token_manager 添加凭据
-        let credential_id = self
+        let result = self
             .token_manager
-            .add_credential(new_cred)
+            .ingest_credential(new_cred, opts)
             .await
             .map_err(|e| self.classify_add_error(e))?;
 
-        // 主动获取订阅等级，避免首次请求时 Free 账号绕过 Opus 模型过滤
-        if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
+        if let Err(e) = self.token_manager.get_usage_limits_for(result.id).await {
             tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
         }
 
         Ok(AddCredentialResponse {
             success: true,
-            message: format!("凭据添加成功，ID: {}", credential_id),
-            credential_id,
-            email,
+            message: format!(
+                "凭据{}成功，ID: {}",
+                match result.action {
+                    crate::kiro::token_manager::IngestAction::Created => "添加",
+                    crate::kiro::token_manager::IngestAction::Updated => "更新",
+                },
+                result.id
+            ),
+            credential_id: result.id,
+            email: result.email,
+            action: Some(result.action.as_str().to_string()),
+            user_id: result.user_id,
         })
     }
+
+    /// 批量导入凭据
+    pub async fn import_credentials_batch(
+        &self,
+        req: crate::admin::types::BatchImportRequest,
+    ) -> Result<crate::admin::types::BatchImportResponse, AdminServiceError> {
+        use crate::admin::types::{
+            BatchImportItemResult, BatchImportResponse, BatchImportSummary,
+        };
+
+        let opts = req.options.as_ref();
+        let default_conflict = opts
+            .and_then(|o| o.on_conflict.clone())
+            .unwrap_or_else(|| "upsert".to_string());
+        let stop_on_error = opts.and_then(|o| o.stop_on_error).unwrap_or(false);
+        let fetch_balance = opts.and_then(|o| o.fetch_balance).unwrap_or(true);
+        let concurrency = opts.and_then(|o| o.concurrency).unwrap_or(1).clamp(1, 4);
+        // 串行以保证确定性并降低上游限流风险（concurrency 预留）
+        let _ = concurrency;
+
+        let mut results = Vec::with_capacity(req.items.len());
+        let mut created = 0usize;
+        let mut updated = 0usize;
+        let mut duplicate = 0usize;
+        let mut failed = 0usize;
+
+        for (index, mut item) in req.items.into_iter().enumerate() {
+            if item.on_conflict.is_none() {
+                item.on_conflict = Some(default_conflict.clone());
+            }
+
+            match self.ingest_from_request(item).await {
+                Ok(resp) => {
+                    let status = resp.action.clone().unwrap_or_else(|| "created".to_string());
+                    match status.as_str() {
+                        "updated" => updated += 1,
+                        _ => created += 1,
+                    }
+
+                    let mut balance = None;
+                    if fetch_balance {
+                        if let Ok(b) = self.get_balance(resp.credential_id).await {
+                            balance = Some(b);
+                        }
+                    }
+
+                    let mut warning = None;
+                    let snapshot = self.token_manager.snapshot();
+                    if let Some(entry) = snapshot.entries.iter().find(|e| e.id == resp.credential_id) {
+                        if !entry.has_profile_arn && !entry.auth_method.as_deref().map(|m| m.eq_ignore_ascii_case("api_key")).unwrap_or(false) {
+                            warning = Some(
+                                "余额可用，但 profileArn 未解析；对话可能仍 403".to_string(),
+                            );
+                            // 非致命：状态仍为 created/updated，警告字段区分（UI 可标 verified_warn）
+                        }
+                    }
+
+                    results.push(BatchImportItemResult {
+                        index,
+                        status,
+                        credential_id: Some(resp.credential_id),
+                        email: resp.email,
+                        user_id: resp.user_id,
+                        error: None,
+                        balance,
+                        warning,
+                    });
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    let is_dup = msg.contains("凭据已存在") || msg.contains("重复");
+                    if is_dup {
+                        duplicate += 1;
+                        results.push(BatchImportItemResult {
+                            index,
+                            status: "duplicate".to_string(),
+                            credential_id: None,
+                            email: None,
+                            user_id: None,
+                            error: Some(msg),
+                            balance: None,
+                            warning: None,
+                        });
+                    } else {
+                        failed += 1;
+                        results.push(BatchImportItemResult {
+                            index,
+                            status: "failed".to_string(),
+                            credential_id: None,
+                            email: None,
+                            user_id: None,
+                            error: Some(msg),
+                            balance: None,
+                            warning: None,
+                        });
+                    }
+                    if stop_on_error {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(BatchImportResponse {
+            success: failed == 0,
+            summary: BatchImportSummary {
+                created,
+                updated,
+                duplicate,
+                failed,
+            },
+            results,
+        })
+    }
+
 
     /// 删除凭据
     pub fn delete_credential(&self, id: u64) -> Result<(), AdminServiceError> {
@@ -417,7 +563,208 @@ impl AdminService {
     }
 
     /// 分类添加凭据错误
-    fn classify_add_error(&self, e: anyhow::Error) -> AdminServiceError {
+
+    /// 将在线授权 token 走统一 ingest
+    async fn ingest_online_tokens(
+        &self,
+        tokens: crate::kiro::online_auth::CompletedTokens,
+    ) -> Result<AddCredentialResponse, AdminServiceError> {
+        use chrono::{Duration as ChronoDuration, Utc};
+        let expires_at = (Utc::now() + ChronoDuration::seconds(tokens.expires_in as i64)).to_rfc3339();
+        let mut req = AddCredentialRequest {
+            refresh_token: Some(tokens.refresh_token),
+            auth_method: tokens.auth_method,
+            provider: Some(tokens.provider),
+            profile_arn: None,
+            client_id: Some(tokens.client_id),
+            client_secret: Some(tokens.client_secret),
+            priority: 0,
+            region: Some(tokens.region.clone()),
+            auth_region: Some(tokens.region),
+            api_region: None,
+            machine_id: None,
+            email: None,
+            user_id: None,
+            nickname: None,
+            start_url: tokens.start_url,
+            proxy_url: None,
+            proxy_username: None,
+            proxy_password: None,
+            kiro_api_key: None,
+            endpoint: None,
+            on_conflict: Some("upsert".into()),
+        };
+        // Prefer import path defaults
+        if req.on_conflict.is_none() {
+            req.on_conflict = Some("upsert".into());
+        }
+        let resp = self.ingest_from_request(req).await?;
+        // access_token already applied via refresh inside ingest for OAuth
+        let _ = expires_at;
+        Ok(resp)
+    }
+
+    pub async fn start_builder_id_login(
+        &self,
+        region: Option<String>,
+    ) -> Result<crate::kiro::online_auth::BuilderIdStartResponse, AdminServiceError> {
+        let proxy = self.token_manager.global_proxy();
+        crate::kiro::online_auth::start_builder_id(region, proxy, self.token_manager.config())
+            .await
+            .map_err(|e| AdminServiceError::UpstreamError(e.to_string()))
+    }
+
+    pub async fn poll_builder_id_login(
+        &self,
+        session_id: String,
+    ) -> Result<serde_json::Value, AdminServiceError> {
+        let proxy = self.token_manager.global_proxy();
+        let result = crate::kiro::online_auth::poll_builder_id(
+            &session_id,
+            proxy,
+            self.token_manager.config(),
+        )
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("not found") || msg.contains("expired") {
+                AdminServiceError::InvalidCredential(msg)
+            } else {
+                AdminServiceError::UpstreamError(msg)
+            }
+        })?;
+
+        match result {
+            Err(pending) => Ok(serde_json::to_value(pending).unwrap()),
+            Ok(tokens) => {
+                let resp = self.ingest_online_tokens(tokens).await?;
+                Ok(serde_json::json!({
+                    "success": true,
+                    "completed": true,
+                    "credentialId": resp.credential_id,
+                    "email": resp.email,
+                    "userId": resp.user_id,
+                    "action": resp.action,
+                }))
+            }
+        }
+    }
+
+    pub async fn start_iam_sso_login(
+        &self,
+        start_url: String,
+        region: Option<String>,
+    ) -> Result<crate::kiro::online_auth::IamSsoStartResponse, AdminServiceError> {
+        if start_url.trim().is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "startUrl is required".into(),
+            ));
+        }
+        let proxy = self.token_manager.global_proxy();
+        crate::kiro::online_auth::start_iam_sso(
+            &start_url,
+            region,
+            proxy,
+            self.token_manager.config(),
+        )
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("startUrl") {
+                AdminServiceError::InvalidCredential(msg)
+            } else {
+                AdminServiceError::UpstreamError(msg)
+            }
+        })
+    }
+
+    pub async fn complete_iam_sso_login(
+        &self,
+        session_id: String,
+        callback_url: String,
+    ) -> Result<AddCredentialResponse, AdminServiceError> {
+        let proxy = self.token_manager.global_proxy();
+        let tokens = crate::kiro::online_auth::complete_iam_sso(
+            &session_id,
+            &callback_url,
+            proxy,
+            self.token_manager.config(),
+        )
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("not found") || msg.contains("expired") {
+                AdminServiceError::InvalidCredential(msg)
+            } else if msg.contains("startUrl") || msg.contains("无效") || msg.contains("状态") {
+                AdminServiceError::InvalidCredential(msg)
+            } else {
+                AdminServiceError::UpstreamError(msg)
+            }
+        })?;
+        self.ingest_online_tokens(tokens).await
+    }
+
+    pub async fn import_sso_tokens(
+        &self,
+        bearer_token: String,
+        region: Option<String>,
+    ) -> Result<crate::admin::types::SsoTokenImportResponse, AdminServiceError> {
+        use crate::admin::types::{SsoTokenAccountResult, SsoTokenImportResponse};
+
+        let lines: Vec<&str> = bearer_token
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect();
+        if lines.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "bearerToken is required".into(),
+            ));
+        }
+
+        let proxy = self.token_manager.global_proxy();
+        let mut accounts = Vec::new();
+        let mut errors = Vec::new();
+
+        for line in lines {
+            match crate::kiro::online_auth::import_sso_token(
+                line,
+                region.clone(),
+                proxy,
+                self.token_manager.config(),
+            )
+            .await
+            {
+                Ok(tokens) => match self.ingest_online_tokens(tokens).await {
+                    Ok(resp) => accounts.push(SsoTokenAccountResult {
+                        credential_id: resp.credential_id,
+                        email: resp.email,
+                        user_id: resp.user_id,
+                    }),
+                    Err(e) => errors.push(e.to_string()),
+                },
+                Err(e) => errors.push(e.to_string()),
+            }
+        }
+
+        if accounts.is_empty() {
+            return Err(AdminServiceError::UpstreamError(
+                if errors.is_empty() {
+                    "SSO token import failed".into()
+                } else {
+                    errors.join("; ")
+                },
+            ));
+        }
+
+        Ok(SsoTokenImportResponse {
+            success: true,
+            accounts,
+            errors,
+        })
+    }
+
+        fn classify_add_error(&self, e: anyhow::Error) -> AdminServiceError {
         let msg = e.to_string();
 
         // 凭据验证失败（refreshToken 无效、格式错误等）

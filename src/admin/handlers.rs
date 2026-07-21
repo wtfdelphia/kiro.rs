@@ -93,6 +93,28 @@ pub async fn add_credential(
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
+/// POST /api/admin/credentials/import
+pub async fn import_credential(
+    State(state): State<AdminState>,
+    Json(payload): Json<AddCredentialRequest>,
+) -> impl IntoResponse {
+    match state.service.import_credential(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+/// POST /api/admin/credentials/import/batch
+pub async fn import_credentials_batch(
+    State(state): State<AdminState>,
+    Json(payload): Json<crate::admin::types::BatchImportRequest>,
+) -> impl IntoResponse {
+    match state.service.import_credentials_batch(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+
 
 /// DELETE /api/admin/credentials/:id
 /// 删除凭据
@@ -137,6 +159,74 @@ pub async fn set_load_balancing_mode(
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
         Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+
+/// POST /api/admin/auth/builderid/start
+pub async fn start_builder_id(
+    State(state): State<AdminState>,
+    Json(payload): Json<crate::admin::types::BuilderIdStartRequest>,
+) -> impl IntoResponse {
+    match state.service.start_builder_id_login(payload.region).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/builderid/poll
+pub async fn poll_builder_id(
+    State(state): State<AdminState>,
+    Json(payload): Json<crate::admin::types::BuilderIdPollRequest>,
+) -> impl IntoResponse {
+    match state.service.poll_builder_id_login(payload.session_id).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/iam-sso/start
+pub async fn start_iam_sso(
+    State(state): State<AdminState>,
+    Json(payload): Json<crate::admin::types::IamSsoStartRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .start_iam_sso_login(payload.start_url, payload.region)
+        .await
+    {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/iam-sso/complete
+pub async fn complete_iam_sso(
+    State(state): State<AdminState>,
+    Json(payload): Json<crate::admin::types::IamSsoCompleteRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .complete_iam_sso_login(payload.session_id, payload.callback_url)
+        .await
+    {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/sso-token
+pub async fn import_sso_token(
+    State(state): State<AdminState>,
+    Json(payload): Json<crate::admin::types::SsoTokenImportRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .import_sso_tokens(payload.bearer_token, payload.region)
+        .await
+    {
+        Ok(resp) => Json(resp).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

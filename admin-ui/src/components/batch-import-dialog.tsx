@@ -1,3 +1,4 @@
+
 import { useState } from 'react'
 import { toast } from 'sonner'
 import { CheckCircle2, XCircle, AlertCircle, Loader2 } from 'lucide-react'
@@ -9,8 +10,9 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
-import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
-import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
+import { useCredentials } from '@/hooks/use-credentials'
+import { importCredentialsBatch, type BatchImportItemResult } from '@/api/credentials'
+import type { AddCredentialRequest } from '@/types/api'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 
 interface BatchImportDialogProps {
@@ -30,52 +32,34 @@ interface CredentialInput {
   kiroApiKey?: string
   authMethod?: string
   endpoint?: string
+  userId?: string
+  nickname?: string
+  startUrl?: string
+  provider?: string
+  profileArn?: string
+  email?: string
 }
 
 interface VerificationResult {
   index: number
-  status: 'pending' | 'checking' | 'verifying' | 'verified' | 'duplicate' | 'failed'
+  status: 'pending' | 'checking' | 'verified' | 'verified_warn' | 'duplicate' | 'failed' | 'updated'
   error?: string
   usage?: string
   email?: string
   credentialId?: number
-  rollbackStatus?: 'success' | 'failed' | 'skipped'
-  rollbackError?: string
+  warning?: string
 }
 
-
+const CHUNK_SIZE = 20
 
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
   const [importing, setImporting] = useState(false)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
-  const [currentProcessing, setCurrentProcessing] = useState<string>('')
+  const [currentProcessing, setCurrentProcessing] = useState('')
   const [results, setResults] = useState<VerificationResult[]>([])
 
-  const { data: existingCredentials } = useCredentials()
-  const { mutateAsync: addCredential } = useAddCredential()
-  const { mutateAsync: deleteCredential } = useDeleteCredential()
-
-  const rollbackCredential = async (id: number): Promise<{ success: boolean; error?: string }> => {
-    try {
-      await setCredentialDisabled(id, true)
-    } catch (error) {
-      return {
-        success: false,
-        error: `禁用失败: ${extractErrorMessage(error)}`,
-      }
-    }
-
-    try {
-      await deleteCredential(id)
-      return { success: true }
-    } catch (error) {
-      return {
-        success: false,
-        error: `删除失败: ${extractErrorMessage(error)}`,
-      }
-    }
-  }
+  const { data: existingCredentials, refetch } = useCredentials()
 
   const resetForm = () => {
     setJsonInput('')
@@ -84,8 +68,65 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     setResults([])
   }
 
+  const toRequest = (cred: CredentialInput): AddCredentialRequest => {
+    const isApiKey = !!(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
+    if (isApiKey) {
+      return {
+        authMethod: 'api_key',
+        kiroApiKey: cred.kiroApiKey?.trim(),
+        priority: cred.priority || 0,
+        authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
+        apiRegion: cred.apiRegion?.trim() || undefined,
+        machineId: cred.machineId?.trim() || undefined,
+        endpoint: cred.endpoint?.trim() || undefined,
+        userId: cred.userId?.trim() || undefined,
+        nickname: cred.nickname?.trim() || undefined,
+        email: cred.email?.trim() || undefined,
+      }
+    }
+    return {
+      refreshToken: cred.refreshToken?.trim(),
+      authMethod:
+        (cred.authMethod as AddCredentialRequest['authMethod']) ||
+        (cred.clientId && cred.clientSecret ? 'idc' : 'social'),
+      clientId: cred.clientId?.trim() || undefined,
+      clientSecret: cred.clientSecret?.trim() || undefined,
+      authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
+      apiRegion: cred.apiRegion?.trim() || undefined,
+      priority: cred.priority || 0,
+      machineId: cred.machineId?.trim() || undefined,
+      endpoint: cred.endpoint?.trim() || undefined,
+      provider: cred.provider?.trim() || undefined,
+      profileArn: cred.profileArn?.trim() || undefined,
+      userId: cred.userId?.trim() || undefined,
+      nickname: cred.nickname?.trim() || undefined,
+      startUrl: cred.startUrl?.trim() || undefined,
+      email: cred.email?.trim() || undefined,
+    }
+  }
+
+  const mapServerResult = (
+    r: BatchImportItemResult,
+    displayIndex: number
+  ): VerificationResult => {
+    let status: VerificationResult['status'] = 'failed'
+    if (r.status === 'duplicate') status = 'duplicate'
+    else if (r.status === 'updated') status = r.warning ? 'verified_warn' : 'updated'
+    else if (r.status === 'created') status = r.warning ? 'verified_warn' : 'verified'
+    else if (r.credentialId) status = r.warning ? 'verified_warn' : 'verified'
+
+    return {
+      index: displayIndex,
+      status,
+      error: r.error,
+      email: r.email,
+      credentialId: r.credentialId,
+      warning: r.warning,
+      usage: r.balance ? r.balance.currentUsage + '/' + r.balance.usageLimit : undefined,
+    }
+  }
+
   const handleBatchImport = async () => {
-    // 先单独解析 JSON，给出精准的错误提示
     let credentials: CredentialInput[]
     try {
       const parsed = JSON.parse(jsonInput)
@@ -104,262 +145,130 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       setImporting(true)
       setProgress({ current: 0, total: credentials.length })
 
-      // 2. 初始化结果
-      const initialResults: VerificationResult[] = credentials.map((_, i) => ({
+      const preResults: VerificationResult[] = credentials.map((_, i) => ({
         index: i + 1,
-        status: 'pending'
+        status: 'pending',
       }))
-      setResults(initialResults)
+      setResults([...preResults])
 
-      // 3. 检测重复：OAuth 与 API Key 分别使用对应的 hash 集合
       const existingOauthHashes = new Set(
         existingCredentials?.credentials
-          .map(c => c.refreshTokenHash)
-          .filter((hash): hash is string => Boolean(hash)) || []
+          .map((c) => c.refreshTokenHash)
+          .filter((h): h is string => Boolean(h)) || []
       )
       const existingApiKeyHashes = new Set(
         existingCredentials?.credentials
-          .map(c => c.apiKeyHash)
-          .filter((hash): hash is string => Boolean(hash)) || []
+          .map((c) => c.apiKeyHash)
+          .filter((h): h is string => Boolean(h)) || []
       )
 
-      let successCount = 0
-      let duplicateCount = 0
-      let failCount = 0
-      let rollbackSuccessCount = 0
-      let rollbackFailedCount = 0
-      let rollbackSkippedCount = 0
+      const items: AddCredentialRequest[] = []
+      const indexMap: number[] = []
 
-      // 4. 导入并验活
       for (let i = 0; i < credentials.length; i++) {
         const cred = credentials[i]
-        const isApiKeyCred = !!(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
+        const isApiKey = !!(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
+        preResults[i] = { ...preResults[i], status: 'checking' }
+        setResults([...preResults])
+        setCurrentProcessing('预检 ' + (i + 1) + '/' + credentials.length)
 
-        // 更新状态为检查中
-        setCurrentProcessing(`正在处理凭据 ${i + 1}/${credentials.length}`)
-        setResults(prev => {
-          const newResults = [...prev]
-          newResults[i] = { ...newResults[i], status: 'checking' }
-          return newResults
-        })
-
-        // 客户端去重：OAuth 基于 refreshToken hash，API Key 基于 kiroApiKey hash
-        let credHash = ''
-        if (isApiKeyCred) {
+        if (isApiKey) {
           const apiKey = cred.kiroApiKey?.trim() || ''
           if (!apiKey) {
-            setResults(prev => {
-              const newResults = [...prev]
-              newResults[i] = {
-                ...newResults[i],
-                status: 'failed',
-                error: '缺少 kiroApiKey',
-              }
-              return newResults
-            })
-            failCount++
-            setProgress({ current: i + 1, total: credentials.length })
+            preResults[i] = { ...preResults[i], status: 'failed', error: '缺少 kiroApiKey' }
             continue
           }
-          credHash = await sha256Hex(apiKey)
-          if (existingApiKeyHashes.has(credHash)) {
-            duplicateCount++
-            const existingCred = existingCredentials?.credentials.find(c => c.apiKeyHash === credHash)
-            setResults(prev => {
-              const newResults = [...prev]
-              newResults[i] = {
-                ...newResults[i],
-                status: 'duplicate',
-                error: '该凭据已存在',
-                email: existingCred?.email || undefined
-              }
-              return newResults
-            })
-            setProgress({ current: i + 1, total: credentials.length })
+          const hash = await sha256Hex(apiKey)
+          if (existingApiKeyHashes.has(hash)) {
+            preResults[i] = { ...preResults[i], status: 'duplicate', error: '该凭据已存在' }
             continue
           }
         } else {
           const token = cred.refreshToken?.trim() || ''
           if (!token) {
-            setResults(prev => {
-              const newResults = [...prev]
-              newResults[i] = {
-                ...newResults[i],
-                status: 'failed',
-                error: '缺少 refreshToken',
-              }
-              return newResults
-            })
-            failCount++
-            setProgress({ current: i + 1, total: credentials.length })
+            preResults[i] = { ...preResults[i], status: 'failed', error: '缺少 refreshToken' }
             continue
           }
-          credHash = await sha256Hex(token)
-          if (existingOauthHashes.has(credHash)) {
-            duplicateCount++
-            const existingCred = existingCredentials?.credentials.find(c => c.refreshTokenHash === credHash)
-            setResults(prev => {
-              const newResults = [...prev]
-              newResults[i] = {
-                ...newResults[i],
-                status: 'duplicate',
-                error: '该凭据已存在',
-                email: existingCred?.email || undefined
-              }
-              return newResults
-            })
-            setProgress({ current: i + 1, total: credentials.length })
+          const hash = await sha256Hex(token)
+          if (existingOauthHashes.has(hash)) {
+            preResults[i] = { ...preResults[i], status: 'duplicate', error: '该凭据已存在' }
             continue
           }
         }
 
-        // 更新状态为验活中
-        setResults(prev => {
-          const newResults = [...prev]
-          newResults[i] = { ...newResults[i], status: 'verifying' }
-          return newResults
+        items.push(toRequest(cred))
+        indexMap.push(i)
+      }
+      setResults([...preResults])
+
+      let okCount = 0
+      let warnCount = 0
+      let duplicateCount = preResults.filter((r) => r.status === 'duplicate').length
+      let failCount = preResults.filter((r) => r.status === 'failed').length
+
+      for (let offset = 0; offset < items.length; offset += CHUNK_SIZE) {
+        const chunk = items.slice(offset, offset + CHUNK_SIZE)
+        const chunkIndexes = indexMap.slice(offset, offset + CHUNK_SIZE)
+        setCurrentProcessing(
+          '服务端导入 ' +
+            (offset + 1) +
+            '-' +
+            Math.min(offset + chunk.length, items.length) +
+            ' / ' +
+            items.length
+        )
+
+        const resp = await importCredentialsBatch({
+          items: chunk,
+          options: {
+            onConflict: 'upsert',
+            stopOnError: false,
+            fetchBalance: true,
+            concurrency: 1,
+          },
         })
 
-        let addedCredId: number | null = null
-
-        try {
-          // 添加凭据
-          if (isApiKeyCred) {
-            // API Key 凭据
-            const addedCred = await addCredential({
-              authMethod: 'api_key',
-              kiroApiKey: cred.kiroApiKey?.trim(),
-              priority: cred.priority || 0,
-              authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
-              apiRegion: cred.apiRegion?.trim() || undefined,
-              machineId: cred.machineId?.trim() || undefined,
-              endpoint: cred.endpoint?.trim() || undefined,
-            })
-
-            addedCredId = addedCred.credentialId
-
-            // 延迟 1 秒
-            await new Promise(resolve => setTimeout(resolve, 1000))
-
-            // 验活
-            const balance = await getCredentialBalance(addedCred.credentialId)
-
-            successCount++
-            existingApiKeyHashes.add(credHash)
-            setCurrentProcessing(addedCred.email ? `验活成功: ${addedCred.email}` : `验活成功: 凭据 ${i + 1}`)
-            setResults(prev => {
-              const newResults = [...prev]
-              newResults[i] = {
-                ...newResults[i],
-                status: 'verified',
-                usage: `${balance.currentUsage}/${balance.usageLimit}`,
-                email: addedCred.email || undefined,
-                credentialId: addedCred.credentialId
-              }
-              return newResults
-            })
-            setProgress({ current: i + 1, total: credentials.length })
-            continue
-          }
-
-          // OAuth 凭据
-          const token = cred.refreshToken!.trim()
-          const clientId = cred.clientId?.trim() || undefined
-          const clientSecret = cred.clientSecret?.trim() || undefined
-          const authMethod = clientId && clientSecret ? 'idc' : 'social'
-
-          // idc 模式下必须同时提供 clientId 和 clientSecret
-          if (authMethod === 'social' && (clientId || clientSecret)) {
-            throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
-          }
-
-          const addedCred = await addCredential({
-            refreshToken: token,
-            authMethod,
-            authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
-            apiRegion: cred.apiRegion?.trim() || undefined,
-            clientId,
-            clientSecret,
-            priority: cred.priority || 0,
-            machineId: cred.machineId?.trim() || undefined,
-            endpoint: cred.endpoint?.trim() || undefined,
-          })
-
-          addedCredId = addedCred.credentialId
-
-          // 延迟 1 秒
-          await new Promise(resolve => setTimeout(resolve, 1000))
-
-          // 验活
-          const balance = await getCredentialBalance(addedCred.credentialId)
-
-          // 验活成功
-          successCount++
-          existingOauthHashes.add(credHash)
-          setCurrentProcessing(addedCred.email ? `验活成功: ${addedCred.email}` : `验活成功: 凭据 ${i + 1}`)
-          setResults(prev => {
-            const newResults = [...prev]
-            newResults[i] = {
-              ...newResults[i],
-              status: 'verified',
-              usage: `${balance.currentUsage}/${balance.usageLimit}`,
-              email: addedCred.email || undefined,
-              credentialId: addedCred.credentialId
-            }
-            return newResults
-          })
-        } catch (error) {
-          // 验活失败，尝试回滚（先禁用再删除）
-          let rollbackStatus: VerificationResult['rollbackStatus'] = 'skipped'
-          let rollbackError: string | undefined
-
-          if (addedCredId) {
-            const rollbackResult = await rollbackCredential(addedCredId)
-            if (rollbackResult.success) {
-              rollbackStatus = 'success'
-              rollbackSuccessCount++
-            } else {
-              rollbackStatus = 'failed'
-              rollbackFailedCount++
-              rollbackError = rollbackResult.error
-            }
-          } else {
-            rollbackSkippedCount++
-          }
-
-          failCount++
-          setResults(prev => {
-            const newResults = [...prev]
-            newResults[i] = {
-              ...newResults[i],
-              status: 'failed',
-              error: extractErrorMessage(error),
-              email: undefined,
-              rollbackStatus,
-              rollbackError,
-            }
-            return newResults
-          })
+        for (const r of resp.results) {
+          const originalIndex = chunkIndexes[r.index]
+          const ui = mapServerResult(r, originalIndex + 1)
+          preResults[originalIndex] = ui
+          if (ui.status === 'verified' || ui.status === 'updated') okCount++
+          else if (ui.status === 'verified_warn') {
+            okCount++
+            warnCount++
+          } else if (ui.status === 'duplicate') duplicateCount++
+          else if (ui.status === 'failed') failCount++
         }
 
-        setProgress({ current: i + 1, total: credentials.length })
+        setResults([...preResults])
+        setProgress({
+          current: Math.min(
+            credentials.length - items.length + offset + chunk.length,
+            credentials.length
+          ),
+          total: credentials.length,
+        })
       }
 
-      // 显示结果
-      if (failCount === 0 && duplicateCount === 0) {
-        toast.success(`成功导入并验活 ${successCount} 个凭据`)
-      } else {
-        const failureSummary = failCount > 0
-          ? `，失败 ${failCount} 个（已排除 ${rollbackSuccessCount}，未排除 ${rollbackFailedCount}，无需排除 ${rollbackSkippedCount}）`
-          : ''
-        toast.info(`验活完成：成功 ${successCount} 个，重复 ${duplicateCount} 个${failureSummary}`)
+      setProgress({ current: credentials.length, total: credentials.length })
+      setCurrentProcessing('')
+      await refetch()
 
-        if (rollbackFailedCount > 0) {
-          toast.warning(`有 ${rollbackFailedCount} 个失败凭据回滚未完成，请手动禁用并删除`)
-        }
+      if (okCount > 0) {
+        toast.success(
+          '导入完成：成功 ' +
+            okCount +
+            (warnCount ? '（含 ' + warnCount + ' 条 profile 警告）' : '') +
+            '，重复 ' +
+            duplicateCount +
+            '，失败 ' +
+            failCount
+        )
+      } else {
+        toast.error('导入失败：重复 ' + duplicateCount + '，失败 ' + failCount)
       }
     } catch (error) {
-      toast.error('导入失败: ' + extractErrorMessage(error))
+      toast.error('批量导入失败: ' + extractErrorMessage(error))
     } finally {
       setImporting(false)
     }
@@ -367,107 +276,95 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
   const getStatusIcon = (status: VerificationResult['status']) => {
     switch (status) {
-      case 'pending':
-        return <div className="w-5 h-5 rounded-full border-2 border-gray-300" />
-      case 'checking':
-      case 'verifying':
-        return <Loader2 className="w-5 h-5 animate-spin text-blue-500" />
       case 'verified':
-        return <CheckCircle2 className="w-5 h-5 text-green-500" />
+      case 'updated':
+        return <CheckCircle2 className="h-4 w-4 text-green-600" />
+      case 'verified_warn':
       case 'duplicate':
-        return <AlertCircle className="w-5 h-5 text-yellow-500" />
+        return <AlertCircle className="h-4 w-4 text-yellow-600" />
       case 'failed':
-        return <XCircle className="w-5 h-5 text-red-500" />
+        return <XCircle className="h-4 w-4 text-red-600" />
+      default:
+        return <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
     }
   }
 
   const getStatusText = (result: VerificationResult) => {
     switch (result.status) {
-      case 'pending':
-        return '等待中'
-      case 'checking':
-        return '检查重复...'
-      case 'verifying':
-        return '验活中...'
       case 'verified':
-        return '验活成功'
+        return '成功'
+      case 'updated':
+        return '已更新'
+      case 'verified_warn':
+        return '成功（缺 profile）'
       case 'duplicate':
-        return '重复凭据'
+        return '重复'
       case 'failed':
-        if (result.rollbackStatus === 'success') return '验活失败（已排除）'
-        if (result.rollbackStatus === 'failed') return '验活失败（未排除）'
-        return '验活失败（未创建）'
+        return '失败'
+      case 'checking':
+        return '检查中'
+      default:
+        return '等待'
     }
   }
 
   return (
-    <Dialog
-      open={open}
-      onOpenChange={(newOpen) => {
-        // 关闭时清空表单（但不在导入过程中清空）
-        if (!newOpen && !importing) {
-          resetForm()
-        }
-        onOpenChange(newOpen)
-      }}
-    >
-      <DialogContent className="sm:max-w-2xl max-h-[80vh] flex flex-col">
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-2xl max-h-[85vh] flex flex-col">
         <DialogHeader>
-          <DialogTitle>批量导入凭据（自动验活）</DialogTitle>
+          <DialogTitle>批量导入凭据</DialogTitle>
         </DialogHeader>
 
-        <div className="flex-1 overflow-y-auto space-y-4 py-4">
+        <div className="space-y-4 overflow-y-auto flex-1">
           <div className="space-y-2">
-            <label className="text-sm font-medium">
-              JSON 格式凭据
-            </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
+              className="w-full min-h-[160px] rounded-md border bg-background p-3 text-sm font-mono"
+              placeholder="JSON 数组或对象，支持 refreshToken / kiroApiKey / userId 等字段"
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
-              className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
             <p className="text-xs text-muted-foreground">
-              💡 导入时自动验活，失败的凭据会被排除
+              主路径走服务端 batch import（默认 upsert）；客户端仅做空字段与 hash 预检。
             </p>
           </div>
 
           {(importing || results.length > 0) && (
             <>
-              {/* 进度条 */}
               <div className="space-y-2">
                 <div className="flex justify-between text-sm">
-                  <span>{importing ? '验活进度' : '验活完成'}</span>
-                  <span>{progress.current} / {progress.total}</span>
+                  <span>{importing ? '导入进度' : '导入完成'}</span>
+                  <span>
+                    {progress.current} / {progress.total}
+                  </span>
                 </div>
                 <div className="w-full bg-secondary rounded-full h-2">
                   <div
                     className="bg-primary h-2 rounded-full transition-all"
-                    style={{ width: `${(progress.current / progress.total) * 100}%` }}
+                    style={{
+                      width: (progress.total ? (progress.current / progress.total) * 100 : 0) + '%',
+                    }}
                   />
                 </div>
                 {importing && currentProcessing && (
-                  <div className="text-xs text-muted-foreground">
-                    {currentProcessing}
-                  </div>
+                  <div className="text-xs text-muted-foreground">{currentProcessing}</div>
                 )}
               </div>
 
-              {/* 统计 */}
-              <div className="flex gap-4 text-sm">
+              <div className="flex flex-wrap gap-4 text-sm">
                 <span className="text-green-600 dark:text-green-400">
-                  ✓ 成功: {results.filter(r => r.status === 'verified').length}
+                  成功:{' '}
+                  {results.filter((r) => r.status === 'verified' || r.status === 'updated').length}
                 </span>
                 <span className="text-yellow-600 dark:text-yellow-400">
-                  ⚠ 重复: {results.filter(r => r.status === 'duplicate').length}
+                  警告/重复:{' '}
+                  {results.filter((r) => r.status === 'verified_warn' || r.status === 'duplicate').length}
                 </span>
                 <span className="text-red-600 dark:text-red-400">
-                  ✗ 失败: {results.filter(r => r.status === 'failed').length}
+                  失败: {results.filter((r) => r.status === 'failed').length}
                 </span>
               </div>
 
-              {/* 结果列表 */}
               <div className="border rounded-md divide-y max-h-[300px] overflow-y-auto">
                 {results.map((result) => (
                   <div key={result.index} className="p-3">
@@ -476,7 +373,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2">
                           <span className="text-sm font-medium">
-                            {result.email || `凭据 #${result.index}`}
+                            {result.email || '凭据 #' + result.index}
                           </span>
                           <span className="text-xs text-muted-foreground">
                             {getStatusText(result)}
@@ -487,14 +384,14 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                             用量: {result.usage}
                           </div>
                         )}
+                        {result.warning && (
+                          <div className="text-xs text-yellow-600 dark:text-yellow-400 mt-1">
+                            {result.warning}
+                          </div>
+                        )}
                         {result.error && (
                           <div className="text-xs text-red-600 dark:text-red-400 mt-1">
                             {result.error}
-                          </div>
-                        )}
-                        {result.rollbackError && (
-                          <div className="text-xs text-red-600 dark:text-red-400 mt-1">
-                            回滚失败: {result.rollbackError}
                           </div>
                         )}
                       </div>
@@ -516,7 +413,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             }}
             disabled={importing}
           >
-            {importing ? '验活中...' : results.length > 0 ? '关闭' : '取消'}
+            {importing ? '导入中...' : results.length > 0 ? '关闭' : '取消'}
           </Button>
           {results.length === 0 && (
             <Button
@@ -524,7 +421,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               onClick={handleBatchImport}
               disabled={importing || !jsonInput.trim()}
             >
-              开始导入并验活
+              开始批量导入
             </Button>
           )}
         </DialogFooter>
