@@ -14,7 +14,9 @@ use crate::kiro::token_manager::MultiTokenManager;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    CredentialModelsResponse, CredentialsStatusResponse, LoadBalancingModeResponse,
+    ModelsRefreshAllResponse, ModelsRefreshErrorItem, ModelsRefreshResponse,
+    SetLoadBalancingModeRequest, TestCredentialRequest, TestCredentialResponse,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -118,6 +120,10 @@ impl AdminService {
         if disabled && id == current_id {
             let _ = self.token_manager.switch_to_next();
         }
+        // 重新启用时异步刷新模型
+        if !disabled {
+            self.token_manager.spawn_refresh_models_arc(id);
+        }
         Ok(())
     }
 
@@ -132,7 +138,10 @@ impl AdminService {
     pub fn reset_and_enable(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager
             .reset_and_enable(id)
-            .map_err(|e| self.classify_error(e, id))
+            .map_err(|e| self.classify_error(e, id))?;
+        // 启用后异步刷新模型缓存
+        self.token_manager.spawn_refresh_models_arc(id);
+        Ok(())
     }
 
     /// 获取凭据余额（带缓存）
@@ -272,6 +281,9 @@ impl AdminService {
         if let Err(e) = self.token_manager.get_usage_limits_for(result.id).await {
             tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
         }
+
+        // 异步刷新模型缓存（失败不影响添加）
+        self.token_manager.spawn_refresh_models_arc(result.id);
 
         Ok(AddCredentialResponse {
             success: true,
@@ -453,6 +465,189 @@ impl AdminService {
             .force_refresh_token_for(id)
             .await
             .map_err(|e| self.classify_balance_error(e, id))
+    }
+
+    /// 刷新单凭据模型缓存
+    pub async fn refresh_models(
+        &self,
+        id: u64,
+    ) -> Result<ModelsRefreshResponse, AdminServiceError> {
+        let result = self
+            .token_manager
+            .refresh_models_for(id)
+            .await
+            .map_err(|e| self.classify_balance_error(e, id))?;
+        Ok(ModelsRefreshResponse {
+            success: true,
+            credential_id: result.credential_id,
+            count: result.count,
+            models: result.models,
+            updated_at: result.updated_at,
+        })
+    }
+
+    /// 刷新全部启用凭据模型缓存
+    pub async fn refresh_models_all(&self) -> ModelsRefreshAllResponse {
+        let result = self.token_manager.refresh_models_all().await;
+        ModelsRefreshAllResponse {
+            success: true,
+            refreshed: result.refreshed,
+            failed: result.failed,
+            global_count: result.global_count,
+            errors: result
+                .errors
+                .into_iter()
+                .map(|(credential_id, error)| ModelsRefreshErrorItem {
+                    credential_id,
+                    error,
+                })
+                .collect(),
+        }
+    }
+
+    /// 查看凭据模型（缓存；live=true 时先刷新）
+    pub async fn get_credential_models(
+        &self,
+        id: u64,
+        live: bool,
+    ) -> Result<CredentialModelsResponse, AdminServiceError> {
+        if live {
+            let _ = self.refresh_models(id).await?;
+        }
+        let snap = self
+            .token_manager
+            .get_credential_models_cached(id)
+            .map_err(|e| self.classify_error(e, id))?;
+        Ok(CredentialModelsResponse {
+            success: true,
+            models: snap.models,
+            updated_at: snap.updated_at,
+            last_error: snap.last_error,
+        })
+    }
+
+    /// 对指定凭据做最小真实推理探测
+    pub async fn test_credential(
+        &self,
+        id: u64,
+        req: TestCredentialRequest,
+    ) -> Result<TestCredentialResponse, AdminServiceError> {
+        use crate::anthropic::map_model;
+        use crate::kiro::model::requests::conversation::{
+            ConversationState, CurrentMessage, UserInputMessage,
+        };
+        use crate::kiro::model::requests::kiro::KiroRequest;
+        use std::time::Instant;
+
+        let requested = req
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("claude-sonnet-4.6");
+
+        let model_id = map_model(requested).ok_or_else(|| {
+            AdminServiceError::InvalidCredential(format!("模型不支持或无法映射: {}", requested))
+        })?;
+
+        let state = ConversationState::new(uuid::Uuid::new_v4().to_string())
+            .with_agent_task_type("vibe")
+            .with_chat_trigger_type("MANUAL")
+            .with_current_message(CurrentMessage::new(UserInputMessage::new(
+                "say ok",
+                model_id.clone(),
+            )));
+        let kiro_req = KiroRequest {
+            conversation_state: state,
+            profile_arn: None,
+        };
+        let body = serde_json::to_string(&kiro_req).map_err(|e| {
+            AdminServiceError::InternalError(format!("序列化测试请求失败: {}", e))
+        })?;
+
+        let started = Instant::now();
+        let reply = self
+            .run_minimal_generate(id, &body)
+            .await
+            .map_err(|e| self.classify_balance_error(e, id))?;
+        let latency_ms = started.elapsed().as_millis() as u64;
+
+        Ok(TestCredentialResponse {
+            success: true,
+            model: requested.to_string(),
+            reply: Some(reply),
+            latency_ms,
+        })
+    }
+
+    /// 使用指定凭据发送最小 generate（非流式解析文本）
+    async fn run_minimal_generate(&self, id: u64, request_body: &str) -> anyhow::Result<String> {
+        use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
+        use crate::kiro::endpoint::ide::IdeEndpoint;
+        use crate::kiro::machine_id;
+        use crate::kiro::parser::decoder::EventStreamDecoder;
+        use crate::kiro::model::events::Event;
+        use crate::http_client::build_client;
+        use futures::StreamExt;
+
+        let token = self.token_manager.ensure_access_token(id).await?;
+        let mut credentials = self.token_manager.credentials_clone(id)?;
+
+        if let Err(e) = crate::kiro::profile::ensure_profile_arn_for_request(
+            &self.token_manager,
+            id,
+            &mut credentials,
+            &token,
+        )
+        .await
+        {
+            tracing::warn!("test 前 profileArn 失败: {}", e);
+        }
+
+        let config = self.token_manager.config();
+        let machine = machine_id::generate_from_credentials(&credentials, config);
+        let endpoint = IdeEndpoint::default();
+        let rctx = RequestContext {
+            credentials: &credentials,
+            token: &token,
+            machine_id: &machine,
+            config,
+        };
+        let url = endpoint.api_url(&rctx);
+        let body = endpoint.transform_api_body(request_body, &rctx);
+        let proxy = credentials.effective_proxy(self.token_manager.global_proxy());
+        let client = build_client(proxy.as_ref(), 60, config.tls_backend)?;
+        let base = client
+            .post(&url)
+            .body(body)
+            .header("content-type", "application/json")
+            .header("Connection", "close");
+        let request = endpoint.decorate_api(base, &rctx);
+        let response = request.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            let summary: String = text.chars().take(400).collect();
+            anyhow::bail!("上游 generate 失败: {} {}", status.as_u16(), summary);
+        }
+
+        let mut decoder = EventStreamDecoder::new();
+        let mut stream = response.bytes_stream();
+        let mut content = String::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            decoder.feed(&chunk)?;
+            for result in decoder.decode_iter() {
+                let frame = match result {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+                if let Ok(Event::AssistantResponse(ev)) = Event::from_frame(frame) {
+                    content.push_str(&ev.content);
+                }
+            }
+        }
+        Ok(content)
     }
 
     // ============ 余额缓存持久化 ============
@@ -804,3 +999,56 @@ impl AdminService {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admin::types::TestCredentialRequest;
+    use crate::kiro::model::credentials::KiroCredentials;
+    use crate::model::config::Config;
+
+    fn manager_with_one() -> Arc<MultiTokenManager> {
+        let mut c = KiroCredentials::default();
+        c.refresh_token = Some("a".repeat(150));
+        Arc::new(
+            MultiTokenManager::new(Config::default(), vec![c], None, None, false).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_credential_rejects_unmapped_model() {
+        let mgr = manager_with_one();
+        let service = AdminService::new(mgr, Vec::<String>::new());
+        let err = service
+            .test_credential(
+                1,
+                TestCredentialRequest {
+                    model: Some("gpt-4".into()),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        let body = serde_json::to_string(&err.into_response()).unwrap();
+        assert!(!body.to_lowercase().contains("refreshtoken"));
+        assert!(!body.to_lowercase().contains("accesstoken"));
+    }
+
+    #[tokio::test]
+    async fn refresh_models_not_found() {
+        let mgr = manager_with_one();
+        let service = AdminService::new(mgr, Vec::<String>::new());
+        let err = service.refresh_models(999).await.unwrap_err();
+        assert_eq!(err.status_code(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_credential_models_not_found() {
+        let mgr = manager_with_one();
+        let service = AdminService::new(mgr, Vec::<String>::new());
+        let err = service.get_credential_models(999, false).await.unwrap_err();
+        assert_eq!(err.status_code(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+}
+

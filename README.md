@@ -381,7 +381,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 | 端点 | 方法 | 描述 |
 |------|------|------|
-| `/v1/models` | GET | 获取可用模型列表 |
+| /v1/models | GET | 获取可用模型列表（优先全局模型缓存并附 -thinking 变体；缓存为空时回退内置静态列表） |
 | `/v1/messages` | POST | 创建消息（对话） |
 | `/v1/messages/count_tokens` | POST | 估算 Token 数量 |
 
@@ -465,6 +465,11 @@ Sonnet 5 的 thinking 行为与已知限制见 [docs/claude-sonnet-5.md](docs/cl
   - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
   - `POST /api/admin/credentials/:id/reset` - 重置失败计数
   - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
+  - `POST /api/admin/credentials/:id/refresh` - 强制刷新 Token
+  - `POST /api/admin/credentials/models/refresh` - 刷新全部启用凭据的模型目录
+  - `POST /api/admin/credentials/:id/models/refresh` - 刷新单凭据模型目录
+  - `GET /api/admin/credentials/:id/models` - 查看凭据模型缓存（`?live=true` 时先刷新）
+  - `POST /api/admin/credentials/:id/test` - 对凭据做最小真实推理探测（可选 body model，默认 claude-sonnet-4.6）
 
 - **Admin UI**
   - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）

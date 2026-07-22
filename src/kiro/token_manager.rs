@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,11 +19,15 @@ use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
+use crate::kiro::model::available_models::{
+    merge_unique_models, model_id_set, set_contains_model, UpstreamModelInfo,
+};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
+use crate::kiro::models_api::list_available_models;
 use crate::model::config::Config;
 
 /// 检查 Token 是否在指定时间内过期
@@ -585,6 +590,48 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 凭据级模型缓存（modelId 小写集合 + 原始列表）
+    model_catalog: Mutex<ModelCatalogState>,
+}
+
+#[derive(Debug, Default)]
+struct ModelCatalogState {
+    global: Vec<UpstreamModelInfo>,
+    per_credential: HashMap<u64, CredentialModelCache>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CredentialModelCache {
+    model_ids: HashSet<String>,
+    raw: Vec<UpstreamModelInfo>,
+    updated_at: Option<String>,
+    last_error: Option<String>,
+}
+
+/// Admin 查看用的模型缓存快照
+#[derive(Debug, Clone)]
+pub struct CredentialModelsSnapshot {
+    pub models: Vec<String>,
+    pub updated_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+/// 单凭据模型刷新结果
+#[derive(Debug, Clone)]
+pub struct ModelsRefreshResult {
+    pub credential_id: u64,
+    pub count: usize,
+    pub models: Vec<String>,
+    pub updated_at: String,
+}
+
+/// 全量刷新结果
+#[derive(Debug, Clone)]
+pub struct ModelsRefreshAllResult {
+    pub refreshed: usize,
+    pub failed: usize,
+    pub global_count: usize,
+    pub errors: Vec<(u64, String)>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -714,6 +761,7 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            model_catalog: Mutex::new(ModelCatalogState::default()),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -807,6 +855,9 @@ impl MultiTokenManager {
             .map(|m| m.to_lowercase().contains("opus"))
             .unwrap_or(false);
 
+        // 模型集合过滤：与缓存 modelId 比较（兼容 4-6/4.6）；上游 Kiro 请求体通常已是 map 后的 id
+        let catalog = self.model_catalog.lock();
+
         // 过滤可用凭据
         let available: Vec<_> = entries
             .iter()
@@ -817,6 +868,16 @@ impl MultiTokenManager {
                 // 如果是 opus 模型，需要检查订阅等级
                 if is_opus && !e.credentials.supports_opus() {
                     return false;
+                }
+                // 按 model set 过滤：无缓存或空集合 = 冷启动乐观放行
+                if let Some(m) = model {
+                    if let Some(cache) = catalog.per_credential.get(&e.id) {
+                        if !cache.model_ids.is_empty()
+                            && !set_contains_model(&cache.model_ids, m)
+                        {
+                            return false;
+                        }
+                    }
                 }
                 true
             })
@@ -2092,6 +2153,13 @@ impl MultiTokenManager {
         // 立即回写统计数据，清除已删除凭据的残留条目
         self.save_stats();
 
+        // 清理模型缓存并重建全局聚合
+        {
+            let mut catalog = self.model_catalog.lock();
+            catalog.per_credential.remove(&id);
+            self.rebuild_global_catalog_locked(&mut catalog);
+        }
+
         tracing::info!("已删除凭据 #{}", id);
         Ok(())
     }
@@ -2134,6 +2202,273 @@ impl MultiTokenManager {
 
         tracing::info!("凭据 #{} Token 已强制刷新", id);
         Ok(())
+    }
+
+    // ========================================================================
+    // 模型目录缓存（ListAvailableModels）
+    // ========================================================================
+
+    /// 异步刷新指定凭据模型缓存（失败仅 log）
+    pub fn spawn_refresh_models_arc(self: &std::sync::Arc<Self>, id: u64) {
+        let manager = std::sync::Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(e) = manager.refresh_models_for(id).await {
+                tracing::warn!("凭据 #{} 异步刷新模型失败: {}", id, e);
+            }
+        });
+    }
+
+    fn rebuild_global_catalog_locked(&self, catalog: &mut ModelCatalogState) {
+        let mut global: Vec<UpstreamModelInfo> = Vec::new();
+        for cache in catalog.per_credential.values() {
+            global = merge_unique_models(&global, &cache.raw);
+        }
+        catalog.global = global;
+    }
+
+    /// 全局聚合模型列表（只读克隆）
+    pub fn global_model_catalog(&self) -> Vec<UpstreamModelInfo> {
+        self.model_catalog.lock().global.clone()
+    }
+
+    /// 获取凭据克隆（Admin test / 内部运维）
+    pub fn credentials_clone(&self, id: u64) -> anyhow::Result<KiroCredentials> {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.credentials.clone())
+            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))
+    }
+
+    /// 确保 token 可用并返回 access token（Admin test）
+    pub async fn ensure_access_token(&self, id: u64) -> anyhow::Result<String> {
+        let credentials = self.credentials_clone(id)?;
+        if credentials.is_api_key_credential() {
+            return credentials
+                .kiro_api_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"));
+        }
+        let needs_refresh =
+            is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
+        if needs_refresh {
+            let _guard = self.refresh_lock.lock().await;
+            let current = self.credentials_clone(id)?;
+            if is_token_expired(&current) || is_token_expiring_soon(&current) {
+                let effective_proxy = current.effective_proxy(self.proxy.as_ref());
+                let new_creds =
+                    refresh_token(&current, &self.config, effective_proxy.as_ref()).await?;
+                {
+                    let mut entries = self.entries.lock();
+                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                        entry.credentials = new_creds.clone();
+                    }
+                }
+                let _ = self.persist_credentials();
+                return new_creds
+                    .access_token
+                    .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"));
+            }
+            return current
+                .access_token
+                .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"));
+        }
+        credentials
+            .access_token
+            .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))
+    }
+
+    /// 读取凭据模型缓存
+    pub fn get_credential_models_cached(&self, id: u64) -> anyhow::Result<CredentialModelsSnapshot> {
+        let entries = self.entries.lock();
+        if !entries.iter().any(|e| e.id == id) {
+            anyhow::bail!("凭据不存在: {}", id);
+        }
+        drop(entries);
+        let catalog = self.model_catalog.lock();
+        let cache = catalog.per_credential.get(&id);
+        Ok(CredentialModelsSnapshot {
+            models: cache
+                .map(|c| {
+                    let mut v: Vec<String> = c.model_ids.iter().cloned().collect();
+                    v.sort();
+                    v
+                })
+                .unwrap_or_default(),
+            updated_at: cache.and_then(|c| c.updated_at.clone()),
+            last_error: cache.and_then(|c| c.last_error.clone()),
+        })
+    }
+
+    /// 刷新单个凭据模型缓存
+    pub async fn refresh_models_for(&self, id: u64) -> anyhow::Result<ModelsRefreshResult> {
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        let token = if credentials.is_api_key_credential() {
+            credentials
+                .kiro_api_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?
+        } else {
+            // 复用 get_usage_limits_for 的 ensure token 逻辑路径：force 刷新过期
+            let needs_refresh =
+                is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
+            if needs_refresh {
+                let _guard = self.refresh_lock.lock().await;
+                let current = {
+                    let entries = self.entries.lock();
+                    entries
+                        .iter()
+                        .find(|e| e.id == id)
+                        .map(|e| e.credentials.clone())
+                        .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+                };
+                if is_token_expired(&current) || is_token_expiring_soon(&current) {
+                    let effective_proxy = current.effective_proxy(self.proxy.as_ref());
+                    let new_creds =
+                        refresh_token(&current, &self.config, effective_proxy.as_ref()).await?;
+                    {
+                        let mut entries = self.entries.lock();
+                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                            entry.credentials = new_creds.clone();
+                        }
+                    }
+                    let _ = self.persist_credentials();
+                    new_creds
+                        .access_token
+                        .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
+                } else {
+                    current
+                        .access_token
+                        .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
+                }
+            } else {
+                credentials
+                    .access_token
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
+            }
+        };
+
+        let mut credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        if let Err(e) = crate::kiro::profile::ensure_profile_arn_for_request(
+            self,
+            id,
+            &mut credentials,
+            &token,
+        )
+        .await
+        {
+            tracing::warn!(
+                "凭据 #{} 刷新模型前 profileArn 解析失败（继续）: {}",
+                id,
+                e
+            );
+        }
+
+        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let models = match list_available_models(
+            &credentials,
+            &self.config,
+            &token,
+            effective_proxy.as_ref(),
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                // 失败保留旧缓存，仅记录 last_error
+                let mut catalog = self.model_catalog.lock();
+                let entry = catalog.per_credential.entry(id).or_default();
+                entry.last_error = Some(e.to_string());
+                return Err(e);
+            }
+        };
+
+        let ids = model_id_set(&models);
+        let updated_at = Utc::now().to_rfc3339();
+        let model_list: Vec<String> = {
+            let mut v: Vec<String> = ids.iter().cloned().collect();
+            v.sort();
+            v
+        };
+
+        {
+            let mut catalog = self.model_catalog.lock();
+            catalog.per_credential.insert(
+                id,
+                CredentialModelCache {
+                    model_ids: ids,
+                    raw: models,
+                    updated_at: Some(updated_at.clone()),
+                    last_error: None,
+                },
+            );
+            self.rebuild_global_catalog_locked(&mut catalog);
+        }
+
+        tracing::info!(
+            "凭据 #{} 模型缓存已刷新: {} 个",
+            id,
+            model_list.len()
+        );
+
+        Ok(ModelsRefreshResult {
+            credential_id: id,
+            count: model_list.len(),
+            models: model_list,
+            updated_at,
+        })
+    }
+
+    /// 刷新所有未禁用凭据的模型缓存
+    pub async fn refresh_models_all(&self) -> ModelsRefreshAllResult {
+        let ids: Vec<u64> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .filter(|e| !e.disabled)
+                .map(|e| e.id)
+                .collect()
+        };
+
+        let mut refreshed = 0usize;
+        let mut failed = 0usize;
+        let mut errors = Vec::new();
+
+        for id in ids {
+            match self.refresh_models_for(id).await {
+                Ok(_) => refreshed += 1,
+                Err(e) => {
+                    failed += 1;
+                    errors.push((id, e.to_string()));
+                }
+            }
+        }
+
+        let global_count = self.model_catalog.lock().global.len();
+        ModelsRefreshAllResult {
+            refreshed,
+            failed,
+            global_count,
+            errors,
+        }
     }
 
     /// 获取负载均衡模式（Admin API）
@@ -2898,6 +3233,221 @@ mod tests {
             .unwrap();
         assert_eq!(r.action, IngestAction::Created);
         assert_eq!(manager.snapshot().total, 2);
+    }
+
+
+    fn sample_cred(priority: u32) -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.priority = priority;
+        c.refresh_token = Some("a".repeat(150));
+        c
+    }
+
+    fn inject_models(manager: &MultiTokenManager, id: u64, models: &[&str]) {
+        let mut catalog = manager.model_catalog.lock();
+        let model_ids = models.iter().map(|m| m.to_lowercase()).collect();
+        catalog.per_credential.insert(
+            id,
+            CredentialModelCache {
+                model_ids,
+                raw: models
+                    .iter()
+                    .map(|m| UpstreamModelInfo {
+                        model_id: (*m).to_string(),
+                        model_name: None,
+                        description: None,
+                        input_types: vec![],
+                        rate_multiplier: None,
+                        token_limits: None,
+                    })
+                    .collect(),
+                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+                last_error: None,
+            },
+        );
+        manager.rebuild_global_catalog_locked(&mut catalog);
+    }
+
+    #[test]
+    fn test_select_next_credential_filters_by_model_set() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![sample_cred(1), sample_cred(2)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // id 1 / 2 assigned
+        inject_models(&manager, 1, &["claude-sonnet-4.6"]);
+        inject_models(&manager, 2, &["claude-opus-4.6"]);
+
+        let selected = manager
+            .select_next_credential(Some("claude-opus-4.6"))
+            .expect("should pick credential with opus in set");
+        assert_eq!(selected.0, 2);
+    }
+
+    #[test]
+    fn test_select_next_credential_cold_start_optimistic() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![sample_cred(1)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // no model cache injected
+        let selected = manager
+            .select_next_credential(Some("claude-sonnet-4.6"))
+            .expect("cold start should not skip");
+        assert_eq!(selected.0, 1);
+    }
+
+    #[test]
+    fn test_select_next_credential_empty_set_optimistic() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![sample_cred(1)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        {
+            let mut catalog = manager.model_catalog.lock();
+            catalog.per_credential.insert(
+                1,
+                CredentialModelCache {
+                    model_ids: HashSet::new(),
+                    raw: vec![],
+                    updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+                    last_error: None,
+                },
+            );
+        }
+        let selected = manager
+            .select_next_credential(Some("claude-sonnet-4.6"))
+            .expect("empty set is cold-start optimistic");
+        assert_eq!(selected.0, 1);
+    }
+
+    #[test]
+    fn test_select_next_credential_opus_subscription_still_blocks() {
+        let config = Config::default();
+        let mut free = sample_cred(1);
+        free.subscription_title = Some("Free".to_string());
+        let manager =
+            MultiTokenManager::new(config, vec![free], None, None, false).unwrap();
+        // even with empty cache (optimistic for model set), opus free must block
+        let selected = manager.select_next_credential(Some("claude-opus-4.6"));
+        assert!(selected.is_none(), "free tier must not get opus");
+    }
+
+    #[test]
+    fn test_delete_credential_clears_model_catalog() {
+        let config = Config::default();
+        let mut c = sample_cred(1);
+        c.disabled = true;
+        let manager =
+            MultiTokenManager::new(config, vec![c], None, None, false).unwrap();
+        inject_models(&manager, 1, &["claude-sonnet-4.6"]);
+        assert!(!manager.global_model_catalog().is_empty());
+        manager.delete_credential(1).unwrap();
+        assert!(manager.global_model_catalog().is_empty());
+        assert!(manager.get_credential_models_cached(1).is_err());
+    }
+
+    #[test]
+    fn test_global_catalog_merge_from_per_credential() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![sample_cred(1), sample_cred(2)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        inject_models(&manager, 1, &["claude-sonnet-4.6"]);
+        inject_models(&manager, 2, &["claude-sonnet-4.6", "claude-opus-4.6"]);
+        let global = manager.global_model_catalog();
+        let ids: Vec<_> = global.iter().map(|m| m.model_id.as_str()).collect();
+        assert!(ids.contains(&"claude-sonnet-4.6"));
+        assert!(ids.contains(&"claude-opus-4.6"));
+        assert_eq!(global.len(), 2);
+    }
+
+
+    #[test]
+    fn test_refresh_failure_preserves_existing_model_cache() {
+        let config = Config::default();
+        let manager =
+            MultiTokenManager::new(config, vec![sample_cred(1)], None, None, false).unwrap();
+        inject_models(&manager, 1, &["claude-sonnet-4.6"]);
+        // Simulate upstream failure path: only write last_error
+        {
+            let mut catalog = manager.model_catalog.lock();
+            let entry = catalog.per_credential.entry(1).or_default();
+            entry.last_error = Some("HTTP 403: denied".to_string());
+        }
+        let snap = manager.get_credential_models_cached(1).unwrap();
+        assert!(snap.models.iter().any(|m| m == "claude-sonnet-4.6"));
+        assert!(snap.last_error.as_deref().unwrap().contains("403"));
+        assert_eq!(manager.global_model_catalog().len(), 1);
+    }
+
+    #[test]
+    fn test_select_next_credential_balanced_among_model_capable() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![sample_cred(1), sample_cred(1)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // both support target model; give id1 more success so balanced picks id2
+        inject_models(&manager, 1, &["claude-sonnet-4.6"]);
+        inject_models(&manager, 2, &["claude-sonnet-4.6"]);
+        {
+            let mut entries = manager.entries.lock();
+            if let Some(e) = entries.iter_mut().find(|e| e.id == 1) {
+                e.success_count = 10;
+            }
+            if let Some(e) = entries.iter_mut().find(|e| e.id == 2) {
+                e.success_count = 0;
+            }
+        }
+        let selected = manager
+            .select_next_credential(Some("claude-sonnet-4.6"))
+            .expect("should select");
+        assert_eq!(selected.0, 2);
+    }
+
+    #[test]
+    fn test_select_next_credential_accepts_dash_model_id() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![sample_cred(1), sample_cred(2)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        inject_models(&manager, 1, &["claude-sonnet-4.6"]);
+        inject_models(&manager, 2, &["claude-opus-4.6"]);
+        let selected = manager
+            .select_next_credential(Some("claude-sonnet-4-6"))
+            .expect("dash alias should match dotted cache");
+        assert_eq!(selected.0, 1);
     }
 
 }

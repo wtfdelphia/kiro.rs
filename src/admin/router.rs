@@ -8,10 +8,11 @@ use axum::{
 use super::{
     handlers::{
         add_credential, complete_iam_sso, delete_credential, force_refresh_token,
-        get_all_credentials, get_credential_balance, get_load_balancing_mode,
+        get_all_credentials, get_credential_balance, get_credential_models, get_load_balancing_mode,
         import_credential, import_credentials_batch, import_sso_token, poll_builder_id,
-        reset_failure_count, set_credential_disabled, set_credential_priority,
-        set_load_balancing_mode, start_builder_id, start_iam_sso,
+        refresh_all_models, refresh_credential_models, reset_failure_count,
+        set_credential_disabled, set_credential_priority, set_load_balancing_mode,
+        start_builder_id, start_iam_sso, test_credential,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -31,6 +32,17 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/reset", post(reset_failure_count))
         .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))
+        // models/refresh 全量必须在 /{id}/... 之前或使用更具体路径，避免冲突
+        .route(
+            "/credentials/models/refresh",
+            post(refresh_all_models),
+        )
+        .route(
+            "/credentials/{id}/models/refresh",
+            post(refresh_credential_models),
+        )
+        .route("/credentials/{id}/models", get(get_credential_models))
+        .route("/credentials/{id}/test", post(test_credential))
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),

@@ -62,3 +62,58 @@ impl AdminServiceError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn status_codes_map_correctly() {
+        assert_eq!(
+            AdminServiceError::NotFound { id: 1 }.status_code(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            AdminServiceError::InvalidCredential("x".into()).status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            AdminServiceError::UpstreamError("x".into()).status_code(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            AdminServiceError::InternalError("x".into()).status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn invalid_credential_response_has_no_secret_fields() {
+        let resp = AdminServiceError::InvalidCredential(
+            "model unmapped: gpt-4".into(),
+        )
+        .into_response();
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.to_lowercase().contains("refreshtoken"));
+        assert!(!json.to_lowercase().contains("accesstoken"));
+        assert!(json.contains("gpt-4"));
+    }
+
+    #[test]
+    fn upstream_error_response_has_no_secret_fields() {
+        let resp = AdminServiceError::UpstreamError(
+            "upstream generate failed: 403 denied".into(),
+        )
+        .into_response();
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.to_lowercase().contains("refreshtoken"));
+        assert!(!json.to_lowercase().contains("accesstoken"));
+        assert_eq!(
+            AdminServiceError::UpstreamError("x".into()).status_code(),
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
+}
+

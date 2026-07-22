@@ -70,10 +70,69 @@ fn map_provider_error(err: Error) -> Response {
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
-pub async fn get_models() -> impl IntoResponse {
+pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
-    let models = vec![
+    // 优先全局模型缓存；空则静态 fallback（兼容现状）
+    if let Some(provider) = &state.kiro_provider {
+        let catalog = provider.token_manager().global_model_catalog();
+        if !catalog.is_empty() {
+            let models = models_from_catalog(&catalog);
+            return Json(ModelsResponse {
+                object: "list".to_string(),
+                data: models,
+            });
+        }
+    }
+
+    let models = static_fallback_models();
+    Json(ModelsResponse {
+        object: "list".to_string(),
+        data: models,
+    })
+}
+
+const THINKING_SUFFIX: &str = "-thinking";
+
+fn models_from_catalog(
+    catalog: &[crate::kiro::model::available_models::UpstreamModelInfo],
+) -> Vec<Model> {
+    let now = chrono::Utc::now().timestamp();
+    let mut out = Vec::with_capacity(catalog.len() * 2);
+    for m in catalog {
+        let max_tokens = m
+            .token_limits
+            .as_ref()
+            .and_then(|t| t.max_output_tokens)
+            .unwrap_or(64_000);
+        let display = m
+            .model_name
+            .clone()
+            .unwrap_or_else(|| m.model_id.clone());
+        out.push(Model {
+            id: m.model_id.clone(),
+            object: "model".to_string(),
+            created: now,
+            owned_by: "anthropic".to_string(),
+            display_name: display.clone(),
+            model_type: "chat".to_string(),
+            max_tokens,
+        });
+        out.push(Model {
+            id: format!("{}{}", m.model_id, THINKING_SUFFIX),
+            object: "model".to_string(),
+            created: now,
+            owned_by: "anthropic".to_string(),
+            display_name: format!("{} (Thinking)", display),
+            model_type: "chat".to_string(),
+            max_tokens,
+        });
+    }
+    out
+}
+
+fn static_fallback_models() -> Vec<Model> {
+    vec![
         Model {
             id: "claude-sonnet-5".to_string(),
             object: "model".to_string(),
@@ -218,12 +277,7 @@ pub async fn get_models() -> impl IntoResponse {
             model_type: "chat".to_string(),
             max_tokens: 64000,
         },
-    ];
-
-    Json(ModelsResponse {
-        object: "list".to_string(),
-        data: models,
-    })
+    ]
 }
 
 /// POST /v1/messages
@@ -991,3 +1045,47 @@ fn create_buffered_sse_stream(
     )
     .flatten()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kiro::model::available_models::{TokenLimits, UpstreamModelInfo};
+
+    #[test]
+    fn static_fallback_models_has_core_ids() {
+        let models = static_fallback_models();
+        let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"claude-sonnet-5"));
+        assert!(ids.contains(&"claude-sonnet-5-thinking"));
+        assert!(ids.contains(&"claude-sonnet-4-6"));
+        assert!(ids.contains(&"claude-haiku-4-5-20251001"));
+        assert!(models.iter().all(|m| m.object == "model"));
+    }
+
+    #[test]
+    fn models_from_catalog_adds_thinking_variants() {
+        let catalog = vec![UpstreamModelInfo {
+            model_id: "claude-sonnet-4.6".into(),
+            model_name: Some("Claude Sonnet 4.6".into()),
+            description: None,
+            input_types: vec![],
+            rate_multiplier: None,
+            token_limits: Some(TokenLimits {
+                max_input_tokens: Some(1_000_000),
+                max_output_tokens: Some(64_000),
+            }),
+        }];
+        let models = models_from_catalog(&catalog);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "claude-sonnet-4.6");
+        assert_eq!(models[1].id, "claude-sonnet-4.6-thinking");
+        assert_eq!(models[0].max_tokens, 64_000);
+        assert!(models[1].display_name.contains("Thinking"));
+    }
+
+    #[test]
+    fn models_from_catalog_empty() {
+        assert!(models_from_catalog(&[]).is_empty());
+    }
+}
+

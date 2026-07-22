@@ -210,6 +210,10 @@ async fn main() {
         tracing::info!("  POST /api/admin/credentials/:index/priority");
         tracing::info!("  POST /api/admin/credentials/:index/reset");
         tracing::info!("  GET  /api/admin/credentials/:index/balance");
+        tracing::info!("  POST /api/admin/credentials/models/refresh");
+        tracing::info!("  POST /api/admin/credentials/:id/models/refresh");
+        tracing::info!("  GET  /api/admin/credentials/:id/models");
+        tracing::info!("  POST /api/admin/credentials/:id/test");
         tracing::info!("Admin UI:");
         tracing::info!("  GET  /admin");
     }

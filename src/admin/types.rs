@@ -211,6 +211,69 @@ pub struct BalanceResponse {
     pub next_reset_at: Option<f64>,
 }
 
+// ============ 模型目录 / 测试 ============
+
+/// 单凭据模型刷新响应
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelsRefreshResponse {
+    pub success: bool,
+    pub credential_id: u64,
+    pub count: usize,
+    pub models: Vec<String>,
+    pub updated_at: String,
+}
+
+/// 全量模型刷新响应
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelsRefreshAllResponse {
+    pub success: bool,
+    pub refreshed: usize,
+    pub failed: usize,
+    pub global_count: usize,
+    pub errors: Vec<ModelsRefreshErrorItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelsRefreshErrorItem {
+    pub credential_id: u64,
+    pub error: String,
+}
+
+/// 凭据模型列表响应
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialModelsResponse {
+    pub success: bool,
+    pub models: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// 凭据测试请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestCredentialRequest {
+    /// 可选模型名（客户端 id 或上游 id）；默认 claude-sonnet-4.6
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// 凭据测试响应
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestCredentialResponse {
+    pub success: bool,
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply: Option<String>,
+    pub latency_ms: u64,
+}
+
 // ============ 负载均衡配置 ============
 
 /// 负载均衡模式响应

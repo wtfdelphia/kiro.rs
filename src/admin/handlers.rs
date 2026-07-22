@@ -2,7 +2,7 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::IntoResponse,
 };
 
@@ -10,7 +10,7 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        SuccessResponse, TestCredentialRequest,
     },
 };
 
@@ -226,6 +226,56 @@ pub async fn import_sso_token(
         .import_sso_tokens(payload.bearer_token, payload.region)
         .await
     {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+// ============ 模型目录 / 测试 ============
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ModelsLiveQuery {
+    #[serde(default)]
+    pub live: Option<bool>,
+}
+
+/// POST /api/admin/credentials/{id}/models/refresh
+pub async fn refresh_credential_models(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.refresh_models(id).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/models/refresh
+pub async fn refresh_all_models(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.refresh_models_all().await)
+}
+
+/// GET /api/admin/credentials/{id}/models
+pub async fn get_credential_models(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Query(query): Query<ModelsLiveQuery>,
+) -> impl IntoResponse {
+    let live = query.live.unwrap_or(false);
+    match state.service.get_credential_models(id, live).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/{id}/test
+pub async fn test_credential(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    body: Option<Json<TestCredentialRequest>>,
+) -> impl IntoResponse {
+    let req = body.map(|j| j.0).unwrap_or(TestCredentialRequest { model: None });
+    match state.service.test_credential(id, req).await {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
