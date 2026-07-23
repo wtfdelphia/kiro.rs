@@ -1,6 +1,7 @@
 //! Profile ARN resolution aligned with Kiro IDE / Kiro-Go.
 //!
-//! Order: cache → fixed ARN map → ListAvailableProfiles → refresh fallback → persist.
+//! Order: trusted cache → ListAvailableProfiles → refresh fallback → persist.
+//! Known fixed placeholder ARNs are never trusted or persisted (they cause upstream 403).
 
 use std::time::Duration;
 
@@ -89,6 +90,7 @@ pub fn infer_provider(credentials: &KiroCredentials) -> Option<String> {
 }
 
 /// Fixed profile ARN table (IDE short-circuit; never call ListAvailableProfiles).
+#[allow(dead_code)]
 pub fn get_fixed_profile_arn(provider: &str) -> Option<&'static str> {
     if eq_ci(provider, "BuilderId") {
         Some(BUILDER_ID_PROFILE_ARN)
@@ -99,20 +101,57 @@ pub fn get_fixed_profile_arn(provider: &str) -> Option<&'static str> {
     }
 }
 
+/// Known IDE/short-circuit placeholder ARNs. Upstream often rejects these with 403.
+pub fn is_known_placeholder_profile_arn(arn: &str) -> bool {
+    let a = arn.trim();
+    a.eq_ignore_ascii_case(BUILDER_ID_PROFILE_ARN)
+        || a.eq_ignore_ascii_case(SOCIAL_SIGN_IN_PROFILE_ARN)
+}
+
+/// Cached profile ARN only if non-empty and not a known placeholder.
+pub fn trusted_profile_arn(credentials: &KiroCredentials) -> Option<&str> {
+    credentials
+        .profile_arn
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter(|s| !is_known_placeholder_profile_arn(s))
+}
+
+/// Soft miss: proceed without profileArn (common for BuilderId after list failure).
+#[derive(Debug)]
+pub struct ProfileArnUnavailable;
+
+impl std::fmt::Display for ProfileArnUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no trusted Kiro profileArn available; proceeding without")
+    }
+}
+
+impl std::error::Error for ProfileArnUnavailable {}
+
 /// Resolve profile ARN for a credential, optionally persisting via token manager.
+///
+/// Does **not** persist or return known placeholder fixed ARNs. Those cause upstream
+/// User is not authorized on ListAvailableModels / generate for many accounts.
 pub async fn resolve_profile_arn(
     token_manager: &MultiTokenManager,
     credential_id: u64,
     credentials: &KiroCredentials,
     token: &str,
 ) -> anyhow::Result<String> {
-    if let Some(arn) = credentials
+    if let Some(arn) = trusted_profile_arn(credentials) {
+        return Ok(arn.to_string());
+    }
+
+    // Drop known-bad placeholder from store so later requests do not keep replaying 403.
+    if credentials
         .profile_arn
         .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
+        .map(|s| is_known_placeholder_profile_arn(s))
+        .unwrap_or(false)
     {
-        return Ok(arn.to_string());
+        let _ = token_manager.clear_profile_arn(credential_id);
     }
 
     if credentials.is_api_key_credential() {
@@ -120,24 +159,8 @@ pub async fn resolve_profile_arn(
     }
 
     let provider = infer_provider(credentials);
-    if let Some(ref p) = provider {
-        if let Some(fixed) = get_fixed_profile_arn(p) {
-            let _ = token_manager.set_profile_arn(credential_id, Some(fixed.to_string()), Some(p.clone()));
-            return Ok(fixed.to_string());
-        }
-    }
 
-    // IdC with client credentials but no provider/fixed entry → BuilderId fixed path
-    // (infer_provider normally already returned BuilderId; this covers empty-auth edge cases)
-    if provider.is_none() && looks_like_idc(credentials) {
-        let fixed = BUILDER_ID_PROFILE_ARN;
-        let _ = token_manager.set_profile_arn(
-            credential_id,
-            Some(fixed.to_string()),
-            Some("BuilderId".to_string()),
-        );
-        return Ok(fixed.to_string());
-    }
+    // Fixed ARN table is documentation/history only — never short-circuit or persist.
 
     if !supports_profiles(credentials) && provider.is_none() {
         return Err(anyhow!(ProfileArnUnsupported));
@@ -147,9 +170,13 @@ pub async fn resolve_profile_arn(
     let proxy = credentials.effective_proxy(token_manager.global_proxy());
 
     let list_err = match list_available_profiles_with_retry(credentials, config, token, proxy.as_ref()).await {
-        Ok(arn) if !arn.is_empty() => {
+        Ok(arn) if !arn.is_empty() && !is_known_placeholder_profile_arn(&arn) => {
             let _ = token_manager.set_profile_arn(credential_id, Some(arn.clone()), provider.clone());
             return Ok(arn);
+        }
+        Ok(arn) if !arn.is_empty() => {
+            // Upstream somehow returned a known placeholder — do not trust/persist.
+            Some(anyhow!("list returned placeholder profileArn"))
         }
         Ok(_) => Some(anyhow!("empty profile list")),
         Err(e) => Some(e),
@@ -160,18 +187,13 @@ pub async fn resolve_profile_arn(
         match token_manager.force_refresh_token_for(credential_id).await {
             Ok(()) => {
                 if let Some(arn) = token_manager.profile_arn_of(credential_id) {
-                    return Ok(arn);
+                    if !is_known_placeholder_profile_arn(&arn) {
+                        return Ok(arn);
+                    }
+                    let _ = token_manager.clear_profile_arn(credential_id);
                 }
-                // refresh succeeded but no profileArn — common for BuilderId; try fixed
-                if looks_like_idc(credentials) {
-                    let fixed = BUILDER_ID_PROFILE_ARN;
-                    let _ = token_manager.set_profile_arn(
-                        credential_id,
-                        Some(fixed.to_string()),
-                        Some("BuilderId".to_string()),
-                    );
-                    return Ok(fixed.to_string());
-                }
+                // refresh succeeded but no trusted profileArn — proceed without
+                return Err(anyhow!(ProfileArnUnavailable));
             }
             Err(refresh_err) => {
                 if let Some(le) = list_err {
@@ -180,6 +202,16 @@ pub async fn resolve_profile_arn(
                 bail!("no available Kiro profile (refresh: {})", refresh_err);
             }
         }
+    }
+
+    // List failed / empty: for IdC/BuilderId-style accounts, generate often works without ARN.
+    if looks_like_idc(credentials)
+        || provider
+            .as_deref()
+            .map(|p| eq_ci(p, "BuilderId"))
+            .unwrap_or(false)
+    {
+        return Err(anyhow!(ProfileArnUnavailable));
     }
 
     if let Some(le) = list_err {
@@ -310,24 +342,35 @@ pub async fn ensure_profile_arn_for_request(
     credentials: &mut KiroCredentials,
     token: &str,
 ) -> anyhow::Result<Option<String>> {
-    if let Some(arn) = credentials
-        .profile_arn
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(arn) = trusted_profile_arn(credentials) {
         return Ok(Some(arn.to_string()));
     }
 
+    // Clear in-memory placeholder so request path does not inject a known-bad ARN.
+    if credentials
+        .profile_arn
+        .as_ref()
+        .map(|s| is_known_placeholder_profile_arn(s))
+        .unwrap_or(false)
+    {
+        credentials.profile_arn = None;
+        let _ = token_manager.clear_profile_arn(credential_id);
+    }
+
     match resolve_profile_arn(token_manager, credential_id, credentials, token).await {
-        Ok(arn) => {
+        Ok(arn) if !is_known_placeholder_profile_arn(&arn) => {
             credentials.profile_arn = Some(arn.clone());
             if credentials.provider.is_none() {
                 credentials.provider = infer_provider(credentials);
             }
             Ok(Some(arn))
         }
+        Ok(_) => {
+            credentials.profile_arn = None;
+            Ok(None)
+        }
         Err(e) if e.downcast_ref::<ProfileArnUnsupported>().is_some() => Ok(None),
+        Err(e) if e.downcast_ref::<ProfileArnUnavailable>().is_some() => Ok(None),
         Err(e) => Err(e),
     }
 }
@@ -433,5 +476,24 @@ mod tests {
         c.client_secret = Some("s".to_string());
         assert_eq!(infer_provider(&c).as_deref(), Some("BuilderId"));
         assert_eq!(get_fixed_profile_arn("BuilderId"), Some(BUILDER_ID_PROFILE_ARN));
+    }
+
+    #[test]
+    fn test_placeholder_arn_not_trusted() {
+        assert!(is_known_placeholder_profile_arn(BUILDER_ID_PROFILE_ARN));
+        assert!(is_known_placeholder_profile_arn(SOCIAL_SIGN_IN_PROFILE_ARN));
+        assert!(!is_known_placeholder_profile_arn(
+            "arn:aws:codewhisperer:us-east-1:1:profile/REAL"
+        ));
+
+        let mut c = KiroCredentials::default();
+        c.profile_arn = Some(BUILDER_ID_PROFILE_ARN.to_string());
+        assert!(trusted_profile_arn(&c).is_none());
+
+        c.profile_arn = Some("arn:aws:codewhisperer:us-east-1:1:profile/REAL".into());
+        assert_eq!(
+            trusted_profile_arn(&c),
+            Some("arn:aws:codewhisperer:us-east-1:1:profile/REAL")
+        );
     }
 }

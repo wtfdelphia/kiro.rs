@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, KeyRound } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, KeyRound, Boxes } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -14,9 +14,10 @@ import { KamImportDialog } from '@/components/kam-import-dialog'
 import { OnlineAuthDialog } from '@/components/online-auth-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
-import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
+import { getCredentialBalance, forceRefreshToken, refreshAllModels } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
-import type { BalanceResponse } from '@/types/api'
+import type { BalanceResponse, ModelsRefreshAllResponse } from '@/types/api'
+import { ModelsRefreshResultDialog } from '@/components/models-refresh-result-dialog'
 
 interface DashboardProps {
   onLogout: () => void
@@ -40,6 +41,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [queryInfoProgress, setQueryInfoProgress] = useState({ current: 0, total: 0 })
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
+  const [refreshingAllModels, setRefreshingAllModels] = useState(false)
+  const [modelsRefreshResultOpen, setModelsRefreshResultOpen] = useState(false)
+  const [modelsRefreshResult, setModelsRefreshResult] = useState<ModelsRefreshAllResponse | null>(null)
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
@@ -493,6 +497,27 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setVerifying(false)
   }
 
+  // 刷新全部模型目录
+  const handleRefreshAllModels = async () => {
+    if (refreshingAllModels) return
+    setRefreshingAllModels(true)
+    try {
+      const result = await refreshAllModels()
+      setModelsRefreshResult(result)
+      const summary = `刷新完成：成功 ${result.refreshed}，失败 ${result.failed}，全局 ${result.globalCount} 个模型`
+      if (result.failed > 0) {
+        toast.warning(summary)
+        setModelsRefreshResultOpen(true)
+      } else {
+        toast.success(summary)
+      }
+    } catch (error) {
+      toast.error(`刷新全部模型失败: ${extractErrorMessage(error)}`)
+    } finally {
+      setRefreshingAllModels(false)
+    }
+  }
+
   // 切换负载均衡模式
   const handleToggleLoadBalancing = () => {
     const currentMode = loadBalancingData?.mode || 'priority'
@@ -684,6 +709,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   清除已禁用
                 </Button>
               )}
+              <Button
+                onClick={handleRefreshAllModels}
+                size="sm"
+                variant="outline"
+                disabled={refreshingAllModels || !data?.credentials?.length}
+                title="刷新全部启用凭据的上游模型目录"
+              >
+                <Boxes className={`h-4 w-4 mr-2 ${refreshingAllModels ? 'animate-spin' : ''}`} />
+                {refreshingAllModels ? '刷新模型中...' : '刷新全部模型'}
+              </Button>
               <Button onClick={() => setKamImportDialogOpen(true)} size="sm" variant="outline">
                 <FileUp className="h-4 w-4 mr-2" />
                 Kiro Account Manager 导入
@@ -710,7 +745,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </Card>
           ) : (
             <>
-              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 [&>*]:min-w-0">
                 {currentCredentials.map((credential) => (
                   <CredentialCard
                     key={credential.id}
@@ -791,6 +826,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
         progress={verifyProgress}
         results={verifyResults}
         onCancel={handleCancelVerify}
+      />
+
+      <ModelsRefreshResultDialog
+        open={modelsRefreshResultOpen}
+        onOpenChange={setModelsRefreshResultOpen}
+        result={modelsRefreshResult}
       />
     </div>
   )

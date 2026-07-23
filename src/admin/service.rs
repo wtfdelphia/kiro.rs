@@ -605,49 +605,70 @@ impl AdminService {
         }
 
         let config = self.token_manager.config();
-        let machine = machine_id::generate_from_credentials(&credentials, config);
         let endpoint = IdeEndpoint::default();
-        let rctx = RequestContext {
-            credentials: &credentials,
-            token: &token,
-            machine_id: &machine,
-            config,
-        };
-        let url = endpoint.api_url(&rctx);
-        let body = endpoint.transform_api_body(request_body, &rctx);
         let proxy = credentials.effective_proxy(self.token_manager.global_proxy());
         let client = build_client(proxy.as_ref(), 60, config.tls_backend)?;
-        let base = client
-            .post(&url)
-            .body(body)
-            .header("content-type", "application/json")
-            .header("Connection", "close");
-        let request = endpoint.decorate_api(base, &rctx);
-        let response = request.send().await?;
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            let summary: String = text.chars().take(400).collect();
-            anyhow::bail!("上游 generate 失败: {} {}", status.as_u16(), summary);
-        }
 
-        let mut decoder = EventStreamDecoder::new();
-        let mut stream = response.bytes_stream();
-        let mut content = String::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            decoder.feed(&chunk)?;
-            for result in decoder.decode_iter() {
-                let frame = match result {
-                    Ok(f) => f,
-                    Err(_) => continue,
-                };
-                if let Ok(Event::AssistantResponse(ev)) = Event::from_frame(frame) {
-                    content.push_str(&ev.content);
+        for attempt in 0..2 {
+            let machine = machine_id::generate_from_credentials(&credentials, config);
+            let rctx = RequestContext {
+                credentials: &credentials,
+                token: &token,
+                machine_id: &machine,
+                config,
+            };
+            let url = endpoint.api_url(&rctx);
+            let body = endpoint.transform_api_body(request_body, &rctx);
+            let base = client
+                .post(&url)
+                .body(body)
+                .header("content-type", "application/json")
+                .header("Connection", "close");
+            let request = endpoint.decorate_api(base, &rctx);
+            let response = request.send().await?;
+            let status = response.status();
+            if !status.is_success() {
+                let text = response.text().await.unwrap_or_default();
+                let has_profile = credentials
+                    .profile_arn
+                    .as_ref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                if attempt == 0
+                    && has_profile
+                    && crate::kiro::models_api::is_user_not_authorized_body(&text)
+                {
+                    tracing::warn!(
+                        "test 凭据 #{} generate 因 profileArn 未授权，清除后重试",
+                        id
+                    );
+                    let _ = self.token_manager.clear_profile_arn(id);
+                    credentials.profile_arn = None;
+                    continue;
+                }
+                let summary: String = text.chars().take(400).collect();
+                anyhow::bail!("上游 generate 失败: {} {}", status.as_u16(), summary);
+            }
+
+            let mut decoder = EventStreamDecoder::new();
+            let mut stream = response.bytes_stream();
+            let mut content = String::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                decoder.feed(&chunk)?;
+                for result in decoder.decode_iter() {
+                    let frame = match result {
+                        Ok(f) => f,
+                        Err(_) => continue,
+                    };
+                    if let Ok(Event::AssistantResponse(ev)) = Event::from_frame(frame) {
+                        content.push_str(&ev.content);
+                    }
                 }
             }
+            return Ok(content);
         }
-        Ok(content)
+        anyhow::bail!("上游 generate 失败: 重试耗尽")
     }
 
     // ============ 余额缓存持久化 ============

@@ -137,6 +137,7 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut profile_arn_stripped: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
@@ -236,6 +237,25 @@ impl KiroProvider {
 
             // 401/403 凭据问题
             if matches!(status.as_u16(), 401 | 403) {
+                let has_profile = ctx
+                    .credentials
+                    .profile_arn
+                    .as_ref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                if has_profile
+                    && crate::kiro::models_api::is_user_not_authorized_body(&body)
+                    && !profile_arn_stripped.contains(&ctx.id)
+                {
+                    profile_arn_stripped.insert(ctx.id);
+                    tracing::warn!(
+                        "凭据 #{} MCP 因 profileArn 未授权，清除 profileArn 后重试",
+                        ctx.id
+                    );
+                    let _ = self.token_manager.clear_profile_arn(ctx.id);
+                    continue;
+                }
+
                 // bearer invalid: if request lacked profileArn, try resolve first; else force-refresh once.
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
@@ -328,6 +348,7 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut profile_arn_stripped: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 尝试从请求体中提取模型信息
@@ -471,6 +492,27 @@ impl KiroProvider {
                     status,
                     body
                 );
+
+                // Bad / placeholder profileArn often yields "User is not authorized".
+                // Strip once and retry without counting failure.
+                let has_profile = ctx
+                    .credentials
+                    .profile_arn
+                    .as_ref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                if has_profile
+                    && crate::kiro::models_api::is_user_not_authorized_body(&body)
+                    && !profile_arn_stripped.contains(&ctx.id)
+                {
+                    profile_arn_stripped.insert(ctx.id);
+                    tracing::warn!(
+                        "凭据 #{} generate 因 profileArn 未授权，清除 profileArn 后重试",
+                        ctx.id
+                    );
+                    let _ = self.token_manager.clear_profile_arn(ctx.id);
+                    continue;
+                }
 
                 // bearer invalid: if request lacked profileArn, try resolve first; else force-refresh once.
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {

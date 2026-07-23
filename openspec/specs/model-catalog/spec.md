@@ -20,6 +20,11 @@ The system MUST call Kiro CodeWhisperer ListAvailableModels for a credential wit
 - **WHEN** ListAvailableModels 返回非 200 或网络失败
 - **THEN** 返回可诊断错误，且 MUST NOT 用空列表静默覆盖该凭据已有 model 缓存
 
+#### Scenario: 坏 profileArn 时无 ARN 重试
+
+- **WHEN** 带 profileArn 的 ListAvailableModels 返回 403 unauthorized，且不带 profileArn 可成功
+- **THEN** 系统 MUST 无 ARN 重试成功并 SHOULD 清除本地坏/占位 profileArn
+
 ### Requirement: 双层模型缓存
 
 The system MUST maintain a per-credential model id set and a global aggregated model catalog derived from successful refreshes.

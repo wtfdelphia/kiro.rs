@@ -8,6 +8,10 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  ModelsRefreshResponse,
+  ModelsRefreshAllResponse,
+  CredentialModelsResponse,
+  TestCredentialResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -232,3 +236,49 @@ export async function importSsoToken(
   })
   return data
 }
+
+// ============ 模型目录 / 凭据测试 ============
+
+/** 刷新单凭据模型目录 */
+export async function refreshCredentialModels(
+  id: number
+): Promise<ModelsRefreshResponse> {
+  const { data } = await api.post<ModelsRefreshResponse>(
+    `/credentials/${id}/models/refresh`
+  )
+  return data
+}
+
+/** 刷新全部启用凭据的模型目录 */
+export async function refreshAllModels(): Promise<ModelsRefreshAllResponse> {
+  const { data } = await api.post<ModelsRefreshAllResponse>(
+    '/credentials/models/refresh'
+  )
+  return data
+}
+
+/** 查看凭据模型缓存；live=true 时先刷新再返回 */
+export async function getCredentialModels(
+  id: number,
+  live = false
+): Promise<CredentialModelsResponse> {
+  const { data } = await api.get<CredentialModelsResponse>(
+    `/credentials/${id}/models`,
+    { params: live ? { live: true } : undefined }
+  )
+  return data
+}
+
+/** 对凭据做最小真实推理探测 */
+export async function testCredential(
+  id: number,
+  model?: string
+): Promise<TestCredentialResponse> {
+  const body = model && model.trim() ? { model: model.trim() } : {}
+  const { data } = await api.post<TestCredentialResponse>(
+    `/credentials/${id}/test`,
+    body
+  )
+  return data
+}
+

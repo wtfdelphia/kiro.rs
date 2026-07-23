@@ -473,6 +473,7 @@ Sonnet 5 的 thinking 行为与已知限制见 [docs/claude-sonnet-5.md](docs/cl
 
 - **Admin UI**
   - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）
+  - 页面入口：列表区「刷新全部模型」；凭据卡片「查看模型 / 刷新模型 / 测试」（对接 models refresh / models list / credential test API）
 
 ## 注意事项
 

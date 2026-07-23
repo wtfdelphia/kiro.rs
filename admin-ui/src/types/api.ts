@@ -99,3 +99,50 @@ export interface AddCredentialResponse {
   action?: 'created' | 'updated'
   userId?: string
 }
+
+// ============ 模型目录 / 凭据测试 ============
+
+/** 单凭据模型刷新响应 */
+export interface ModelsRefreshResponse {
+  success: boolean
+  credentialId: number
+  count: number
+  models: string[]
+  updatedAt: string
+}
+
+export interface ModelsRefreshErrorItem {
+  credentialId: number
+  error: string
+}
+
+/** 全量模型刷新响应 */
+export interface ModelsRefreshAllResponse {
+  success: boolean
+  refreshed: number
+  failed: number
+  globalCount: number
+  errors: ModelsRefreshErrorItem[]
+}
+
+/** 凭据模型列表（缓存或 live） */
+export interface CredentialModelsResponse {
+  success: boolean
+  models: string[]
+  updatedAt?: string | null
+  lastError?: string | null
+}
+
+/** 凭据推理探测请求 */
+export interface TestCredentialRequest {
+  model?: string
+}
+
+/** 凭据推理探测响应 */
+export interface TestCredentialResponse {
+  success: boolean
+  model: string
+  reply?: string | null
+  latencyMs: number
+}
+

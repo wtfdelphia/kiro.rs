@@ -27,7 +27,7 @@ use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
-use crate::kiro::models_api::list_available_models;
+use crate::kiro::models_api::list_available_models_with_meta;
 use crate::model::config::Config;
 
 /// 检查 Token 是否在指定时间内过期
@@ -825,6 +825,20 @@ impl MultiTokenManager {
                     entry.credentials.provider = Some(p);
                 }
             }
+        }
+        let _ = self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 清除 profile_arn（例如已知固定占位 ARN 触发上游 403 后）。
+    pub fn clear_profile_arn(&self, id: u64) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.profile_arn = None;
         }
         let _ = self.persist_credentials()?;
         Ok(())
@@ -2383,7 +2397,7 @@ impl MultiTokenManager {
         }
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let models = match list_available_models(
+        let (models, stripped_bad_arn) = match list_available_models_with_meta(
             &credentials,
             &self.config,
             &token,
@@ -2400,6 +2414,14 @@ impl MultiTokenManager {
                 return Err(e);
             }
         };
+
+        if stripped_bad_arn {
+            tracing::warn!(
+                "凭据 #{} ListAvailableModels 因 profileArn 403 已无 ARN 回退成功，清除本地 profileArn",
+                id
+            );
+            let _ = self.clear_profile_arn(id);
+        }
 
         let ids = model_id_set(&models);
         let updated_at = Utc::now().to_rfc3339();
