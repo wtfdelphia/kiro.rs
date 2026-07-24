@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
-import { Loader2, RefreshCw } from 'lucide-react'
+import { Loader2, RefreshCw, FlaskConical } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -22,12 +22,16 @@ interface CredentialModelsDialogProps {
   credentialId: number | null
   open: boolean
   onOpenChange: (open: boolean) => void
+  onTestModel?: (modelId: string) => void
+  onModelsChanged?: () => void
 }
 
 export function CredentialModelsDialog({
   credentialId,
   open,
   onOpenChange,
+  onTestModel,
+  onModelsChanged,
 }: CredentialModelsDialogProps) {
   const [loading, setLoading] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
@@ -73,6 +77,7 @@ export function CredentialModelsDialog({
         lastError: null,
       })
       setError(null)
+      onModelsChanged?.()
     } catch (e) {
       toast.error(`刷新模型失败: ${extractErrorMessage(e)}`)
     } finally {
@@ -90,7 +95,7 @@ export function CredentialModelsDialog({
         <DialogHeader>
           <DialogTitle>凭据 #{credentialId} 模型目录</DialogTitle>
           <DialogDescription>
-            显示该凭据缓存的上游可用模型；可刷新或实时拉取。
+            显示该凭据缓存的上游可用模型；可刷新、实时拉取，或用某模型发起测试。
           </DialogDescription>
         </DialogHeader>
 
@@ -125,9 +130,21 @@ export function CredentialModelsDialog({
                 data.models.map((m) => (
                   <div
                     key={m}
-                    className="font-mono text-xs px-2 py-1 rounded hover:bg-muted"
+                    className="flex items-center justify-between gap-2 px-2 py-1 rounded hover:bg-muted"
                   >
-                    {m}
+                    <span className="font-mono text-xs break-all">{m}</span>
+                    {onTestModel && (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-7 shrink-0"
+                        onClick={() => onTestModel(m)}
+                        title="用此模型测试"
+                      >
+                        <FlaskConical className="h-3.5 w-3.5 mr-1" />
+                        测试
+                      </Button>
+                    )}
                   </div>
                 ))
               )}
@@ -151,9 +168,7 @@ export function CredentialModelsDialog({
               onClick={handleRefresh}
               disabled={loading || refreshing || credentialId == null}
             >
-              <RefreshCw
-                className={`h-4 w-4 mr-1 ${refreshing ? 'animate-spin' : ''}`}
-              />
+              <RefreshCw className={`h-4 w-4 mr-1 ${refreshing ? 'animate-spin' : ''}`} />
               刷新模型
             </Button>
           </div>

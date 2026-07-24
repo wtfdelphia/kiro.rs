@@ -87,6 +87,10 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
+    /// 是否要求客户端 API Key（默认 true，兼容现网）
+    #[serde(default = "default_require_api_key")]
+    pub require_api_key: bool,
+
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
@@ -155,6 +159,10 @@ fn default_extract_thinking() -> bool {
     true
 }
 
+fn default_require_api_key() -> bool {
+    true
+}
+
 fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
@@ -180,6 +188,7 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
+            require_api_key: default_require_api_key(),
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),

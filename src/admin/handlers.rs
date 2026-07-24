@@ -71,15 +71,22 @@ pub async fn reset_failure_count(
 }
 
 /// GET /api/admin/credentials/:id/balance
-/// 获取指定凭据的余额
+/// 获取指定凭据的余额（?force=true 跳过 TTL 缓存）
 pub async fn get_credential_balance(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
+    Query(query): Query<crate::admin::types::BalanceQuery>,
 ) -> impl IntoResponse {
-    match state.service.get_balance(id).await {
+    match state.service.get_balance(id, query.force).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
+}
+
+/// GET /api/admin/models/catalog
+/// 全局模型 catalog 摘要
+pub async fn get_global_models_catalog(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_global_models_catalog())
 }
 
 /// POST /api/admin/credentials
@@ -276,6 +283,51 @@ pub async fn test_credential(
 ) -> impl IntoResponse {
     let req = body.map(|j| j.0).unwrap_or(TestCredentialRequest { model: None });
     match state.service.test_credential(id, req).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+
+// ============ Runtime settings ============
+
+pub async fn get_proxy_settings(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_proxy_settings())
+}
+
+pub async fn update_proxy_settings(
+    State(state): State<AdminState>,
+    Json(payload): Json<crate::admin::types::UpdateProxySettingsRequest>,
+) -> impl IntoResponse {
+    match state.service.update_proxy_settings(payload) {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+pub async fn get_endpoint_settings(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_endpoint_settings())
+}
+
+pub async fn update_endpoint_settings(
+    State(state): State<AdminState>,
+    Json(payload): Json<crate::admin::types::UpdateEndpointSettingsRequest>,
+) -> impl IntoResponse {
+    match state.service.update_endpoint_settings(payload) {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+pub async fn get_auth_settings(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_auth_settings())
+}
+
+pub async fn update_auth_settings(
+    State(state): State<AdminState>,
+    Json(payload): Json<crate::admin::types::UpdateAuthSettingsRequest>,
+) -> impl IntoResponse {
+    match state.service.update_auth_settings(payload) {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

@@ -77,9 +77,14 @@ export async function forceRefreshToken(
   return data
 }
 
-// 获取凭据余额
-export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
-  const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`)
+// 获取凭据余额（force=true 跳过 TTL 缓存）
+export async function getCredentialBalance(
+  id: number,
+  force = false
+): Promise<BalanceResponse> {
+  const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`, {
+    params: force ? { force: true } : undefined,
+  })
   return data
 }
 

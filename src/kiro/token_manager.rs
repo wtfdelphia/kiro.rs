@@ -572,8 +572,8 @@ pub struct IngestResult {
 }
 
 pub struct MultiTokenManager {
-    config: Config,
-    proxy: Option<ProxyConfig>,
+    config: Mutex<Config>,
+    proxy: Mutex<Option<ProxyConfig>>,
     /// 凭据条目列表
     entries: Mutex<Vec<CredentialEntry>>,
     /// 当前活动凭据 ID
@@ -751,8 +751,8 @@ impl MultiTokenManager {
 
         let load_balancing_mode = config.load_balancing_mode.clone();
         let manager = Self {
-            config,
-            proxy,
+            config: Mutex::new(config),
+            proxy: Mutex::new(proxy),
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
             refresh_lock: TokioMutex::new(()),
@@ -779,14 +779,35 @@ impl MultiTokenManager {
         Ok(manager)
     }
 
-    /// 获取配置的引用
-    pub fn config(&self) -> &Config {
-        &self.config
+    /// 获取配置的克隆（热更新安全）
+    pub fn config(&self) -> Config {
+        self.config.lock().clone()
+    }
+
+    /// 更新配置中的字段并可选落盘
+    pub fn update_config_with<F>(&self, f: F) -> anyhow::Result<Config>
+    where
+        F: FnOnce(&mut Config),
+    {
+        let mut cfg = self.config.lock();
+        f(&mut cfg);
+        let snapshot = cfg.clone();
+        drop(cfg);
+        Ok(snapshot)
+    }
+
+    pub fn save_config(&self) -> anyhow::Result<()> {
+        self.config.lock().save()
     }
 
     /// 全局代理配置（供 profile 解析等复用）
-    pub fn global_proxy(&self) -> Option<&crate::http_client::ProxyConfig> {
-        self.proxy.as_ref()
+    pub fn global_proxy(&self) -> Option<crate::http_client::ProxyConfig> {
+        self.proxy.lock().clone()
+    }
+
+    /// 设置全局代理（热更新）
+    pub fn set_global_proxy(&self, proxy: Option<ProxyConfig>) {
+        *self.proxy.lock() = proxy;
     }
 
     /// 读取凭据当前 profile_arn（若有）
@@ -1098,9 +1119,9 @@ impl MultiTokenManager {
 
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 // 确实需要刷新
-                let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
-                let new_creds =
-                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
+                let effective_proxy = current_creds.effective_proxy(self.proxy.lock().as_ref());
+                let __cfg = self.config();
+                let new_creds = refresh_token(&current_creds, &__cfg, effective_proxy.as_ref()).await?;
 
                 if is_token_expired(&new_creds) {
                     anyhow::bail!("刷新后的 Token 仍然无效或已过期");
@@ -1746,10 +1767,9 @@ impl MultiTokenManager {
                 };
 
                 if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                    let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
-                    let new_creds =
-                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
-                            .await?;
+                    let effective_proxy = current_creds.effective_proxy(self.proxy.lock().as_ref());
+                    let __cfg = self.config();
+                    let new_creds = refresh_token(&current_creds, &__cfg, effective_proxy.as_ref()).await?;
                     {
                         let mut entries = self.entries.lock();
                         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -1800,8 +1820,9 @@ impl MultiTokenManager {
             );
         }
 
-        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let usage_limits = get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+        let effective_proxy = credentials.effective_proxy(self.proxy.lock().as_ref());
+        let __cfg = self.config();
+        let usage_limits = get_usage_limits(&credentials, &__cfg, &token, effective_proxy.as_ref()).await?;
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
@@ -1905,8 +1926,11 @@ impl MultiTokenManager {
         let mut validated_cred = if new_cred.is_api_key_credential() {
             new_cred.clone()
         } else {
-            let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
-            refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
+            let effective_proxy = new_cred.effective_proxy(self.proxy.lock().as_ref());
+            {
+                let __cfg = self.config();
+                refresh_token(&new_cred, &__cfg, effective_proxy.as_ref()).await?
+            }
         };
 
         validated_cred.priority = new_cred.priority;
@@ -1956,11 +1980,12 @@ impl MultiTokenManager {
 
         if !new_cred.is_api_key_credential() {
             if let Some(access) = validated_cred.access_token.clone() {
-                let effective_proxy = validated_cred.effective_proxy(self.proxy.as_ref());
+                let effective_proxy = validated_cred.effective_proxy(self.proxy.lock().as_ref());
+                let __cfg = self.config();
                 match crate::kiro::user_info::get_user_info(
                     &access,
                     effective_proxy.as_ref(),
-                    &self.config,
+                    &__cfg,
                 )
                 .await
                 {
@@ -2196,9 +2221,9 @@ impl MultiTokenManager {
         let _guard = self.refresh_lock.lock().await;
 
         // 无条件调用 refresh_token
-        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let new_creds =
-            refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
+        let effective_proxy = credentials.effective_proxy(self.proxy.lock().as_ref());
+        let __cfg = self.config();
+        let new_creds = refresh_token(&credentials, &__cfg, effective_proxy.as_ref()).await?;
 
         // 更新 entries 中对应凭据
         {
@@ -2221,6 +2246,66 @@ impl MultiTokenManager {
     // ========================================================================
     // 模型目录缓存（ListAvailableModels）
     // ========================================================================
+
+
+    /// 测试/内部：写入凭据模型缓存（不访问上游）
+    #[cfg(test)]
+    pub fn test_seed_model_cache(
+        &self,
+        id: u64,
+        models: Vec<UpstreamModelInfo>,
+        updated_at: Option<String>,
+    ) {
+        let ids = model_id_set(&models);
+        let mut catalog = self.model_catalog.lock();
+        catalog.per_credential.insert(
+            id,
+            CredentialModelCache {
+                model_ids: ids,
+                raw: models,
+                updated_at,
+                last_error: None,
+            },
+        );
+        self.rebuild_global_catalog_locked(&mut catalog);
+    }
+
+    /// 启动后台模型预热：对启用凭据限并发 refresh（失败仅 log）
+    pub fn spawn_warmup_models(self: &std::sync::Arc<Self>, concurrency: usize) {
+        let manager = std::sync::Arc::clone(self);
+        let concurrency = concurrency.max(1);
+        tokio::spawn(async move {
+            let ids: Vec<u64> = {
+                let entries = manager.entries.lock();
+                entries
+                    .iter()
+                    .filter(|e| !e.disabled)
+                    .map(|e| e.id)
+                    .collect()
+            };
+            if ids.is_empty() {
+                return;
+            }
+            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+            let mut handles = Vec::new();
+            for id in ids {
+                let manager = std::sync::Arc::clone(&manager);
+                let sem = std::sync::Arc::clone(&sem);
+                handles.push(tokio::spawn(async move {
+                    let _permit = match sem.acquire().await {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
+                    if let Err(e) = manager.refresh_models_for(id).await {
+                        tracing::warn!("启动预热：凭据 #{} 模型刷新失败: {}", id, e);
+                    }
+                }));
+            }
+            for h in handles {
+                let _ = h.await;
+            }
+        });
+    }
 
     /// 异步刷新指定凭据模型缓存（失败仅 log）
     pub fn spawn_refresh_models_arc(self: &std::sync::Arc<Self>, id: u64) {
@@ -2270,9 +2355,9 @@ impl MultiTokenManager {
             let _guard = self.refresh_lock.lock().await;
             let current = self.credentials_clone(id)?;
             if is_token_expired(&current) || is_token_expiring_soon(&current) {
-                let effective_proxy = current.effective_proxy(self.proxy.as_ref());
-                let new_creds =
-                    refresh_token(&current, &self.config, effective_proxy.as_ref()).await?;
+                let effective_proxy = current.effective_proxy(self.proxy.lock().as_ref());
+                let __cfg = self.config();
+                let new_creds = refresh_token(&current, &__cfg, effective_proxy.as_ref()).await?;
                 {
                     let mut entries = self.entries.lock();
                     if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -2346,9 +2431,9 @@ impl MultiTokenManager {
                         .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
                 };
                 if is_token_expired(&current) || is_token_expiring_soon(&current) {
-                    let effective_proxy = current.effective_proxy(self.proxy.as_ref());
-                    let new_creds =
-                        refresh_token(&current, &self.config, effective_proxy.as_ref()).await?;
+                    let effective_proxy = current.effective_proxy(self.proxy.lock().as_ref());
+                    let __cfg = self.config();
+                    let new_creds = refresh_token(&current, &__cfg, effective_proxy.as_ref()).await?;
                     {
                         let mut entries = self.entries.lock();
                         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -2396,10 +2481,11 @@ impl MultiTokenManager {
             );
         }
 
-        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let effective_proxy = credentials.effective_proxy(self.proxy.lock().as_ref());
+        let __cfg = self.config();
         let (models, stripped_bad_arn) = match list_available_models_with_meta(
             &credentials,
-            &self.config,
+            &__cfg,
             &token,
             effective_proxy.as_ref(),
         )
@@ -2501,7 +2587,7 @@ impl MultiTokenManager {
     fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
         use anyhow::Context;
 
-        let config_path = match self.config.config_path() {
+        let config_path = match self.config.lock().config_path() {
             Some(path) => path.to_path_buf(),
             None => {
                 tracing::warn!("配置文件路径未知，负载均衡模式仅在当前进程生效: {}", mode);

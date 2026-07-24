@@ -156,7 +156,20 @@ curl http://127.0.0.1:8990/v1/messages \
   }'
 ```
 
-### Docker
+#
+### 运行时设置（Admin）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET/PUT | `/api/admin/settings/proxy` | 全局出站代理（热更新 + 落盘；不回传明文密码） |
+| GET/PUT | `/api/admin/settings/endpoint` | 默认 Kiro 端点（仅已注册名，当前 `ide`） |
+| GET/PUT | `/api/admin/settings/auth` | 客户端 `requireApiKey` / `apiKey`（mask 读；热更新） |
+| GET | `/api/admin/models/catalog` | 全局模型 catalog 摘要 |
+| GET | `/api/admin/credentials/{id}/balance?force=true` | 强制刷新余额（跳过 TTL 缓存） |
+
+`GET /v1/models`：优先全局模型缓存；仅暴露 `map_model` 可映射的 id；缓存为空时静态 fallback（不阻塞上游全量刷新）。
+
+## Docker
 
 也可以通过 Docker 启动：
 
@@ -174,7 +187,8 @@ docker-compose up
 |------|------|--------|------|
 | `host` | string | `127.0.0.1` | 服务监听地址 |
 | `port` | number | `8080` | 服务监听端口 |
-| `apiKey` | string | - | 自定义 API Key（用于客户端认证，必配） |
+| `apiKey` | string | - | 自定义 API Key（用于客户端认证；`requireApiKey=true` 时建议配置） |
+| `requireApiKey` | bool | `true` | 是否要求客户端 API Key。`true` 且 `apiKey` 为空时 fail-closed（一律 401）；`false` 时客户端可不带 key（Admin 仍需 `adminApiKey`） |
 | `region` | string | `us-east-1` | AWS 区域 |
 | `authRegion` | string | - | Auth Region（用于 Token 刷新），未配置时回退到 region |
 | `apiRegion` | string | - | API Region（用于 API 请求），未配置时回退到 region |

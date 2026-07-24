@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, Boxes, FlaskConical } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, Boxes, FlaskConical, RotateCcw } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -23,7 +23,8 @@ import {
   useDeleteCredential,
   useForceRefreshToken,
 } from '@/hooks/use-credentials'
-import { refreshCredentialModels } from '@/api/credentials'
+import { getCredentialBalance, refreshCredentialModels } from '@/api/credentials'
+import { useQueryClient } from '@tanstack/react-query'
 import { extractErrorMessage } from '@/lib/utils'
 import { CredentialModelsDialog } from '@/components/credential-models-dialog'
 import { CredentialTestDialog } from '@/components/credential-test-dialog'
@@ -66,7 +67,11 @@ export function CredentialCard({
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
   const [modelsDialogOpen, setModelsDialogOpen] = useState(false)
   const [testDialogOpen, setTestDialogOpen] = useState(false)
+  const [testInitialModel, setTestInitialModel] = useState('')
   const [refreshingModels, setRefreshingModels] = useState(false)
+  const [refreshingBalance, setRefreshingBalance] = useState(false)
+  const [localBalance, setLocalBalance] = useState<BalanceResponse | null>(null)
+  const queryClient = useQueryClient()
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
@@ -141,12 +146,31 @@ export function CredentialCard({
         `凭据 #${credential.id} 模型已刷新：${resp.count} 个` +
           (sample ? `（${sample}${more}）` : '')
       )
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
     } catch (err) {
       toast.error('刷新模型失败: ' + extractErrorMessage(err))
     } finally {
       setRefreshingModels(false)
     }
   }
+
+  const handleRefreshBalance = async () => {
+    if (refreshingBalance) return
+    setRefreshingBalance(true)
+    try {
+      const resp = await getCredentialBalance(credential.id, true)
+      setLocalBalance(resp)
+      toast.success(
+        `余额已刷新：剩余 ${resp.remaining}${resp.subscriptionTitle ? `（${resp.subscriptionTitle}）` : ''}`
+      )
+    } catch (err) {
+      toast.error('刷新余额失败: ' + extractErrorMessage(err))
+    } finally {
+      setRefreshingBalance(false)
+    }
+  }
+
+  const displayBalance = localBalance ?? balance
 
   const handleDelete = () => {
     if (!credential.disabled) {
@@ -310,7 +334,7 @@ export function CredentialCard({
               <span className="font-medium">
                 {loadingBalance ? (
                   <Loader2 className="inline w-3 h-3 animate-spin" />
-                ) : balance?.subscriptionTitle || '未知'}
+                ) : displayBalance?.subscriptionTitle || '未知'}
               </span>
             </div>
             <div>
@@ -333,11 +357,11 @@ export function CredentialCard({
                 <span className="text-sm ml-1">
                   <Loader2 className="inline w-3 h-3 animate-spin" /> 加载中...
                 </span>
-              ) : balance ? (
+              ) : displayBalance ? (
                 <span className="font-medium ml-1">
-                  {balance.remaining.toFixed(2)} / {balance.usageLimit.toFixed(2)}
+                  {displayBalance.remaining.toFixed(2)} / {displayBalance.usageLimit.toFixed(2)}
                   <span className="text-xs text-muted-foreground ml-1">
-                    ({(100 - balance.usagePercentage).toFixed(1)}% 剩余)
+                    ({(100 - displayBalance.usagePercentage).toFixed(1)}% 剩余)
                   </span>
                 </span>
               ) : (
@@ -365,19 +389,47 @@ export function CredentialCard({
                 <span className="text-xs text-muted-foreground">provider={credential.provider}</span>
               )}
             </div>
+            <div className="col-span-2 flex items-center gap-2">
+              <span className="text-muted-foreground">模型缓存：</span>
+              {(credential.modelCount ?? 0) > 0 ? (
+                <Badge variant="secondary">{credential.modelCount} 个</Badge>
+              ) : (
+                <span className="text-sm text-muted-foreground">未缓存</span>
+              )}
+              {credential.modelsLastError && (
+                <span className="text-xs text-amber-600 truncate max-w-[12rem]" title={credential.modelsLastError}>
+                  有错误
+                </span>
+              )}
+            </div>
           </div>
 
           {/* 操作按钮 */}
           <div className="flex flex-wrap gap-2 pt-2 border-t">
             <Button
               size="sm"
-              variant="outline"
-              onClick={handleReset}
-              disabled={resetFailure.isPending || (credential.failureCount === 0 && credential.refreshFailureCount === 0)}
+              variant="default"
+              onClick={handleRefreshBalance}
+              disabled={refreshingBalance || credential.disabled}
+              title="强制刷新该凭据余额/订阅（跳过缓存）"
             >
-              <RefreshCw className="h-4 w-4 mr-1" />
-              重置失败
+              <Wallet className={`h-4 w-4 mr-1 ${refreshingBalance ? 'animate-spin' : ''}`} />
+              {refreshingBalance ? '刷新中…' : '刷新余额'}
             </Button>
+            {(credential.failureCount > 0 ||
+              credential.refreshFailureCount > 0 ||
+              credential.disabled) && (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={handleReset}
+                disabled={resetFailure.isPending}
+                title="重置失败计数并尝试恢复"
+              >
+                <RotateCcw className="h-4 w-4 mr-1" />
+                重置失败
+              </Button>
+            )}
             <Button
               size="sm"
               variant="outline"
@@ -514,13 +566,25 @@ export function CredentialCard({
         credentialId={credential.id}
         open={modelsDialogOpen}
         onOpenChange={setModelsDialogOpen}
+        onTestModel={(modelId) => {
+          setTestInitialModel(modelId)
+          setModelsDialogOpen(false)
+          setTestDialogOpen(true)
+        }}
+        onModelsChanged={() => {
+          queryClient.invalidateQueries({ queryKey: ['credentials'] })
+        }}
       />
 
       <CredentialTestDialog
         credentialId={credential.id}
         open={testDialogOpen}
-        onOpenChange={setTestDialogOpen}
+        onOpenChange={(open) => {
+          setTestDialogOpen(open)
+          if (!open) setTestInitialModel('')
+        }}
         disabled={credential.disabled}
+        initialModel={testInitialModel}
       />
     </>
   )

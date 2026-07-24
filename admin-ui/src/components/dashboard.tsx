@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, KeyRound, Boxes } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, KeyRound, Boxes, Settings } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -18,6 +18,7 @@ import { getCredentialBalance, forceRefreshToken, refreshAllModels } from '@/api
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse, ModelsRefreshAllResponse } from '@/types/api'
 import { ModelsRefreshResultDialog } from '@/components/models-refresh-result-dialog'
+import { SettingsPanel } from '@/components/settings-panel'
 
 interface DashboardProps {
   onLogout: () => void
@@ -44,6 +45,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [refreshingAllModels, setRefreshingAllModels] = useState(false)
   const [modelsRefreshResultOpen, setModelsRefreshResultOpen] = useState(false)
   const [modelsRefreshResult, setModelsRefreshResult] = useState<ModelsRefreshAllResponse | null>(null)
+  const [settingsOpen, setSettingsOpen] = useState(false)
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
@@ -587,6 +589,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <Button variant="ghost" size="icon" onClick={handleRefresh}>
               <RefreshCw className="h-5 w-5" />
             </Button>
+            <Button variant="ghost" size="icon" onClick={() => setSettingsOpen(true)} title="运行时设置">
+              <Settings className="h-5 w-5" />
+            </Button>
             <Button variant="ghost" size="icon" onClick={handleLogout}>
               <LogOut className="h-5 w-5" />
             </Button>
@@ -693,7 +698,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   disabled={queryingInfo}
                 >
                   <RefreshCw className={`h-4 w-4 mr-2 ${queryingInfo ? 'animate-spin' : ''}`} />
-                  {queryingInfo ? `查询中... ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询信息'}
+                  {queryingInfo ? `查询中... ${queryInfoProgress.current}/${queryInfoProgress.total}` : '批量余额/订阅'}
                 </Button>
               )}
               {data?.credentials && data.credentials.length > 0 && (
@@ -833,6 +838,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
         onOpenChange={setModelsRefreshResultOpen}
         result={modelsRefreshResult}
       />
+
+      <SettingsPanel open={settingsOpen} onOpenChange={setSettingsOpen} />
     </div>
   )
 }

@@ -77,11 +77,11 @@ async fn main() {
     let first_credentials = credentials_list.first().cloned().unwrap_or_default();
     tracing::debug!("主凭证: {:?}", first_credentials);
 
-    // 获取 API Key
-    let api_key = config.api_key.clone().unwrap_or_else(|| {
-        tracing::error!("配置文件中未设置 apiKey");
-        std::process::exit(1);
-    });
+    // 获取 API Key（requireApiKey=true 且为空时 fail-closed，由中间件处理；启动允许空 key）
+    let api_key = config.api_key.clone().unwrap_or_default();
+    if config.require_api_key && api_key.trim().is_empty() {
+        tracing::warn!("requireApiKey=true 但未配置 apiKey：客户端请求将一律 401（fail-closed）");
+    }
 
     // 构建代理配置
     let proxy_config = config.proxy_url.as_ref().map(|url| {
@@ -141,12 +141,14 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
-    let kiro_provider = KiroProvider::with_proxy(
+    // 后台预热模型目录（限并发 2）；失败仅 log，不阻塞启动与 /v1/models
+    token_manager.spawn_warmup_models(2);
+    let kiro_provider = Arc::new(KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
         endpoints,
         config.default_endpoint.clone(),
-    );
+    ));
 
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
@@ -158,10 +160,11 @@ async fn main() {
     });
 
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
-    let anthropic_app = anthropic::create_router_with_provider(
+    let (anthropic_app, app_state) = anthropic::create_router_with_provider_and_auth(
         &api_key,
-        Some(kiro_provider),
+        Some(kiro_provider.clone()),
         config.extract_thinking,
+        config.require_api_key,
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -177,8 +180,12 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
-            let admin_service =
-                admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
+            let admin_service = admin::AdminService::new_with_runtime(
+                token_manager.clone(),
+                endpoint_names.clone(),
+                Some(app_state.auth.clone()),
+                Some(kiro_provider.clone()),
+            );
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 
@@ -198,7 +205,12 @@ async fn main() {
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("启动 Anthropic API 端点: {}", addr);
-    tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2)]);
+    if api_key.is_empty() {
+        tracing::info!("API Key: <empty>");
+    } else {
+        tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2).max(1)]);
+    }
+    tracing::info!("requireApiKey: {}", config.require_api_key);
     tracing::info!("可用 API:");
     tracing::info!("  GET  /v1/models");
     tracing::info!("  POST /v1/messages");
@@ -214,6 +226,10 @@ async fn main() {
         tracing::info!("  POST /api/admin/credentials/:id/models/refresh");
         tracing::info!("  GET  /api/admin/credentials/:id/models");
         tracing::info!("  POST /api/admin/credentials/:id/test");
+        tracing::info!("  GET  /api/admin/models/catalog");
+        tracing::info!("  GET/PUT /api/admin/settings/proxy");
+        tracing::info!("  GET/PUT /api/admin/settings/endpoint");
+        tracing::info!("  GET/PUT /api/admin/settings/auth");
         tracing::info!("Admin UI:");
         tracing::info!("  GET  /admin");
     }

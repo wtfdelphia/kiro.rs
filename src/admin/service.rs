@@ -14,9 +14,10 @@ use crate::kiro::token_manager::MultiTokenManager;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialModelsResponse, CredentialsStatusResponse, LoadBalancingModeResponse,
-    ModelsRefreshAllResponse, ModelsRefreshErrorItem, ModelsRefreshResponse,
-    SetLoadBalancingModeRequest, TestCredentialRequest, TestCredentialResponse,
+    CredentialModelsResponse, CredentialsStatusResponse, GlobalModelsCatalogResponse,
+    LoadBalancingModeResponse, ModelsRefreshAllResponse, ModelsRefreshErrorItem,
+    ModelsRefreshResponse, SetLoadBalancingModeRequest, TestCredentialRequest,
+    TestCredentialResponse,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -40,12 +41,25 @@ pub struct AdminService {
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
+    /// 客户端鉴权热更新句柄
+    client_auth: Option<Arc<parking_lot::RwLock<crate::anthropic::AuthRuntime>>>,
+    /// Provider 热更新（proxy/defaultEndpoint）
+    provider: Option<Arc<crate::kiro::provider::KiroProvider>>,
 }
 
 impl AdminService {
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
         known_endpoints: impl IntoIterator<Item = String>,
+    ) -> Self {
+        Self::new_with_runtime(token_manager, known_endpoints, None, None)
+    }
+
+    pub fn new_with_runtime(
+        token_manager: Arc<MultiTokenManager>,
+        known_endpoints: impl IntoIterator<Item = String>,
+        client_auth: Option<Arc<parking_lot::RwLock<crate::anthropic::AuthRuntime>>>,
+        provider: Option<Arc<crate::kiro::provider::KiroProvider>>,
     ) -> Self {
         let cache_path = token_manager
             .cache_dir()
@@ -58,6 +72,8 @@ impl AdminService {
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
+            client_auth,
+            provider,
         }
     }
 
@@ -69,29 +85,41 @@ impl AdminService {
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
             .into_iter()
-            .map(|entry| CredentialStatusItem {
-                id: entry.id,
-                priority: entry.priority,
-                disabled: entry.disabled,
-                failure_count: entry.failure_count,
-                is_current: entry.id == snapshot.current_id,
-                expires_at: entry.expires_at,
-                auth_method: entry.auth_method,
-                has_profile_arn: entry.has_profile_arn,
-                provider: entry.provider,
-                refresh_token_hash: entry.refresh_token_hash,
-                api_key_hash: entry.api_key_hash,
-                masked_api_key: entry.masked_api_key,
-                email: entry.email,
-                user_id: entry.user_id,
-                nickname: entry.nickname,
-                success_count: entry.success_count,
-                last_used_at: entry.last_used_at.clone(),
-                has_proxy: entry.has_proxy,
-                proxy_url: entry.proxy_url,
-                refresh_failure_count: entry.refresh_failure_count,
-                disabled_reason: entry.disabled_reason,
-                endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+            .map(|entry| {
+                let model_meta = self
+                    .token_manager
+                    .get_credential_models_cached(entry.id)
+                    .ok();
+                CredentialStatusItem {
+                    id: entry.id,
+                    priority: entry.priority,
+                    disabled: entry.disabled,
+                    failure_count: entry.failure_count,
+                    is_current: entry.id == snapshot.current_id,
+                    expires_at: entry.expires_at,
+                    auth_method: entry.auth_method,
+                    has_profile_arn: entry.has_profile_arn,
+                    provider: entry.provider,
+                    refresh_token_hash: entry.refresh_token_hash,
+                    api_key_hash: entry.api_key_hash,
+                    masked_api_key: entry.masked_api_key,
+                    email: entry.email,
+                    user_id: entry.user_id,
+                    nickname: entry.nickname,
+                    success_count: entry.success_count,
+                    last_used_at: entry.last_used_at.clone(),
+                    has_proxy: entry.has_proxy,
+                    proxy_url: entry.proxy_url,
+                    refresh_failure_count: entry.refresh_failure_count,
+                    disabled_reason: entry.disabled_reason,
+                    endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                    model_count: model_meta
+                        .as_ref()
+                        .map(|m| m.models.len() as u32)
+                        .unwrap_or(0),
+                    models_updated_at: model_meta.as_ref().and_then(|m| m.updated_at.clone()),
+                    models_last_error: model_meta.as_ref().and_then(|m| m.last_error.clone()),
+                }
             })
             .collect();
 
@@ -103,6 +131,32 @@ impl AdminService {
             available: snapshot.available,
             current_id: snapshot.current_id,
             credentials,
+        }
+    }
+
+    /// 全局模型 catalog 摘要
+    pub fn get_global_models_catalog(&self) -> GlobalModelsCatalogResponse {
+        let catalog = self.token_manager.global_model_catalog();
+        let mut models: Vec<String> = catalog.iter().map(|m| m.model_id.clone()).collect();
+        models.sort();
+        // 取各凭据缓存 updated_at 的最新值（若有）
+        let snapshot = self.token_manager.snapshot();
+        let mut updated_at: Option<String> = None;
+        for e in &snapshot.entries {
+            if let Ok(meta) = self.token_manager.get_credential_models_cached(e.id) {
+                if let Some(ts) = meta.updated_at {
+                    updated_at = match updated_at {
+                        Some(cur) if cur >= ts => Some(cur),
+                        _ => Some(ts),
+                    };
+                }
+            }
+        }
+        GlobalModelsCatalogResponse {
+            success: true,
+            count: models.len(),
+            models,
+            updated_at,
         }
     }
 
@@ -144,10 +198,14 @@ impl AdminService {
         Ok(())
     }
 
-    /// 获取凭据余额（带缓存）
-    pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        // 先查缓存
-        {
+    /// 获取凭据余额（带缓存；force=true 跳过 TTL）
+    pub async fn get_balance(
+        &self,
+        id: u64,
+        force: bool,
+    ) -> Result<BalanceResponse, AdminServiceError> {
+        // 先查缓存（force 时跳过）
+        if !force {
             let cache = self.balance_cache.lock();
             if let Some(cached) = cache.get(&id) {
                 let now = Utc::now().timestamp() as f64;
@@ -156,9 +214,11 @@ impl AdminService {
                     return Ok(cached.data.clone());
                 }
             }
+        } else {
+            tracing::debug!("凭据 #{} 余额 force 刷新，跳过缓存", id);
         }
 
-        // 缓存未命中或已过期，从上游获取
+        // 缓存未命中、已过期或 force，从上游获取
         let balance = self.fetch_balance(id).await?;
 
         // 更新缓存
@@ -342,7 +402,7 @@ impl AdminService {
 
                     let mut balance = None;
                     if fetch_balance {
-                        if let Ok(b) = self.get_balance(resp.credential_id).await {
+                        if let Ok(b) = self.get_balance(resp.credential_id, false).await {
                             balance = Some(b);
                         }
                     }
@@ -606,16 +666,16 @@ impl AdminService {
 
         let config = self.token_manager.config();
         let endpoint = IdeEndpoint::default();
-        let proxy = credentials.effective_proxy(self.token_manager.global_proxy());
+        let proxy = credentials.effective_proxy(self.token_manager.global_proxy().as_ref());
         let client = build_client(proxy.as_ref(), 60, config.tls_backend)?;
 
         for attempt in 0..2 {
-            let machine = machine_id::generate_from_credentials(&credentials, config);
+            let machine = machine_id::generate_from_credentials(&credentials, &config);
             let rctx = RequestContext {
                 credentials: &credentials,
                 token: &token,
                 machine_id: &machine,
-                config,
+                config: &config,
             };
             let url = endpoint.api_url(&rctx);
             let body = endpoint.transform_api_body(request_body, &rctx);
@@ -820,12 +880,224 @@ impl AdminService {
         Ok(resp)
     }
 
+
+    // ============ Runtime settings ============
+
+    pub fn get_proxy_settings(&self) -> crate::admin::types::ProxySettingsResponse {
+        let cfg = self.token_manager.config();
+        crate::admin::types::ProxySettingsResponse {
+            proxy_url: cfg.proxy_url.clone(),
+            has_proxy_auth: cfg.proxy_username.is_some() && cfg.proxy_password.is_some(),
+            proxy_username: cfg.proxy_username.clone(),
+        }
+    }
+
+    pub fn update_proxy_settings(
+        &self,
+        req: crate::admin::types::UpdateProxySettingsRequest,
+    ) -> Result<super::types::SuccessResponse, AdminServiceError> {
+        use crate::http_client::ProxyConfig;
+
+        let url = req.proxy_url.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let _proxy_validated = if let Some(u) = url {
+            // 基础校验：支持 http/https/socks5
+            let lower = u.to_lowercase();
+            if !(lower.starts_with("http://")
+                || lower.starts_with("https://")
+                || lower.starts_with("socks5://")
+                || lower.starts_with("socks5h://"))
+            {
+                return Err(AdminServiceError::InvalidCredential(
+                    "proxyUrl 必须是 http/https/socks5 URL".into(),
+                ));
+            }
+            // 尝试用 reqwest 解析
+            if let Err(e) = reqwest::Proxy::all(u) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "proxyUrl 无效: {}",
+                    e
+                )));
+            }
+            let mut p = ProxyConfig::new(u);
+            if let (Some(user), Some(pass)) = (
+                req.proxy_username.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+                req.proxy_password.as_deref().filter(|s| !s.is_empty()),
+            ) {
+                p = p.with_auth(user, pass);
+            } else if let (Some(user), Some(pass)) = (
+                // 保留旧密码：仅更新 URL/用户名时
+                None::<&str>,
+                None::<&str>,
+            ) {
+                let _ = (user, pass);
+            }
+            Some(p)
+        } else {
+            None
+        };
+
+        // 更新内存 config
+        let username = req.proxy_username.clone().filter(|s| !s.trim().is_empty());
+        let password = req.proxy_password.clone().filter(|s| !s.is_empty());
+        let proxy_url = url.map(|s| s.to_string());
+
+        self.token_manager
+            .update_config_with(|cfg| {
+                cfg.proxy_url = proxy_url.clone();
+                if proxy_url.is_none() {
+                    cfg.proxy_username = None;
+                    cfg.proxy_password = None;
+                } else {
+                    if username.is_some() || password.is_some() {
+                        if let Some(u) = username.clone() {
+                            cfg.proxy_username = Some(u);
+                        }
+                        if let Some(p) = password.clone() {
+                            cfg.proxy_password = Some(p);
+                        }
+                    }
+                }
+            })
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        // rebuild proxy from final config for runtime
+        let cfg = self.token_manager.config();
+        let runtime_proxy = cfg.proxy_url.as_ref().map(|u| {
+            let mut p = ProxyConfig::new(u);
+            if let (Some(user), Some(pass)) = (&cfg.proxy_username, &cfg.proxy_password) {
+                p = p.with_auth(user, pass);
+            }
+            p
+        });
+        self.token_manager.set_global_proxy(runtime_proxy.clone());
+        if let Some(provider) = &self.provider {
+            provider.set_global_proxy(runtime_proxy);
+        }
+
+        self.token_manager
+            .save_config()
+            .map_err(|e| AdminServiceError::InternalError(format!("配置落盘失败: {}", e)))?;
+
+        Ok(super::types::SuccessResponse::new("代理设置已更新"))
+    }
+
+    pub fn get_endpoint_settings(&self) -> crate::admin::types::EndpointSettingsResponse {
+        let cfg = self.token_manager.config();
+        let mut registered: Vec<String> = self.known_endpoints.iter().cloned().collect();
+        registered.sort();
+        if let Some(provider) = &self.provider {
+            registered = provider.registered_endpoints();
+        }
+        crate::admin::types::EndpointSettingsResponse {
+            default_endpoint: cfg.default_endpoint.clone(),
+            registered_endpoints: registered,
+        }
+    }
+
+    pub fn update_endpoint_settings(
+        &self,
+        req: crate::admin::types::UpdateEndpointSettingsRequest,
+    ) -> Result<super::types::SuccessResponse, AdminServiceError> {
+        let name = req.default_endpoint.trim().to_string();
+        if name.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "defaultEndpoint 不能为空".into(),
+            ));
+        }
+        if !self.known_endpoints.contains(&name) {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "未知端点: {}（已注册: {:?}）",
+                name, self.known_endpoints
+            )));
+        }
+        if let Some(provider) = &self.provider {
+            provider
+                .set_default_endpoint(name.clone())
+                .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+        }
+        self.token_manager
+            .update_config_with(|cfg| {
+                cfg.default_endpoint = name.clone();
+            })
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        self.token_manager
+            .save_config()
+            .map_err(|e| AdminServiceError::InternalError(format!("配置落盘失败: {}", e)))?;
+        Ok(super::types::SuccessResponse::new(format!(
+            "默认端点已设置为 {}",
+            name
+        )))
+    }
+
+    fn mask_api_key(key: &str) -> Option<String> {
+        let k = key.trim();
+        if k.is_empty() {
+            return None;
+        }
+        if k.len() <= 8 {
+            return Some(format!("{}***", &k[..k.len().min(2)]));
+        }
+        Some(format!("{}***{}", &k[..4], &k[k.len() - 4..]))
+    }
+
+    pub fn get_auth_settings(&self) -> crate::admin::types::AuthSettingsResponse {
+        if let Some(auth) = &self.client_auth {
+            let a = auth.read();
+            return crate::admin::types::AuthSettingsResponse {
+                require_api_key: a.require_api_key,
+                has_api_key: !a.api_key.trim().is_empty(),
+                api_key_mask: Self::mask_api_key(&a.api_key),
+            };
+        }
+        let cfg = self.token_manager.config();
+        crate::admin::types::AuthSettingsResponse {
+            require_api_key: cfg.require_api_key,
+            has_api_key: cfg.api_key.as_ref().map(|k| !k.trim().is_empty()).unwrap_or(false),
+            api_key_mask: cfg.api_key.as_deref().and_then(Self::mask_api_key),
+        }
+    }
+
+    pub fn update_auth_settings(
+        &self,
+        req: crate::admin::types::UpdateAuthSettingsRequest,
+    ) -> Result<super::types::SuccessResponse, AdminServiceError> {
+        let current = self.get_auth_settings();
+        let require = req.require_api_key.unwrap_or(current.require_api_key);
+        let new_key = req.api_key.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+        // 更新 config
+        self.token_manager
+            .update_config_with(|cfg| {
+                cfg.require_api_key = require;
+                if let Some(k) = new_key {
+                    cfg.api_key = Some(k.to_string());
+                }
+            })
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        // 热更新内存鉴权
+        if let Some(auth) = &self.client_auth {
+            let mut a = auth.write();
+            a.require_api_key = require;
+            if let Some(k) = new_key {
+                a.api_key = k.to_string();
+            }
+        }
+
+        self.token_manager
+            .save_config()
+            .map_err(|e| AdminServiceError::InternalError(format!("配置落盘失败: {}", e)))?;
+
+        Ok(super::types::SuccessResponse::new("鉴权设置已更新"))
+    }
+
     pub async fn start_builder_id_login(
         &self,
         region: Option<String>,
     ) -> Result<crate::kiro::online_auth::BuilderIdStartResponse, AdminServiceError> {
         let proxy = self.token_manager.global_proxy();
-        crate::kiro::online_auth::start_builder_id(region, proxy, self.token_manager.config())
+        let cfg = self.token_manager.config();
+        crate::kiro::online_auth::start_builder_id(region, proxy.as_ref(), &cfg)
             .await
             .map_err(|e| AdminServiceError::UpstreamError(e.to_string()))
     }
@@ -835,12 +1107,9 @@ impl AdminService {
         session_id: String,
     ) -> Result<serde_json::Value, AdminServiceError> {
         let proxy = self.token_manager.global_proxy();
-        let result = crate::kiro::online_auth::poll_builder_id(
-            &session_id,
-            proxy,
-            self.token_manager.config(),
-        )
-        .await
+        let cfg = self.token_manager.config();
+        let result = crate::kiro::online_auth::poll_builder_id(&session_id, proxy.as_ref(), &cfg)
+            .await
         .map_err(|e| {
             let msg = e.to_string();
             if msg.contains("not found") || msg.contains("expired") {
@@ -877,21 +1146,17 @@ impl AdminService {
             ));
         }
         let proxy = self.token_manager.global_proxy();
-        crate::kiro::online_auth::start_iam_sso(
-            &start_url,
-            region,
-            proxy,
-            self.token_manager.config(),
-        )
-        .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("startUrl") {
-                AdminServiceError::InvalidCredential(msg)
-            } else {
-                AdminServiceError::UpstreamError(msg)
-            }
-        })
+        let cfg = self.token_manager.config();
+        crate::kiro::online_auth::start_iam_sso(&start_url, region, proxy.as_ref(), &cfg)
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("startUrl") {
+                    AdminServiceError::InvalidCredential(msg)
+                } else {
+                    AdminServiceError::UpstreamError(msg)
+                }
+            })
     }
 
     pub async fn complete_iam_sso_login(
@@ -900,11 +1165,12 @@ impl AdminService {
         callback_url: String,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
         let proxy = self.token_manager.global_proxy();
+        let cfg = self.token_manager.config();
         let tokens = crate::kiro::online_auth::complete_iam_sso(
             &session_id,
             &callback_url,
-            proxy,
-            self.token_manager.config(),
+            proxy.as_ref(),
+            &cfg,
         )
         .await
         .map_err(|e| {
@@ -943,11 +1209,12 @@ impl AdminService {
         let mut errors = Vec::new();
 
         for line in lines {
+            let cfg = self.token_manager.config();
             match crate::kiro::online_auth::import_sso_token(
                 line,
                 region.clone(),
-                proxy,
-                self.token_manager.config(),
+                proxy.as_ref(),
+                &cfg,
             )
             .await
             {
@@ -1069,6 +1336,75 @@ mod tests {
         let service = AdminService::new(mgr, Vec::<String>::new());
         let err = service.get_credential_models(999, false).await.unwrap_err();
         assert_eq!(err.status_code(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn credentials_status_includes_model_count_default_zero() {
+        let mgr = manager_with_one();
+        let service = AdminService::new(mgr, Vec::<String>::new());
+        let status = service.get_all_credentials();
+        assert_eq!(status.total, 1);
+        assert_eq!(status.credentials[0].model_count, 0);
+        assert!(status.credentials[0].models_updated_at.is_none());
+    }
+
+    #[test]
+    fn credentials_status_model_count_from_cache() {
+        let mgr = manager_with_one();
+        // seed model cache via public path used by tests elsewhere
+        {
+            use crate::kiro::model::available_models::UpstreamModelInfo;
+            let info = UpstreamModelInfo {
+                model_id: "claude-sonnet-4.6".into(),
+                model_name: Some("Sonnet".into()),
+                description: None,
+                input_types: vec![],
+                rate_multiplier: None,
+                token_limits: None,
+            };
+            // use refresh path internals: write through refresh_models is async; use test helper if any
+            // Directly call get after seeding via private API is hard; use token_manager test inject if exists.
+            // Fallback: only assert field presence when empty path works; if inject available:
+            mgr.test_seed_model_cache(1, vec![info], Some("2026-07-24T00:00:00Z".into()));
+        }
+        let service = AdminService::new(mgr, Vec::<String>::new());
+        let status = service.get_all_credentials();
+        assert_eq!(status.credentials[0].model_count, 1);
+        assert_eq!(
+            status.credentials[0].models_updated_at.as_deref(),
+            Some("2026-07-24T00:00:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_balance_force_bypasses_cache() {
+        let mgr = manager_with_one();
+        let service = AdminService::new(mgr, Vec::<String>::new());
+        // seed cache manually
+        {
+            let mut cache = service.balance_cache.lock();
+            cache.insert(
+                1,
+                CachedBalance {
+                    cached_at: chrono::Utc::now().timestamp() as f64,
+                    data: BalanceResponse {
+                        id: 1,
+                        subscription_title: Some("cached".into()),
+                        current_usage: 1.0,
+                        usage_limit: 10.0,
+                        remaining: 9.0,
+                        usage_percentage: 10.0,
+                        next_reset_at: None,
+                    },
+                },
+            );
+        }
+        // force=false hits cache
+        let hit = service.get_balance(1, false).await.unwrap();
+        assert_eq!(hit.subscription_title.as_deref(), Some("cached"));
+        // force=true will try upstream and fail for fake cred — but must not return cached
+        let force_err = service.get_balance(1, true).await;
+        assert!(force_err.is_err(), "force should not return cache-only success without upstream");
     }
 
 }

@@ -30,6 +30,9 @@ export interface CredentialStatusItem {
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
+  modelCount?: number
+  modelsUpdatedAt?: string | null
+  modelsLastError?: string | null
 }
 
 // 余额响应
@@ -146,3 +149,26 @@ export interface TestCredentialResponse {
   latencyMs: number
 }
 
+
+// Runtime settings
+export interface ProxySettings {
+  proxyUrl: string | null
+  hasProxyAuth: boolean
+  proxyUsername?: string | null
+}
+
+export interface EndpointSettings {
+  defaultEndpoint: string
+  registeredEndpoints: string[]
+}
+
+export interface AuthSettings {
+  requireApiKey: boolean
+  hasApiKey: boolean
+  apiKeyMask: string | null
+}
+
+export interface SuccessSettingsResponse {
+  success: boolean
+  message: string
+}

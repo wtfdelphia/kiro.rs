@@ -167,9 +167,9 @@ pub async fn resolve_profile_arn(
     }
 
     let config = token_manager.config();
-    let proxy = credentials.effective_proxy(token_manager.global_proxy());
+    let proxy = credentials.effective_proxy(token_manager.global_proxy().as_ref());
 
-    let list_err = match list_available_profiles_with_retry(credentials, config, token, proxy.as_ref()).await {
+    let list_err = match list_available_profiles_with_retry(credentials, &config, token, proxy.as_ref()).await {
         Ok(arn) if !arn.is_empty() && !is_known_placeholder_profile_arn(&arn) => {
             let _ = token_manager.set_profile_arn(credential_id, Some(arn.clone()), provider.clone());
             return Ok(arn);

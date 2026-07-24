@@ -71,6 +71,35 @@ pub struct CredentialStatusItem {
     pub disabled_reason: Option<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 凭据模型缓存数量（无缓存时为 0）
+    #[serde(default)]
+    pub model_count: u32,
+    /// 模型缓存更新时间（RFC3339）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub models_updated_at: Option<String>,
+    /// 最近一次模型刷新错误
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub models_last_error: Option<String>,
+}
+
+/// 全局模型 catalog 摘要（Admin）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobalModelsCatalogResponse {
+    pub success: bool,
+    pub count: usize,
+    pub models: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+/// 余额查询参数
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceQuery {
+    /// true 时跳过 TTL 缓存强制刷新
+    #[serde(default)]
+    pub force: bool,
 }
 
 // ============ 操作请求 ============
@@ -542,4 +571,52 @@ mod tests {
         assert_eq!(v["userId"], "u");
         assert_eq!(v["credentialId"], 3);
     }
+}
+
+
+// ============ Runtime settings ============
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxySettingsResponse {
+    pub proxy_url: Option<String>,
+    pub has_proxy_auth: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_username: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateProxySettingsRequest {
+    pub proxy_url: Option<String>,
+    pub proxy_username: Option<String>,
+    pub proxy_password: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointSettingsResponse {
+    pub default_endpoint: String,
+    pub registered_endpoints: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateEndpointSettingsRequest {
+    pub default_endpoint: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthSettingsResponse {
+    pub require_api_key: bool,
+    pub has_api_key: bool,
+    pub api_key_mask: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateAuthSettingsRequest {
+    pub require_api_key: Option<bool>,
+    pub api_key: Option<String>,
 }

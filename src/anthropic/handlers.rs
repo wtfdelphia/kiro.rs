@@ -21,7 +21,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request};
+use super::converter::{ConversionError, convert_request, map_model};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
@@ -100,6 +100,15 @@ fn models_from_catalog(
     let now = chrono::Utc::now().timestamp();
     let mut out = Vec::with_capacity(catalog.len() * 2);
     for m in catalog {
+        // Default: only expose model ids accepted by map_model.
+        if map_model(&m.model_id).is_none() {
+            tracing::warn!(
+                model_id = %m.model_id,
+                "skip unmapped catalog model id"
+            );
+            continue;
+        }
+
         let max_tokens = m
             .token_limits
             .as_ref()
@@ -109,8 +118,10 @@ fn models_from_catalog(
             .model_name
             .clone()
             .unwrap_or_else(|| m.model_id.clone());
+        // Keep upstream model_id as client-visible id once map_model accepts it.
+        let id = m.model_id.clone();
         out.push(Model {
-            id: m.model_id.clone(),
+            id: id.clone(),
             object: "model".to_string(),
             created: now,
             owned_by: "anthropic".to_string(),
@@ -119,7 +130,7 @@ fn models_from_catalog(
             max_tokens,
         });
         out.push(Model {
-            id: format!("{}{}", m.model_id, THINKING_SUFFIX),
+            id: format!("{}{}", id, THINKING_SUFFIX),
             object: "model".to_string(),
             created: now,
             owned_by: "anthropic".to_string(),
@@ -1063,6 +1074,18 @@ mod tests {
     }
 
     #[test]
+    fn static_fallback_models_all_mappable() {
+        let models = static_fallback_models();
+        for m in &models {
+            assert!(
+                map_model(&m.id).is_some(),
+                "static fallback id must be mappable: {}",
+                m.id
+            );
+        }
+    }
+
+    #[test]
     fn models_from_catalog_adds_thinking_variants() {
         let catalog = vec![UpstreamModelInfo {
             model_id: "claude-sonnet-4.6".into(),
@@ -1081,6 +1104,36 @@ mod tests {
         assert_eq!(models[1].id, "claude-sonnet-4.6-thinking");
         assert_eq!(models[0].max_tokens, 64_000);
         assert!(models[1].display_name.contains("Thinking"));
+        assert!(map_model(&models[0].id).is_some());
+        assert!(map_model(&models[1].id).is_some());
+    }
+
+    #[test]
+    fn models_from_catalog_skips_unmapped() {
+        let catalog = vec![
+            UpstreamModelInfo {
+                model_id: "claude-sonnet-4.6".into(),
+                model_name: Some("Claude Sonnet 4.6".into()),
+                description: None,
+                input_types: vec![],
+                rate_multiplier: None,
+                token_limits: None,
+            },
+            UpstreamModelInfo {
+                model_id: "totally-unknown-model".into(),
+                model_name: Some("Unknown".into()),
+                description: None,
+                input_types: vec![],
+                rate_multiplier: None,
+                token_limits: None,
+            },
+        ];
+        let models = models_from_catalog(&catalog);
+        let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"claude-sonnet-4.6"));
+        assert!(ids.contains(&"claude-sonnet-4.6-thinking"));
+        assert!(!ids.iter().any(|id| id.contains("totally-unknown")));
+        assert_eq!(models.len(), 2);
     }
 
     #[test]

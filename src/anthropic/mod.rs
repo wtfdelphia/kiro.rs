@@ -25,10 +25,11 @@
 mod converter;
 mod handlers;
 mod middleware;
+pub use middleware::AuthRuntime;
 mod router;
 mod stream;
 pub mod types;
 mod websearch;
 
 pub use converter::map_model;
-pub use router::create_router_with_provider;
+pub use router::{create_router_with_provider, create_router_with_provider_and_auth};

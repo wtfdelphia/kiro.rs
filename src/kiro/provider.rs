@@ -33,17 +33,17 @@ const MAX_TOTAL_RETRIES: usize = 9;
 /// 按凭据 `endpoint` 字段选择 [`KiroEndpoint`] 实现
 pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
-    /// 全局代理配置（用于凭据无自定义代理时的回退）
-    global_proxy: Option<ProxyConfig>,
-    /// Client 缓存：key = effective proxy config, value = reqwest::Client
+    /// 全局代理配置（用于凭据无自定义代理时的回退，可热更新）
+    global_proxy: Mutex<Option<ProxyConfig>>,
+    /// Client 缓存：key = effective proxy config: &config, value = reqwest::Client
     /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client
     client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
     /// 端点实现注册表（key: endpoint 名称）
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
-    /// 默认端点名称（凭据未指定 endpoint 时使用）
-    default_endpoint: String,
+    /// 默认端点名称（凭据未指定 endpoint 时使用，可热更新）
+    default_endpoint: Mutex<String>,
 }
 
 impl KiroProvider {
@@ -74,17 +74,17 @@ impl KiroProvider {
 
         Self {
             token_manager,
-            global_proxy: proxy,
+            global_proxy: Mutex::new(proxy),
             client_cache: Mutex::new(cache),
             tls_backend,
             endpoints,
-            default_endpoint,
+            default_endpoint: Mutex::new(default_endpoint),
         }
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
-        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+        let effective = credentials.effective_proxy(self.global_proxy.lock().as_ref());
         let mut cache = self.client_cache.lock();
         if let Some(client) = cache.get(&effective) {
             return Ok(client.clone());
@@ -99,14 +99,39 @@ impl KiroProvider {
         &self,
         credentials: &KiroCredentials,
     ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
+        let default_name = self.default_endpoint.lock().clone();
         let name = credentials
             .endpoint
             .as_deref()
-            .unwrap_or(&self.default_endpoint);
+            .unwrap_or(default_name.as_str());
         self.endpoints
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
+    }
+
+    /// 热更新全局代理（后续新 client 生效）
+    pub fn set_global_proxy(&self, proxy: Option<ProxyConfig>) {
+        *self.global_proxy.lock() = proxy;
+    }
+
+    /// 热更新默认端点（必须已在注册表中）
+    pub fn set_default_endpoint(&self, name: String) -> anyhow::Result<()> {
+        if !self.endpoints.contains_key(&name) {
+            anyhow::bail!("未知端点: {}", name);
+        }
+        *self.default_endpoint.lock() = name;
+        Ok(())
+    }
+
+    pub fn registered_endpoints(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.endpoints.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    pub fn default_endpoint(&self) -> String {
+        self.default_endpoint.lock().clone()
     }
 
     /// 共享 TokenManager（供 get_models 等读 catalog）
@@ -162,7 +187,7 @@ impl KiroProvider {
             }
 
             let config = self.token_manager.config();
-            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
+            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
 
             let endpoint = match self.endpoint_for(&ctx.credentials) {
                 Ok(e) => e,
@@ -178,7 +203,7 @@ impl KiroProvider {
                 credentials: &ctx.credentials,
                 token: &ctx.token,
                 machine_id: &machine_id,
-                config,
+                config: &config,
             };
 
             let url = endpoint.mcp_url(&rctx);
@@ -390,7 +415,7 @@ impl KiroProvider {
             }
 
             let config = self.token_manager.config();
-            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
+            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
 
             let endpoint = match self.endpoint_for(&ctx.credentials) {
                 Ok(e) => e,
@@ -405,7 +430,7 @@ impl KiroProvider {
                 credentials: &ctx.credentials,
                 token: &ctx.token,
                 machine_id: &machine_id,
-                config,
+                config: &config,
             };
 
             let url = endpoint.api_url(&rctx);

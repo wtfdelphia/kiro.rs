@@ -8,11 +8,13 @@ use axum::{
 use super::{
     handlers::{
         add_credential, complete_iam_sso, delete_credential, force_refresh_token,
-        get_all_credentials, get_credential_balance, get_credential_models, get_load_balancing_mode,
-        import_credential, import_credentials_batch, import_sso_token, poll_builder_id,
-        refresh_all_models, refresh_credential_models, reset_failure_count,
+        get_all_credentials, get_auth_settings, get_credential_balance, get_credential_models,
+        get_endpoint_settings, get_global_models_catalog, get_load_balancing_mode,
+        get_proxy_settings, import_credential, import_credentials_batch, import_sso_token,
+        poll_builder_id, refresh_all_models, refresh_credential_models, reset_failure_count,
         set_credential_disabled, set_credential_priority, set_load_balancing_mode,
-        start_builder_id, start_iam_sso, test_credential,
+        start_builder_id, start_iam_sso, test_credential, update_auth_settings,
+        update_endpoint_settings, update_proxy_settings,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -43,6 +45,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         .route("/credentials/{id}/models", get(get_credential_models))
         .route("/credentials/{id}/test", post(test_credential))
+        .route("/models/catalog", get(get_global_models_catalog))
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),
@@ -52,6 +55,18 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/auth/iam-sso/start", post(start_iam_sso))
         .route("/auth/iam-sso/complete", post(complete_iam_sso))
         .route("/auth/sso-token", post(import_sso_token))
+        .route(
+            "/settings/proxy",
+            get(get_proxy_settings).put(update_proxy_settings),
+        )
+        .route(
+            "/settings/endpoint",
+            get(get_endpoint_settings).put(update_endpoint_settings),
+        )
+        .route(
+            "/settings/auth",
+            get(get_auth_settings).put(update_auth_settings),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,
