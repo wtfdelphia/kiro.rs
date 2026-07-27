@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - dev
     tags:
       - 'v*'
   workflow_dispatch:
@@ -31,7 +32,7 @@ jobs:
         run: |
           if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/heads/* ]] && git tag --points-at HEAD | grep -q '^v'; then
             echo "should_build=false" >> $GITHUB_OUTPUT
-            echo "::notice::Skipping beta build: commit already has a release tag"
+            echo "::notice::Skipping beta/dev artifact build: commit already has a release tag"
           else
             echo "should_build=true" >> $GITHUB_OUTPUT
           fi
@@ -81,7 +82,12 @@ jobs:
             echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
           else
             SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-6)
-            echo "version=beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
+            BRANCH="${{ github.ref_name }}"
+            if [ "${BRANCH}" = "dev" ]; then
+              echo "version=dev-${SHORT_SHA}" >> $GITHUB_OUTPUT
+            else
+              echo "version=beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
+            fi
           fi
 
       - name: Setup Node.js

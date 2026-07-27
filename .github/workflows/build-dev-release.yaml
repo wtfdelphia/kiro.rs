@@ -2,9 +2,9 @@ name: Build Dev Release
 
 # Dedicated dev-branch pipeline:
 # 1) build multi-platform binaries
-# 2) publish a GitHub prerelease so assets appear under Releases on the repo home page
+# 2) publish/update a rolling GitHub prerelease on fixed tag `dev-latest`
 #
-# This file is intentionally separate from build.yaml (master/tag formal path).
+# Separate from build.yaml (master/tag + artifact path).
 
 on:
   push:
@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Optional version/tag override (e.g., dev-2026.3.2). Leave empty to use dev-<sha>.'
+        description: 'Optional tag override. Leave empty to use rolling tag dev-latest.'
         required: false
         default: ''
 
@@ -25,6 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
       short_sha: ${{ steps.version.outputs.short_sha }}
     steps:
       - name: Determine version
@@ -36,15 +37,18 @@ jobs:
 
           INPUT_VERSION="${{ github.event.inputs.version }}"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${INPUT_VERSION}" ]; then
-            VERSION="${INPUT_VERSION}"
+            # Manual override still allowed for one-off tags
+            RELEASE_TAG="${INPUT_VERSION// /-}"
           else
-            VERSION="dev-${SHORT_SHA}"
+            # Rolling tag: always the same, assets/home-page entry stay stable
+            RELEASE_TAG="dev-latest"
           fi
 
-          # GitHub release tag cannot contain spaces
-          VERSION="${VERSION// /-}"
+          # Asset/file label uses the same stable id for fixed download URLs
+          VERSION="${RELEASE_TAG}"
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "::notice::Dev release version/tag: ${VERSION}"
+          echo "::notice::Dev rolling release tag: ${RELEASE_TAG} (commit ${SHORT_SHA})"
 
   build:
     needs: prepare
@@ -173,26 +177,47 @@ jobs:
           find release-assets -type f -print
           test -n "$(find release-assets -type f | head -n 1)"
 
+      - name: Move rolling tag to current commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.prepare.outputs.release_tag }}"
+          git tag -f "${TAG}" "${{ github.sha }}"
+          git push origin "refs/tags/${TAG}" --force
+
+      - name: Recreate prerelease shell for clean asset replace
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.prepare.outputs.release_tag }}"
+          # Delete existing release (keep tag) so asset names can be re-uploaded cleanly
+          gh release delete "${TAG}" --yes 2>/dev/null || true
+
       - name: Create or update GitHub prerelease
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.prepare.outputs.version }}
-          name: Dev build ${{ needs.prepare.outputs.version }}
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          name: Dev rolling build (${{ needs.prepare.outputs.short_sha }})
           target_commitish: ${{ github.sha }}
           prerelease: true
           make_latest: false
           generate_release_notes: true
           fail_on_unmatched_files: true
           body: |
-            Automated **dev** prerelease from branch `${{ github.ref_name }}`.
+            Automated **dev** rolling prerelease.
 
+            - Rolling tag: `${{ needs.prepare.outputs.release_tag }}`
+            - Branch: `${{ github.ref_name }}`
             - Commit: ${{ github.sha }}
             - Short SHA: ${{ needs.prepare.outputs.short_sha }}
             - Workflow: Build Dev Release
             - Trigger: ${{ github.event_name }}
 
-            Download platform binaries from **Assets** below.
-            This prerelease intentionally does **not** replace the repository "Latest" stable release.
+            Fixed download tag stays at **${{ needs.prepare.outputs.release_tag }}**.
+            Each successful dev build force-moves this tag and replaces Assets.
+            This prerelease does **not** replace the repository "Latest" stable release.
           files: |
             release-assets/*
         env:

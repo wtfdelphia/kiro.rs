@@ -28,6 +28,7 @@ on:
   push:
     branches:
       - master
+      - dev
     tags:
       - 'v*'
   workflow_dispatch:
@@ -37,11 +38,13 @@ on:
         required: true
 ```
 
+> 说明：上面是 `build.yaml` 的触发条件。`build-dev-release.yaml` 只监听 `dev`（以及手动触发），用于滚动 prerelease。
+
 | 触发方式 | 是否触发 | 版本结果 | 说明 |
 | --- | --- | --- | --- |
 | push 到 `master` | 是 | `beta-<sha 前 6 位>` | 日常 beta 构建 |
-| push 到 `dev` | 否 | - | 当前未监听 `dev` |
-| push 到其他分支 | 否 | - | 仅 `master` 在 branches 列表中 |
+| push 到 `dev` | 是（两份相关工作流） | artifact: `dev-<sha6>`；release: 滚动 `dev-latest` | `build.yaml` 出 artifact；`build-dev-release.yaml` 发 prerelease |
+| push 到其他分支 | 否 | - | 仅 `master` / `dev` 在 branches 列表中 |
 | push `v*` tag | 是 | tag 名本身，如 `v2026.3.1` | 正式发布路径 |
 | Actions 手动 Run workflow | 是 | 你填写的 `version` | 可选择任意 branch，包括 `dev` |
 
@@ -387,20 +390,24 @@ git push origin v2026.3.2
 - [`README.md`](../README.md) 中的 Docker / Release 说明
 
 
-## 3. Build Dev Release（dev 自动 prerelease）
+## 3. Build Dev Release（dev 滚动 prerelease）
 
-新增旁路工作流：[`.github/workflows/build-dev-release.yaml`](../.github/workflows/build-dev-release.yaml)。
+旁路工作流：[`.github/workflows/build-dev-release.yaml`](../.github/workflows/build-dev-release.yaml)。
 
-与 `build.yaml` 分开，不改动正式 master/tag 发布路径。
+与 `build.yaml` 分开：
+
+- `build.yaml`：`master` / `dev` / `v*` 都可出 **Actions Artifact**
+- `build-dev-release.yaml`：`dev` 额外自动发 **Releases 首页可见的滚动 prerelease**
 
 | 项 | 行为 |
 | --- | --- |
 | 触发 | push `dev`；或 Actions 手动 Run |
-| 默认 version/tag | `dev-<sha7>` |
-| 手动 version | workflow_dispatch 可覆盖 |
+| 固定滚动 tag | `dev-latest`（默认） |
+| 手动 version | workflow_dispatch 可覆盖成一次性 tag |
 | 产物 | 7 平台二进制 Artifact + GitHub **Prerelease** Assets |
-| 首页可见 | 是，出现在 Releases（标记为 Pre-release） |
+| 首页可见 | 是，Releases 中固定入口 `dev-latest` |
 | 是否覆盖 Latest | 否（`prerelease: true` + `make_latest: false`） |
+| tag 策略 | 每次成功构建 `git tag -f dev-latest` 并 force-push，再替换 Assets |
 | 权限 | `contents: write` |
 
 ### 怎么触发
@@ -412,7 +419,19 @@ git push origin dev
 
 或 Actions → **Build Dev Release** → Run workflow。
 
-成功后到仓库 **Releases** 下载 `kiro-rs-dev-<sha>-<platform>` 二进制；首页右侧也会看到该 prerelease。
+成功后固定打开：
+
+- Release: `https://github.com/<owner>/<repo>/releases/tag/dev-latest`
+- 资源名示例：`kiro-rs-dev-latest-Windows-x64.exe`
+
+历史一次性 tag（如早期的 `dev-60b58dd`）可以手动删掉，不再自动新增。
+
+### 与 build.yaml 的 dev 行为
+
+| 工作流 | push `dev` 后 |
+| --- | --- |
+| Build Artifacts | 上传 `kiro-rs-dev-<sha>-...` Artifacts |
+| Build Dev Release | 更新滚动 prerelease `dev-latest` |
 
 ## 一句话总结
 
