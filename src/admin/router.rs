@@ -8,12 +8,13 @@ use axum::{
 use super::{
     handlers::{
         add_credential, complete_iam_sso, delete_credential, force_refresh_token,
-        get_all_credentials, get_auth_settings, get_credential_balance, get_credential_models,
-        get_endpoint_settings, get_global_models_catalog, get_load_balancing_mode,
-        get_proxy_settings, import_credential, import_credentials_batch, import_sso_token,
-        poll_builder_id, refresh_all_models, refresh_credential_models, reset_failure_count,
-        set_credential_disabled, set_credential_priority, set_load_balancing_mode,
-        start_builder_id, start_iam_sso, test_credential, update_auth_settings,
+        get_all_credentials, get_auth_settings, get_client_identity_settings,
+        get_credential_balance, get_credential_models, get_endpoint_settings,
+        get_global_models_catalog, get_load_balancing_mode, get_proxy_settings, import_credential,
+        import_credentials_batch, import_sso_token, poll_builder_id, refresh_all_models,
+        refresh_credential_models, reset_failure_count, set_credential_disabled,
+        set_credential_priority, set_load_balancing_mode, start_builder_id, start_iam_sso,
+        test_credential, update_auth_settings, update_client_identity_settings,
         update_endpoint_settings, update_proxy_settings,
     },
     middleware::{AdminState, admin_auth_middleware},
@@ -35,10 +36,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))
         // models/refresh 全量必须在 /{id}/... 之前或使用更具体路径，避免冲突
-        .route(
-            "/credentials/models/refresh",
-            post(refresh_all_models),
-        )
+        .route("/credentials/models/refresh", post(refresh_all_models))
         .route(
             "/credentials/{id}/models/refresh",
             post(refresh_credential_models),
@@ -66,6 +64,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/settings/auth",
             get(get_auth_settings).put(update_auth_settings),
+        )
+        .route(
+            "/settings/client-identity",
+            get(get_client_identity_settings).put(update_client_identity_settings),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),

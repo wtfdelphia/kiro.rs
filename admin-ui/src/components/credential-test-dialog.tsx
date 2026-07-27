@@ -11,9 +11,10 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Select } from '@/components/ui/select'
 import { getCredentialModels, testCredential } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
-import type { TestCredentialResponse } from '@/types/api'
+import type { ModelCatalogItem, TestCredentialResponse } from '@/types/api'
 
 interface CredentialTestDialogProps {
   credentialId: number | null
@@ -32,7 +33,7 @@ export function CredentialTestDialog({
 }: CredentialTestDialogProps) {
   const [model, setModel] = useState('')
   const [customModel, setCustomModel] = useState('')
-  const [modelOptions, setModelOptions] = useState<string[]>([])
+  const [modelOptions, setModelOptions] = useState<ModelCatalogItem[]>([])
   const [loadingModels, setLoadingModels] = useState(false)
   const [pending, setPending] = useState(false)
   const [result, setResult] = useState<TestCredentialResponse | null>(null)
@@ -49,10 +50,15 @@ export function CredentialTestDialog({
       try {
         const resp = await getCredentialModels(credentialId, false)
         if (cancelled) return
-        const models = resp.models ?? []
-        setModelOptions(models)
+        const rawModels = resp.models ?? []
+        const items = resp.modelItems?.length
+          ? resp.modelItems
+          : rawModels.map((id) => ({ id, resolvable: true, testable: true }))
+        const testable = items.filter((item) => item.testable)
+        setModelOptions(testable)
+        const ids = testable.map((item) => item.id)
         if (initialModel) {
-          if (models.includes(initialModel)) {
+          if (ids.includes(initialModel)) {
             setModel(initialModel)
             setCustomModel('')
           } else {
@@ -61,7 +67,7 @@ export function CredentialTestDialog({
           }
         } else {
           const preferred =
-            models.find((m) => m.toLowerCase().includes('sonnet')) ?? models[0] ?? ''
+            ids.find((m) => m.toLowerCase().includes('sonnet')) ?? ids[0] ?? ''
           setModel(preferred)
           setCustomModel('')
         }
@@ -133,20 +139,22 @@ export function CredentialTestDialog({
         <div className="space-y-3">
           <div className="space-y-1">
             <label className="text-sm text-muted-foreground">模型</label>
-            <select
-              className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+            <Select
               value={model}
-              onChange={(e) => setModel(e.target.value)}
+              onValueChange={setModel}
               disabled={pending || disabled || loadingModels}
-            >
-              <option value="">（服务端默认）</option>
-              {modelOptions.map((m) => (
-                <option key={m} value={m}>
-                  {m}
-                </option>
-              ))}
-              <option value="__custom__">手动输入…</option>
-            </select>
+              triggerClassName="h-9"
+              options={[
+                { value: '', label: '（服务端默认）' },
+                ...modelOptions.map((m) => ({
+                  value: m.id,
+                  label: m.resolveTo && m.resolveTo !== m.id
+                    ? `${m.id} → ${m.resolveTo}`
+                    : m.id,
+                })),
+                { value: '__custom__', label: '手动输入…' },
+              ]}
+            />
             {loadingModels && (
               <div className="text-xs text-muted-foreground flex items-center gap-1">
                 <Loader2 className="h-3 w-3 animate-spin" />
@@ -179,6 +187,15 @@ export function CredentialTestDialog({
                 <span className="text-muted-foreground">模型：</span>
                 <span className="font-mono">{result.model}</span>
               </div>
+              {result.resolvedModel && (
+                <div>
+                  <span className="text-muted-foreground">上游模型：</span>
+                  <span className="font-mono">{result.resolvedModel}</span>
+                  {result.resolveKind && (
+                    <span className="ml-1 text-xs text-muted-foreground">({result.resolveKind})</span>
+                  )}
+                </div>
+              )}
               <div>
                 <span className="text-muted-foreground">延迟：</span>
                 {result.latencyMs} ms

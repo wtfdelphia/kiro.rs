@@ -128,10 +128,19 @@ export interface ModelsRefreshAllResponse {
   errors: ModelsRefreshErrorItem[]
 }
 
+export interface ModelCatalogItem {
+  id: string
+  resolvable: boolean
+  resolveTo?: string | null
+  resolveKind?: string | null
+  testable: boolean
+}
+
 /** 凭据模型列表（缓存或 live） */
 export interface CredentialModelsResponse {
   success: boolean
   models: string[]
+  modelItems?: ModelCatalogItem[]
   updatedAt?: string | null
   lastError?: string | null
 }
@@ -145,6 +154,8 @@ export interface TestCredentialRequest {
 export interface TestCredentialResponse {
   success: boolean
   model: string
+  resolvedModel?: string | null
+  resolveKind?: string | null
   reply?: string | null
   latencyMs: number
 }
@@ -166,6 +177,12 @@ export interface AuthSettings {
   requireApiKey: boolean
   hasApiKey: boolean
   apiKeyMask: string | null
+}
+
+export interface ClientIdentitySettings {
+  kiroVersion: string
+  systemVersion: string
+  nodeVersion: string
 }
 
 export interface SuccessSettingsResponse {

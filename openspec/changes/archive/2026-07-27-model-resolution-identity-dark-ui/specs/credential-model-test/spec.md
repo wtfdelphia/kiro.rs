@@ -1,10 +1,4 @@
-# Capability: credential-model-test
-
-## Purpose
-
-Allow Admin operators to smoke-test a specific credential with a minimal real upstream generation (default or specified model), returning diagnosable success/failure without leaking secrets.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Admin 可对凭据做真实推理探测
 
@@ -58,17 +52,3 @@ On token refresh failure, model resolution failure, or upstream generate failure
 
 - **WHEN** token 有效但上游 generate 返回错误
 - **THEN** test 失败并包含可诊断的错误摘要（状态码或截断 body），不含密钥
-
-#### Scenario: 坏 profileArn 未授权后可恢复
-
-- **WHEN** token 有效，请求因 profileArn 收到 User is not authorized，且去掉 profileArn 后上游可成功
-- **THEN** test 路径清除或跳过坏 ARN 并重试，成功时返回 success=true 且不含密钥
-
-### Requirement: 测试不得破坏凭据主数据安全约束
-
-Credential test MUST NOT persist raw secrets into logs at info level or write secrets into admin response fields.
-
-#### Scenario: 日志与响应审查
-
-- **WHEN** 执行成功或失败的 test
-- **THEN** 常规日志与 JSON 响应均不出现 refreshToken/accessToken 明文

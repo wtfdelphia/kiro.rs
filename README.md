@@ -192,10 +192,10 @@ docker-compose up
 | `region` | string | `us-east-1` | AWS 区域 |
 | `authRegion` | string | - | Auth Region（用于 Token 刷新），未配置时回退到 region |
 | `apiRegion` | string | - | API Region（用于 API 请求），未配置时回退到 region |
-| `kiroVersion` | string | `0.9.2` | Kiro 版本号 |
+| `kiroVersion` | string | `0.11.107` | Kiro 版本号；可在 Admin「运行时设置 / 客户端标识」热更新 |
 | `machineId` | string | - | 自定义机器码（64位十六进制），不定义则自动生成 |
-| `systemVersion` | string | 随机 | 系统版本标识 |
-| `nodeVersion` | string | `22.21.1` | Node.js 版本标识 |
+| `systemVersion` | string | 随机 | 系统版本标识；可在 Admin「运行时设置 / 客户端标识」热更新 |
+| `nodeVersion` | string | `22.22.0` | Node.js 版本标识；可在 Admin「运行时设置 / 客户端标识」热更新 |
 | `tlsBackend` | string | `rustls` | TLS 后端：`rustls` 或 `native-tls` |
 | `countTokensApiUrl` | string | - | 外部 count_tokens API 地址 |
 | `countTokensApiKey` | string | - | 外部 count_tokens API 密钥 |
@@ -207,6 +207,10 @@ docker-compose up
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
+| `modelResolution.defaultChatModel` | string | `claude-sonnet-4.6` | `auto` 解析到的默认上游聊天模型 |
+| `modelResolution.allowCatalogPassthrough` | bool | `true` | 允许命中 Kiro catalog 的上游模型 ID（如 `gpt-5.6-sol`）透传 |
+| `modelResolution.exposeCompatAliasesInModels` | bool | `false` | 是否在公开 `/v1/models` 额外暴露 `auto` / `gpt-4o` / `gpt-4` 等兼容别名 |
+| `modelResolution.compatAliases` | object | `{}` | 自定义兼容别名，key 为客户端 model，value 为上游 model |
 
 完整配置示例：
 
@@ -217,10 +221,10 @@ docker-compose up
    "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
    "region": "us-east-1",
    "tlsBackend": "rustls",
-   "kiroVersion": "0.9.2",
+   "kiroVersion": "0.11.107",
    "machineId": "64位十六进制机器码",
    "systemVersion": "darwin#24.6.0",
-   "nodeVersion": "22.21.1",
+   "nodeVersion": "22.22.0",
    "authRegion": "us-east-1",
    "apiRegion": "us-east-1",
    "countTokensApiUrl": "https://api.example.com/v1/messages/count_tokens",
@@ -231,7 +235,16 @@ docker-compose up
    "proxyPassword": "pass",
    "adminApiKey": "sk-admin-your-secret-key",
    "loadBalancingMode": "priority",
-   "extractThinking": true
+   "extractThinking": true,
+   "defaultEndpoint": "ide",
+   "modelResolution": {
+     "defaultChatModel": "claude-sonnet-4.6",
+     "allowCatalogPassthrough": true,
+     "exposeCompatAliasesInModels": false,
+     "compatAliases": {
+       "my-client-model": "claude-sonnet-4.6"
+     }
+   }
 }
 ```
 

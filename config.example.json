@@ -6,5 +6,13 @@
   "tlsBackend": "rustls",
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
-  "defaultEndpoint": "ide"
+  "defaultEndpoint": "ide",
+  "kiroVersion": "0.11.107",
+  "systemVersion": "win32#10.0.22631",
+  "nodeVersion": "22.22.0",
+  "modelResolution": {
+    "defaultChatModel": "claude-sonnet-4.6",
+    "allowCatalogPassthrough": true,
+    "exposeCompatAliasesInModels": false
+  }
 }

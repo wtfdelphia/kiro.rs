@@ -13,11 +13,12 @@ use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialModelsResponse, CredentialsStatusResponse, GlobalModelsCatalogResponse,
-    LoadBalancingModeResponse, ModelsRefreshAllResponse, ModelsRefreshErrorItem,
-    ModelsRefreshResponse, SetLoadBalancingModeRequest, TestCredentialRequest,
-    TestCredentialResponse,
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse, ClientIdentitySettingsResponse,
+    CredentialModelsResponse, CredentialStatusItem, CredentialsStatusResponse,
+    GlobalModelsCatalogResponse, LoadBalancingModeResponse, ModelCatalogItem,
+    ModelsRefreshAllResponse, ModelsRefreshErrorItem, ModelsRefreshResponse,
+    SetLoadBalancingModeRequest, TestCredentialRequest, TestCredentialResponse,
+    UpdateClientIdentitySettingsRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -134,11 +135,57 @@ impl AdminService {
         }
     }
 
+    /// 构建模型解析元数据（raw id 列表 + catalog 集合）
+    fn annotate_model_ids(&self, models: &[String]) -> Vec<ModelCatalogItem> {
+        use crate::anthropic::resolve_model;
+        use crate::kiro::model::available_models::model_id_set;
+
+        let policy = self.token_manager.config().model_resolution.clone();
+        let mut catalog_models = self.token_manager.global_model_catalog();
+        catalog_models.extend(models.iter().cloned().map(|id| {
+            crate::kiro::model::available_models::UpstreamModelInfo {
+                model_id: id,
+                model_name: None,
+                description: None,
+                input_types: vec![],
+                rate_multiplier: None,
+                token_limits: None,
+            }
+        }));
+        let catalog_set = model_id_set(&catalog_models);
+        let catalog_ref = if catalog_set.is_empty() {
+            None
+        } else {
+            Some(&catalog_set)
+        };
+
+        models
+            .iter()
+            .map(|id| match resolve_model(id, &policy, catalog_ref) {
+                Ok(r) => ModelCatalogItem {
+                    id: id.clone(),
+                    resolvable: true,
+                    resolve_to: Some(r.model_id),
+                    resolve_kind: Some(r.kind.as_str().to_string()),
+                    testable: true,
+                },
+                Err(_) => ModelCatalogItem {
+                    id: id.clone(),
+                    resolvable: false,
+                    resolve_to: None,
+                    resolve_kind: None,
+                    testable: false,
+                },
+            })
+            .collect()
+    }
+
     /// 全局模型 catalog 摘要
     pub fn get_global_models_catalog(&self) -> GlobalModelsCatalogResponse {
         let catalog = self.token_manager.global_model_catalog();
         let mut models: Vec<String> = catalog.iter().map(|m| m.model_id.clone()).collect();
         models.sort();
+        let model_items = self.annotate_model_ids(&models);
         // 取各凭据缓存 updated_at 的最新值（若有）
         let snapshot = self.token_manager.snapshot();
         let mut updated_at: Option<String> = None;
@@ -156,6 +203,7 @@ impl AdminService {
             success: true,
             count: models.len(),
             models,
+            model_items,
             updated_at,
         }
     }
@@ -300,8 +348,7 @@ impl AdminService {
             }
         }
 
-        let on_conflict =
-            crate::kiro::token_manager::OnConflict::parse(req.on_conflict.as_deref());
+        let on_conflict = crate::kiro::token_manager::OnConflict::parse(req.on_conflict.as_deref());
         let opts = crate::kiro::token_manager::IngestOptions { on_conflict };
 
         let new_cred = KiroCredentials {
@@ -367,9 +414,7 @@ impl AdminService {
         &self,
         req: crate::admin::types::BatchImportRequest,
     ) -> Result<crate::admin::types::BatchImportResponse, AdminServiceError> {
-        use crate::admin::types::{
-            BatchImportItemResult, BatchImportResponse, BatchImportSummary,
-        };
+        use crate::admin::types::{BatchImportItemResult, BatchImportResponse, BatchImportSummary};
 
         let opts = req.options.as_ref();
         let default_conflict = opts
@@ -409,11 +454,18 @@ impl AdminService {
 
                     let mut warning = None;
                     let snapshot = self.token_manager.snapshot();
-                    if let Some(entry) = snapshot.entries.iter().find(|e| e.id == resp.credential_id) {
-                        if !entry.has_profile_arn && !entry.auth_method.as_deref().map(|m| m.eq_ignore_ascii_case("api_key")).unwrap_or(false) {
-                            warning = Some(
-                                "余额可用，但 profileArn 未解析；对话可能仍 403".to_string(),
-                            );
+                    if let Some(entry) =
+                        snapshot.entries.iter().find(|e| e.id == resp.credential_id)
+                    {
+                        if !entry.has_profile_arn
+                            && !entry
+                                .auth_method
+                                .as_deref()
+                                .map(|m| m.eq_ignore_ascii_case("api_key"))
+                                .unwrap_or(false)
+                        {
+                            warning =
+                                Some("余额可用，但 profileArn 未解析；对话可能仍 403".to_string());
                             // 非致命：状态仍为 created/updated，警告字段区分（UI 可标 verified_warn）
                         }
                     }
@@ -475,7 +527,6 @@ impl AdminService {
             results,
         })
     }
-
 
     /// 删除凭据
     pub fn delete_credential(&self, id: u64) -> Result<(), AdminServiceError> {
@@ -578,9 +629,11 @@ impl AdminService {
             .token_manager
             .get_credential_models_cached(id)
             .map_err(|e| self.classify_error(e, id))?;
+        let model_items = self.annotate_model_ids(&snap.models);
         Ok(CredentialModelsResponse {
             success: true,
             models: snap.models,
+            model_items,
             updated_at: snap.updated_at,
             last_error: snap.last_error,
         })
@@ -592,7 +645,8 @@ impl AdminService {
         id: u64,
         req: TestCredentialRequest,
     ) -> Result<TestCredentialResponse, AdminServiceError> {
-        use crate::anthropic::map_model;
+        use crate::anthropic::resolve_model;
+        use crate::kiro::model::available_models::model_id_set;
         use crate::kiro::model::requests::conversation::{
             ConversationState, CurrentMessage, UserInputMessage,
         };
@@ -606,24 +660,46 @@ impl AdminService {
             .filter(|s| !s.is_empty())
             .unwrap_or("claude-sonnet-4.6");
 
-        let model_id = map_model(requested).ok_or_else(|| {
-            AdminServiceError::InvalidCredential(format!("模型不支持或无法映射: {}", requested))
-        })?;
+        let policy = self.token_manager.config().model_resolution.clone();
+        // 优先凭据缓存，其次全局 catalog
+        let mut catalog_models = Vec::new();
+        if let Ok(snap) = self.token_manager.get_credential_models_cached(id) {
+            catalog_models.extend(snap.models.into_iter().map(|id| {
+                crate::kiro::model::available_models::UpstreamModelInfo {
+                    model_id: id,
+                    model_name: None,
+                    description: None,
+                    input_types: vec![],
+                    rate_multiplier: None,
+                    token_limits: None,
+                }
+            }));
+        }
+        let global = self.token_manager.global_model_catalog();
+        catalog_models.extend(global);
+        let catalog_set = model_id_set(&catalog_models);
+        let catalog_ref = if catalog_set.is_empty() {
+            None
+        } else {
+            Some(&catalog_set)
+        };
+
+        let resolved = resolve_model(requested, &policy, catalog_ref)
+            .map_err(|e| AdminServiceError::ModelUnmapped(e.message()))?;
 
         let state = ConversationState::new(uuid::Uuid::new_v4().to_string())
             .with_agent_task_type("vibe")
             .with_chat_trigger_type("MANUAL")
             .with_current_message(CurrentMessage::new(UserInputMessage::new(
                 "say ok",
-                model_id.clone(),
+                resolved.model_id.clone(),
             )));
         let kiro_req = KiroRequest {
             conversation_state: state,
             profile_arn: None,
         };
-        let body = serde_json::to_string(&kiro_req).map_err(|e| {
-            AdminServiceError::InternalError(format!("序列化测试请求失败: {}", e))
-        })?;
+        let body = serde_json::to_string(&kiro_req)
+            .map_err(|e| AdminServiceError::InternalError(format!("序列化测试请求失败: {}", e)))?;
 
         let started = Instant::now();
         let reply = self
@@ -635,6 +711,8 @@ impl AdminService {
         Ok(TestCredentialResponse {
             success: true,
             model: requested.to_string(),
+            resolved_model: Some(resolved.model_id),
+            resolve_kind: Some(resolved.kind.as_str().to_string()),
             reply: Some(reply),
             latency_ms,
         })
@@ -642,12 +720,12 @@ impl AdminService {
 
     /// 使用指定凭据发送最小 generate（非流式解析文本）
     async fn run_minimal_generate(&self, id: u64, request_body: &str) -> anyhow::Result<String> {
-        use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
-        use crate::kiro::endpoint::ide::IdeEndpoint;
-        use crate::kiro::machine_id;
-        use crate::kiro::parser::decoder::EventStreamDecoder;
-        use crate::kiro::model::events::Event;
         use crate::http_client::build_client;
+        use crate::kiro::endpoint::ide::IdeEndpoint;
+        use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
+        use crate::kiro::machine_id;
+        use crate::kiro::model::events::Event;
+        use crate::kiro::parser::decoder::EventStreamDecoder;
         use futures::StreamExt;
 
         let token = self.token_manager.ensure_access_token(id).await?;
@@ -846,7 +924,8 @@ impl AdminService {
         tokens: crate::kiro::online_auth::CompletedTokens,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
         use chrono::{Duration as ChronoDuration, Utc};
-        let expires_at = (Utc::now() + ChronoDuration::seconds(tokens.expires_in as i64)).to_rfc3339();
+        let expires_at =
+            (Utc::now() + ChronoDuration::seconds(tokens.expires_in as i64)).to_rfc3339();
         let mut req = AddCredentialRequest {
             refresh_token: Some(tokens.refresh_token),
             auth_method: tokens.auth_method,
@@ -880,7 +959,6 @@ impl AdminService {
         Ok(resp)
     }
 
-
     // ============ Runtime settings ============
 
     pub fn get_proxy_settings(&self) -> crate::admin::types::ProxySettingsResponse {
@@ -898,7 +976,11 @@ impl AdminService {
     ) -> Result<super::types::SuccessResponse, AdminServiceError> {
         use crate::http_client::ProxyConfig;
 
-        let url = req.proxy_url.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let url = req
+            .proxy_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         let _proxy_validated = if let Some(u) = url {
             // 基础校验：支持 http/https/socks5
             let lower = u.to_lowercase();
@@ -920,7 +1002,10 @@ impl AdminService {
             }
             let mut p = ProxyConfig::new(u);
             if let (Some(user), Some(pass)) = (
-                req.proxy_username.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+                req.proxy_username
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
                 req.proxy_password.as_deref().filter(|s| !s.is_empty()),
             ) {
                 p = p.with_auth(user, pass);
@@ -1052,7 +1137,11 @@ impl AdminService {
         let cfg = self.token_manager.config();
         crate::admin::types::AuthSettingsResponse {
             require_api_key: cfg.require_api_key,
-            has_api_key: cfg.api_key.as_ref().map(|k| !k.trim().is_empty()).unwrap_or(false),
+            has_api_key: cfg
+                .api_key
+                .as_ref()
+                .map(|k| !k.trim().is_empty())
+                .unwrap_or(false),
             api_key_mask: cfg.api_key.as_deref().and_then(Self::mask_api_key),
         }
     }
@@ -1063,7 +1152,11 @@ impl AdminService {
     ) -> Result<super::types::SuccessResponse, AdminServiceError> {
         let current = self.get_auth_settings();
         let require = req.require_api_key.unwrap_or(current.require_api_key);
-        let new_key = req.api_key.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let new_key = req
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
 
         // 更新 config
         self.token_manager
@@ -1091,6 +1184,82 @@ impl AdminService {
         Ok(super::types::SuccessResponse::new("鉴权设置已更新"))
     }
 
+    pub fn get_client_identity_settings(&self) -> ClientIdentitySettingsResponse {
+        let cfg = self.token_manager.config();
+        ClientIdentitySettingsResponse {
+            kiro_version: cfg.kiro_version.clone(),
+            system_version: cfg.system_version.clone(),
+            node_version: cfg.node_version.clone(),
+        }
+    }
+
+    pub fn update_client_identity_settings(
+        &self,
+        req: UpdateClientIdentitySettingsRequest,
+    ) -> Result<super::types::SuccessResponse, AdminServiceError> {
+        const MAX_LEN: usize = 64;
+        fn validate_field(name: &str, value: &str) -> Result<String, AdminServiceError> {
+            let t = value.trim();
+            if t.is_empty() {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "{} 不能为空",
+                    name
+                )));
+            }
+            if t.len() > MAX_LEN {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "{} 长度不能超过 {} 字符",
+                    name, MAX_LEN
+                )));
+            }
+            Ok(t.to_string())
+        }
+
+        let kiro = req
+            .kiro_version
+            .as_deref()
+            .map(|s| validate_field("kiroVersion", s))
+            .transpose()?;
+        let system = req
+            .system_version
+            .as_deref()
+            .map(|s| validate_field("systemVersion", s))
+            .transpose()?;
+        let node = req
+            .node_version
+            .as_deref()
+            .map(|s| validate_field("nodeVersion", s))
+            .transpose()?;
+
+        if kiro.is_none() && system.is_none() && node.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 kiroVersion / systemVersion / nodeVersion 之一".into(),
+            ));
+        }
+
+        self.token_manager
+            .update_config_with(|cfg| {
+                if let Some(v) = &kiro {
+                    cfg.kiro_version = v.clone();
+                }
+                if let Some(v) = &system {
+                    cfg.system_version = v.clone();
+                }
+                if let Some(v) = &node {
+                    cfg.node_version = v.clone();
+                }
+            })
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        self.token_manager
+            .save_config()
+            .map_err(|e| AdminServiceError::InternalError(format!("配置落盘失败: {}", e)))?;
+
+        Ok(super::types::SuccessResponse::new(
+            "客户端标识已更新（后续上游请求使用新值）",
+        ))
+    }
+
     pub async fn start_builder_id_login(
         &self,
         region: Option<String>,
@@ -1110,14 +1279,14 @@ impl AdminService {
         let cfg = self.token_manager.config();
         let result = crate::kiro::online_auth::poll_builder_id(&session_id, proxy.as_ref(), &cfg)
             .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("not found") || msg.contains("expired") {
-                AdminServiceError::InvalidCredential(msg)
-            } else {
-                AdminServiceError::UpstreamError(msg)
-            }
-        })?;
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("not found") || msg.contains("expired") {
+                    AdminServiceError::InvalidCredential(msg)
+                } else {
+                    AdminServiceError::UpstreamError(msg)
+                }
+            })?;
 
         match result {
             Err(pending) => Ok(serde_json::to_value(pending).unwrap()),
@@ -1231,13 +1400,11 @@ impl AdminService {
         }
 
         if accounts.is_empty() {
-            return Err(AdminServiceError::UpstreamError(
-                if errors.is_empty() {
-                    "SSO token import failed".into()
-                } else {
-                    errors.join("; ")
-                },
-            ));
+            return Err(AdminServiceError::UpstreamError(if errors.is_empty() {
+                "SSO token import failed".into()
+            } else {
+                errors.join("; ")
+            }));
         }
 
         Ok(SsoTokenImportResponse {
@@ -1247,7 +1414,7 @@ impl AdminService {
         })
     }
 
-        fn classify_add_error(&self, e: anyhow::Error) -> AdminServiceError {
+    fn classify_add_error(&self, e: anyhow::Error) -> AdminServiceError {
         let msg = e.to_string();
 
         // 凭据验证失败（refreshToken 无效、格式错误等）
@@ -1280,7 +1447,8 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
+        {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)
@@ -1296,11 +1464,23 @@ mod tests {
     use crate::model::config::Config;
 
     fn manager_with_one() -> Arc<MultiTokenManager> {
+        manager_with_config(Config::default())
+    }
+
+    fn manager_with_config(config: Config) -> Arc<MultiTokenManager> {
         let mut c = KiroCredentials::default();
         c.refresh_token = Some("a".repeat(150));
-        Arc::new(
-            MultiTokenManager::new(Config::default(), vec![c], None, None, false).unwrap(),
-        )
+        Arc::new(MultiTokenManager::new(config, vec![c], None, None, false).unwrap())
+    }
+
+    fn temp_config() -> (Config, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "kiro-rs-client-identity-test-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, "{}").unwrap();
+        let cfg = Config::load(&path).unwrap();
+        (cfg, path)
     }
 
     #[tokio::test]
@@ -1311,15 +1491,81 @@ mod tests {
             .test_credential(
                 1,
                 TestCredentialRequest {
-                    model: Some("gpt-4".into()),
+                    model: Some("totally-unknown-model-xyz".into()),
                 },
             )
             .await
             .unwrap_err();
         assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        let msg = err.to_string();
+        assert!(!msg.starts_with("凭据无效"), "msg={}", msg);
         let body = serde_json::to_string(&err.into_response()).unwrap();
+        assert!(!body.contains("凭据无效"));
         assert!(!body.to_lowercase().contains("refreshtoken"));
         assert!(!body.to_lowercase().contains("accesstoken"));
+    }
+
+    #[tokio::test]
+    async fn test_credential_resolves_auto_locally() {
+        // auto 应在本地解析为 defaultChatModel；无上游 token 时可能在 generate 阶段失败，
+        // 但不得以 unmapped 拒绝。
+        let mgr = manager_with_one();
+        let service = AdminService::new(mgr, Vec::<String>::new());
+        let err = service
+            .test_credential(
+                1,
+                TestCredentialRequest {
+                    model: Some("auto".into()),
+                },
+            )
+            .await
+            .err();
+        if let Some(e) = err {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("无法映射") && !msg.contains("不在可用 catalog"),
+                "auto should not fail as unmapped: {}",
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn client_identity_get_and_update() {
+        let (cfg, path) = temp_config();
+        let mgr = manager_with_config(cfg);
+        let service = AdminService::new(mgr, Vec::<String>::new());
+        let before = service.get_client_identity_settings();
+        assert!(!before.kiro_version.is_empty());
+        let resp = service
+            .update_client_identity_settings(UpdateClientIdentitySettingsRequest {
+                kiro_version: Some("0.12.0-test".into()),
+                system_version: Some("win32#10.0.0".into()),
+                node_version: Some("22.22.0".into()),
+            })
+            .unwrap();
+        assert!(resp.success);
+        let after = service.get_client_identity_settings();
+        assert_eq!(after.kiro_version, "0.12.0-test");
+        assert_eq!(after.system_version, "win32#10.0.0");
+        assert_eq!(after.node_version, "22.22.0");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("0.12.0-test"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn client_identity_rejects_empty() {
+        let mgr = manager_with_one();
+        let service = AdminService::new(mgr, Vec::<String>::new());
+        let err = service
+            .update_client_identity_settings(UpdateClientIdentitySettingsRequest {
+                kiro_version: Some("  ".into()),
+                system_version: None,
+                node_version: None,
+            })
+            .unwrap_err();
+        assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1404,8 +1650,9 @@ mod tests {
         assert_eq!(hit.subscription_title.as_deref(), Some("cached"));
         // force=true will try upstream and fail for fake cred — but must not return cached
         let force_err = service.get_balance(1, true).await;
-        assert!(force_err.is_err(), "force should not return cache-only success without upstream");
+        assert!(
+            force_err.is_err(),
+            "force should not return cache-only success without upstream"
+        );
     }
-
 }
-

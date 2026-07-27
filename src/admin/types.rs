@@ -89,8 +89,24 @@ pub struct GlobalModelsCatalogResponse {
     pub success: bool,
     pub count: usize,
     pub models: Vec<String>,
+    /// 带解析元数据的模型列表（与 models 同序子集；兼容旧客户端）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_items: Vec<ModelCatalogItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+}
+
+/// Admin 模型列表条目（raw + 解析元数据）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalogItem {
+    pub id: String,
+    pub resolvable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolve_to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolve_kind: Option<String>,
+    pub testable: bool,
 }
 
 /// 余额查询参数
@@ -277,6 +293,9 @@ pub struct ModelsRefreshErrorItem {
 pub struct CredentialModelsResponse {
     pub success: bool,
     pub models: Vec<String>,
+    /// 带解析元数据的模型列表
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_items: Vec<ModelCatalogItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -297,7 +316,14 @@ pub struct TestCredentialRequest {
 #[serde(rename_all = "camelCase")]
 pub struct TestCredentialResponse {
     pub success: bool,
+    /// 客户端请求的 model（或默认）
     pub model: String,
+    /// 实际发送上游的 modelId
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_model: Option<String>,
+    /// alias | normalized | passthrough
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolve_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply: Option<String>,
     pub latency_ms: u64,
@@ -383,7 +409,6 @@ impl AdminErrorResponse {
     }
 }
 
-
 // ============ 批量导入 ============
 
 /// 批量导入选项
@@ -449,8 +474,6 @@ pub struct BatchImportResponse {
     pub summary: BatchImportSummary,
     pub results: Vec<BatchImportItemResult>,
 }
-
-
 
 // ============ 在线授权 ============
 
@@ -573,7 +596,6 @@ mod tests {
     }
 }
 
-
 // ============ Runtime settings ============
 
 #[derive(Debug, Serialize)]
@@ -619,4 +641,20 @@ pub struct AuthSettingsResponse {
 pub struct UpdateAuthSettingsRequest {
     pub require_api_key: Option<bool>,
     pub api_key: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientIdentitySettingsResponse {
+    pub kiro_version: String,
+    pub system_version: String,
+    pub node_version: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateClientIdentitySettingsRequest {
+    pub kiro_version: Option<String>,
+    pub system_version: Option<String>,
+    pub node_version: Option<String>,
 }

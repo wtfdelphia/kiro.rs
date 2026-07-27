@@ -31,5 +31,5 @@ mod stream;
 pub mod types;
 mod websearch;
 
-pub use converter::map_model;
-pub use router::{create_router_with_provider, create_router_with_provider_and_auth};
+pub use converter::resolve_model;
+pub use router::create_router_with_provider_and_auth;

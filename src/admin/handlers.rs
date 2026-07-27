@@ -121,8 +121,6 @@ pub async fn import_credentials_batch(
     }
 }
 
-
-
 /// DELETE /api/admin/credentials/:id
 /// 删除凭据
 pub async fn delete_credential(
@@ -170,7 +168,6 @@ pub async fn set_load_balancing_mode(
     }
 }
 
-
 /// POST /api/admin/auth/builderid/start
 pub async fn start_builder_id(
     State(state): State<AdminState>,
@@ -187,7 +184,11 @@ pub async fn poll_builder_id(
     State(state): State<AdminState>,
     Json(payload): Json<crate::admin::types::BuilderIdPollRequest>,
 ) -> impl IntoResponse {
-    match state.service.poll_builder_id_login(payload.session_id).await {
+    match state
+        .service
+        .poll_builder_id_login(payload.session_id)
+        .await
+    {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
@@ -281,13 +282,14 @@ pub async fn test_credential(
     Path(id): Path<u64>,
     body: Option<Json<TestCredentialRequest>>,
 ) -> impl IntoResponse {
-    let req = body.map(|j| j.0).unwrap_or(TestCredentialRequest { model: None });
+    let req = body
+        .map(|j| j.0)
+        .unwrap_or(TestCredentialRequest { model: None });
     match state.service.test_credential(id, req).await {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
-
 
 // ============ Runtime settings ============
 
@@ -328,6 +330,20 @@ pub async fn update_auth_settings(
     Json(payload): Json<crate::admin::types::UpdateAuthSettingsRequest>,
 ) -> impl IntoResponse {
     match state.service.update_auth_settings(payload) {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+pub async fn get_client_identity_settings(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_client_identity_settings())
+}
+
+pub async fn update_client_identity_settings(
+    State(state): State<AdminState>,
+    Json(payload): Json<crate::admin::types::UpdateClientIdentitySettingsRequest>,
+) -> impl IntoResponse {
+    match state.service.update_client_identity_settings(payload) {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

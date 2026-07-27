@@ -11,12 +11,15 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Select } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import {
   getAuthSettings,
+  getClientIdentitySettings,
   getEndpointSettings,
   getProxySettings,
   updateAuthSettings,
+  updateClientIdentitySettings,
   updateEndpointSettings,
   updateProxySettings,
 } from '@/api/settings'
@@ -45,13 +48,18 @@ export function SettingsPanel({ open, onOpenChange }: SettingsPanelProps) {
   const [newApiKey, setNewApiKey] = useState('')
   const [confirmDisableAuth, setConfirmDisableAuth] = useState(false)
 
+  const [kiroVersion, setKiroVersion] = useState('')
+  const [systemVersion, setSystemVersion] = useState('')
+  const [nodeVersion, setNodeVersion] = useState('')
+
   const load = async () => {
     setLoading(true)
     try {
-      const [proxy, endpoint, auth] = await Promise.all([
+      const [proxy, endpoint, auth, identity] = await Promise.all([
         getProxySettings(),
         getEndpointSettings(),
         getAuthSettings(),
+        getClientIdentitySettings(),
       ])
       setProxyUrl(proxy.proxyUrl ?? '')
       setProxyUsername(proxy.proxyUsername ?? '')
@@ -64,6 +72,9 @@ export function SettingsPanel({ open, onOpenChange }: SettingsPanelProps) {
       setApiKeyMask(auth.apiKeyMask)
       setNewApiKey('')
       setConfirmDisableAuth(false)
+      setKiroVersion(identity.kiroVersion)
+      setSystemVersion(identity.systemVersion)
+      setNodeVersion(identity.nodeVersion)
     } catch (e) {
       toast.error('加载设置失败: ' + extractErrorMessage(e))
     } finally {
@@ -91,6 +102,11 @@ export function SettingsPanel({ open, onOpenChange }: SettingsPanelProps) {
       await updateAuthSettings({
         requireApiKey,
         apiKey: newApiKey.trim() ? newApiKey.trim() : undefined,
+      })
+      await updateClientIdentitySettings({
+        kiroVersion: kiroVersion.trim(),
+        systemVersion: systemVersion.trim(),
+        nodeVersion: nodeVersion.trim(),
       })
       toast.success('设置已保存并热更新')
       await load()
@@ -148,17 +164,36 @@ export function SettingsPanel({ open, onOpenChange }: SettingsPanelProps) {
 
             <section className="space-y-2">
               <h3 className="text-sm font-medium">默认 Kiro 端点</h3>
-              <select
-                className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm"
+              <Select
                 value={defaultEndpoint}
-                onChange={(e) => setDefaultEndpoint(e.target.value)}
-              >
-                {registeredEndpoints.map((ep) => (
-                  <option key={ep} value={ep}>
-                    {ep}
-                  </option>
-                ))}
-              </select>
+                onValueChange={setDefaultEndpoint}
+                triggerClassName="h-9"
+                options={registeredEndpoints.map((ep) => ({ value: ep, label: ep }))}
+              />
+            </section>
+
+            <section className="space-y-2">
+              <h3 className="text-sm font-medium">客户端标识</h3>
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                <Input
+                  placeholder="kiroVersion"
+                  value={kiroVersion}
+                  onChange={(e) => setKiroVersion(e.target.value)}
+                />
+                <Input
+                  placeholder="systemVersion"
+                  value={systemVersion}
+                  onChange={(e) => setSystemVersion(e.target.value)}
+                />
+                <Input
+                  placeholder="nodeVersion"
+                  value={nodeVersion}
+                  onChange={(e) => setNodeVersion(e.target.value)}
+                />
+              </div>
+              <p className="text-xs text-amber-700 dark:text-amber-400">
+                这些值会进入后续上游请求指纹；错误版本可能导致上游拒绝。保存后写盘并热生效。
+              </p>
             </section>
 
             <section className="space-y-2">

@@ -2,10 +2,12 @@
 //!
 //! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+use crate::model::config::ModelResolutionConfig;
 
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
@@ -32,14 +34,26 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     };
 
     // type（必须是字符串）
-    if !obj.get("type").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
-        obj.insert("type".to_string(), serde_json::Value::String("object".to_string()));
+    if !obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty())
+    {
+        obj.insert(
+            "type".to_string(),
+            serde_json::Value::String("object".to_string()),
+        );
     }
 
     // properties（必须是 object）
     match obj.get("properties") {
         Some(serde_json::Value::Object(_)) => {}
-        _ => { obj.insert("properties".to_string(), serde_json::Value::Object(serde_json::Map::new())); }
+        _ => {
+            obj.insert(
+                "properties".to_string(),
+                serde_json::Value::Object(serde_json::Map::new()),
+            );
+        }
     }
 
     // required（必须是 string 数组）
@@ -56,7 +70,12 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     // additionalProperties（允许 bool 或 object，其他按 true 处理）
     match obj.get("additionalProperties") {
         Some(serde_json::Value::Bool(_)) | Some(serde_json::Value::Object(_)) => {}
-        _ => { obj.insert("additionalProperties".to_string(), serde_json::Value::Bool(true)); }
+        _ => {
+            obj.insert(
+                "additionalProperties".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
     }
 
     serde_json::Value::Object(obj)
@@ -75,38 +94,253 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
-/// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
-/// 严格对照版本号
-pub fn map_model(model: &str) -> Option<String> {
-    let model_lower = model.to_lowercase();
+/// thinking 后缀（与 /v1/models 展示一致）
+pub const THINKING_SUFFIX: &str = "-thinking";
 
-    if model_lower.contains("sonnet") {
-        if model_lower.contains("sonnet-5") {
+/// 解析结果类型
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveKind {
+    /// Claude 归一（含 thinking 基座）
+    Normalized,
+    /// 兼容别名（含 auto）
+    Alias,
+    /// catalog 命中透传
+    Passthrough,
+}
+
+impl ResolveKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ResolveKind::Normalized => "normalized",
+            ResolveKind::Alias => "alias",
+            ResolveKind::Passthrough => "passthrough",
+        }
+    }
+}
+
+/// 成功解析的模型
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModel {
+    /// 将发送给上游的 modelId
+    pub model_id: String,
+    /// 解析路径
+    pub kind: ResolveKind,
+    /// 输入是否带 thinking 后缀
+    pub thinking_requested: bool,
+    /// 客户端原始输入（trim 后）
+    pub original: String,
+}
+
+/// 解析失败原因
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveError {
+    Unmapped { model: String },
+    NotInCatalog { model: String },
+}
+
+impl ResolveError {
+    pub fn message(&self) -> String {
+        match self {
+            ResolveError::Unmapped { model } => {
+                format!("模型不支持或无法映射: {}", model)
+            }
+            ResolveError::NotInCatalog { model } => {
+                format!("模型不在可用 catalog 中: {}", model)
+            }
+        }
+    }
+
+    pub fn model(&self) -> &str {
+        match self {
+            ResolveError::Unmapped { model } | ResolveError::NotInCatalog { model } => model,
+        }
+    }
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message())
+    }
+}
+
+impl std::error::Error for ResolveError {}
+
+/// 内置 OpenAI 兼容别名 → Claude 上游 id
+pub fn builtin_compat_aliases() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("gpt-4o", "claude-sonnet-4.5"),
+        ("gpt-4", "claude-sonnet-4.5"),
+        ("gpt-4-turbo", "claude-sonnet-4.5"),
+        ("gpt-3.5-turbo", "claude-sonnet-4.5"),
+        ("gpt-4o-mini", "claude-sonnet-4.5"),
+    ]
+}
+
+/// Claude 关键字归一：将 Anthropic/客户端模型名映射到 Kiro 模型 ID
+/// 严格对照版本号。thinking 后缀由调用方剥离后再传入更清晰，但本函数也容忍。
+pub fn normalize_claude_model(model: &str) -> Option<String> {
+    let model_lower = model.to_lowercase();
+    let base = model_lower
+        .strip_suffix(THINKING_SUFFIX)
+        .unwrap_or(model_lower.as_str());
+
+    if base.contains("sonnet") {
+        if base.contains("sonnet-5") {
             Some("claude-sonnet-5".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
+        } else if base.contains("4-6") || base.contains("4.6") {
             Some("claude-sonnet-4.6".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
+        } else if base.contains("4-5")
+            || base.contains("4.5")
+            || base.contains("3-5")
+            || base.contains("3.5")
+            || base.contains("sonnet-4")
+        {
             Some("claude-sonnet-4.5".to_string())
         } else {
             None
         }
-    } else if model_lower.contains("opus") {
-        if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-opus-4.5".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-opus-4.6".to_string())
-        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
-            Some("claude-opus-4.7".to_string())
-        } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
+    } else if base.contains("opus") {
+        if base.contains("4-8") || base.contains("4.8") {
             Some("claude-opus-4.8".to_string())
+        } else if base.contains("4-7") || base.contains("4.7") {
+            Some("claude-opus-4.7".to_string())
+        } else if base.contains("4-6") || base.contains("4.6") {
+            Some("claude-opus-4.6".to_string())
+        } else if base.contains("4-5") || base.contains("4.5") || base.contains("opus-4") {
+            Some("claude-opus-4.5".to_string())
         } else {
             None
         }
-    } else if model_lower.contains("haiku") {
+    } else if base.contains("haiku") {
         Some("claude-haiku-4.5".to_string())
     } else {
         None
     }
+}
+
+/// 兼容旧入口：仅 Claude 关键字归一（无别名 / 无 catalog 透传）
+pub fn map_model(model: &str) -> Option<String> {
+    normalize_claude_model(model)
+}
+
+/// 默认解析策略（缺省 config 时）
+pub fn default_resolution_policy() -> ModelResolutionConfig {
+    ModelResolutionConfig::default()
+}
+
+fn lookup_compat_alias(model_lower: &str, policy: &ModelResolutionConfig) -> Option<String> {
+    if let Some(v) = policy.compat_aliases.get(model_lower) {
+        let t = v.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    for (k, v) in builtin_compat_aliases() {
+        if *k == model_lower {
+            return Some((*v).to_string());
+        }
+    }
+    None
+}
+
+fn catalog_contains(catalog: Option<&HashSet<String>>, model: &str) -> bool {
+    let Some(set) = catalog else {
+        return false;
+    };
+    crate::kiro::model::available_models::set_contains_model(set, model)
+}
+
+/// 统一模型解析：thinking 后缀 → 别名/auto → Claude 归一 → catalog 透传
+///
+/// `catalog` 为 lower-case model id 集合（可用 `model_id_set` 构建）；None 表示不做透传命中。
+pub fn resolve_model(
+    model: &str,
+    policy: &ModelResolutionConfig,
+    catalog: Option<&HashSet<String>>,
+) -> Result<ResolvedModel, ResolveError> {
+    let original = model.trim().to_string();
+    if original.is_empty() {
+        return Err(ResolveError::Unmapped { model: original });
+    }
+
+    let lower = original.to_lowercase();
+    let thinking_requested = lower.ends_with(THINKING_SUFFIX);
+    let base = if thinking_requested {
+        lower
+            .strip_suffix(THINKING_SUFFIX)
+            .unwrap_or(lower.as_str())
+            .to_string()
+    } else {
+        lower.clone()
+    };
+    let base = base.trim().to_string();
+    if base.is_empty() {
+        return Err(ResolveError::Unmapped { model: original });
+    }
+
+    // auto → defaultChatModel
+    if base == "auto" {
+        let target = policy.default_chat_model.trim();
+        if target.is_empty() {
+            return Err(ResolveError::Unmapped { model: original });
+        }
+        // 默认模型再走一遍 Claude 归一，保证版本拼写一致
+        let mapped = normalize_claude_model(target).unwrap_or_else(|| target.to_string());
+        return Ok(ResolvedModel {
+            model_id: mapped,
+            kind: ResolveKind::Alias,
+            thinking_requested,
+            original,
+        });
+    }
+
+    // 兼容别名
+    if let Some(alias_target) = lookup_compat_alias(&base, policy) {
+        let mapped = normalize_claude_model(&alias_target).unwrap_or(alias_target);
+        return Ok(ResolvedModel {
+            model_id: mapped,
+            kind: ResolveKind::Alias,
+            thinking_requested,
+            original,
+        });
+    }
+
+    // Claude 归一
+    if let Some(mapped) = normalize_claude_model(&base) {
+        return Ok(ResolvedModel {
+            model_id: mapped,
+            kind: ResolveKind::Normalized,
+            thinking_requested,
+            original,
+        });
+    }
+
+    // catalog 透传：保留原始基座 id 的 casing（用输入 base 对应 original 片段）
+    if policy.allow_catalog_passthrough {
+        // 从 original 去掉 thinking 后缀保留原 casing
+        let passthrough_id = if thinking_requested {
+            let orig_lower = original.to_lowercase();
+            if orig_lower.ends_with(THINKING_SUFFIX) {
+                original[..original.len() - THINKING_SUFFIX.len()].to_string()
+            } else {
+                original.clone()
+            }
+        } else {
+            original.clone()
+        };
+        let passthrough_id = passthrough_id.trim().to_string();
+        if catalog_contains(catalog, &passthrough_id) {
+            return Ok(ResolvedModel {
+                model_id: passthrough_id,
+                kind: ResolveKind::Passthrough,
+                thinking_requested,
+                original,
+            });
+        }
+        return Err(ResolveError::NotInCatalog { model: original });
+    }
+
+    Err(ResolveError::Unmapped { model: original })
 }
 
 /// 根据模型名称返回对应的上下文窗口大小
@@ -116,7 +350,15 @@ pub fn map_model(model: &str) -> Option<String> {
 /// Sonnet 5 / Opus 4.7 / 4.8 同 1M
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
-        Some(mapped) if mapped == "claude-sonnet-5" || mapped == "claude-sonnet-4.6" || mapped == "claude-opus-4.6" || mapped == "claude-opus-4.7" || mapped == "claude-opus-4.8" => 1_000_000,
+        Some(mapped)
+            if mapped == "claude-sonnet-5"
+                || mapped == "claude-sonnet-4.6"
+                || mapped == "claude-opus-4.6"
+                || mapped == "claude-opus-4.7"
+                || mapped == "claude-opus-4.8" =>
+        {
+            1_000_000
+        }
         _ => 200_000,
     }
 }
@@ -222,9 +464,19 @@ fn create_placeholder_tool(name: &str) -> Tool {
 
 /// 将 Anthropic 请求转换为 Kiro 请求
 pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
-    // 1. 映射模型
-    let model_id = map_model(&req.model)
-        .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
+    convert_request_with_policy(req, &default_resolution_policy(), None)
+}
+
+/// 带策略与 catalog 的请求转换（Admin/chat 主路径应传入运行时 config）
+pub fn convert_request_with_policy(
+    req: &MessagesRequest,
+    policy: &ModelResolutionConfig,
+    catalog: Option<&HashSet<String>>,
+) -> Result<ConversionResult, ConversionError> {
+    // 1. 映射模型（统一 resolve）
+    let model_id = resolve_model(&req.model, policy, catalog)
+        .map(|r| r.model_id)
+        .map_err(|e| ConversionError::UnsupportedModel(e.model().to_string()))?;
 
     // 2. 检查消息列表
     if req.messages.is_empty() {
@@ -325,10 +577,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         .with_history(history);
 
     if !tool_name_map.is_empty() {
-        tracing::info!(
-            "工具名称映射: {} 个超长名称已缩短",
-            tool_name_map.len()
-        );
+        tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
     }
 
     Ok(ConversionResult {
@@ -579,7 +828,10 @@ fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> Str
 }
 
 /// 转换工具定义
-fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut HashMap<String, String>) -> Vec<Tool> {
+fn convert_tools(
+    tools: &Option<Vec<super::types::Tool>>,
+    tool_name_map: &mut HashMap<String, String>,
+) -> Vec<Tool> {
     let Some(tools) = tools else {
         return Vec::new();
     };
@@ -610,7 +862,9 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
                 tool_specification: ToolSpecification {
                     name: map_tool_name(&t.name, tool_name_map),
                     description,
-                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(t.input_schema))),
+                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(
+                        t.input_schema
+                    ))),
                 },
             }
         })
@@ -653,7 +907,12 @@ fn has_thinking_tags(content: &str) -> bool {
 ///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
 ///   调用方应始终使用此参数而非 `req.messages`。
 /// * `model_id` - 已映射的 Kiro 模型 ID
-fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str, tool_name_map: &mut HashMap<String, String>) -> Result<Vec<Message>, ConversionError> {
+fn build_history(
+    req: &MessagesRequest,
+    messages: &[super::types::Message],
+    model_id: &str,
+    tool_name_map: &mut HashMap<String, String>,
+) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
@@ -817,7 +1076,8 @@ fn convert_assistant_message(
                             if let (Some(id), Some(name)) = (block.id, block.name) {
                                 let input = block.input.unwrap_or(serde_json::json!({}));
                                 let mapped_name = map_tool_name(&name, tool_name_map);
-                                tool_uses.push(ToolUseEntry::new(id, mapped_name).with_input(input));
+                                tool_uses
+                                    .push(ToolUseEntry::new(id, mapped_name).with_input(input));
                             }
                         }
                         _ => {}
@@ -934,7 +1194,127 @@ mod tests {
 
     #[test]
     fn test_map_model_unsupported() {
+        // map_model 仅 Claude 归一；兼容别名走 resolve_model
         assert!(map_model("gpt-4").is_none());
+        assert!(map_model("totally-unknown-model").is_none());
+    }
+
+    #[test]
+    fn test_resolve_model_openai_aliases() {
+        let policy = default_resolution_policy();
+        let r = resolve_model("gpt-4", &policy, None).unwrap();
+        assert_eq!(r.model_id, "claude-sonnet-4.5");
+        assert_eq!(r.kind, ResolveKind::Alias);
+
+        let r = resolve_model("GPT-4o", &policy, None).unwrap();
+        assert_eq!(r.model_id, "claude-sonnet-4.5");
+        assert_eq!(r.kind, ResolveKind::Alias);
+
+        let r = resolve_model("gpt-4-turbo", &policy, None).unwrap();
+        assert_eq!(r.model_id, "claude-sonnet-4.5");
+
+        let r = resolve_model("gpt-3.5-turbo", &policy, None).unwrap();
+        assert_eq!(r.model_id, "claude-sonnet-4.5");
+    }
+
+    #[test]
+    fn test_resolve_model_auto() {
+        let policy = default_resolution_policy();
+        let r = resolve_model("auto", &policy, None).unwrap();
+        assert_eq!(r.model_id, "claude-sonnet-4.6");
+        assert_eq!(r.kind, ResolveKind::Alias);
+
+        let mut custom = policy.clone();
+        custom.default_chat_model = "claude-sonnet-4.5".into();
+        let r = resolve_model("AUTO", &custom, None).unwrap();
+        assert_eq!(r.model_id, "claude-sonnet-4.5");
+    }
+
+    #[test]
+    fn test_resolve_model_catalog_passthrough() {
+        let mut set = HashSet::new();
+        set.insert("gpt-5.6-sol".to_string());
+        let policy = default_resolution_policy();
+        let r = resolve_model("gpt-5.6-sol", &policy, Some(&set)).unwrap();
+        assert_eq!(r.model_id, "gpt-5.6-sol");
+        assert_eq!(r.kind, ResolveKind::Passthrough);
+
+        let err = resolve_model("gpt-5.6-sol", &policy, None).unwrap_err();
+        assert!(matches!(err, ResolveError::NotInCatalog { .. }));
+        assert!(!err.message().contains("凭据无效"));
+
+        let mut disabled = policy.clone();
+        disabled.allow_catalog_passthrough = false;
+        let err = resolve_model("gpt-5.6-sol", &disabled, Some(&set)).unwrap_err();
+        assert!(matches!(err, ResolveError::Unmapped { .. }));
+    }
+
+    #[test]
+    fn test_resolve_model_thinking_suffix() {
+        let policy = default_resolution_policy();
+        let r = resolve_model("claude-sonnet-4.6-thinking", &policy, None).unwrap();
+        assert_eq!(r.model_id, "claude-sonnet-4.6");
+        assert!(r.thinking_requested);
+        assert_eq!(r.kind, ResolveKind::Normalized);
+    }
+
+    #[test]
+    fn test_resolve_model_claude_regression() {
+        let policy = default_resolution_policy();
+        let r = resolve_model("claude-sonnet-4-20250514", &policy, None).unwrap();
+        assert!(r.model_id.contains("sonnet"));
+        assert_eq!(r.kind, ResolveKind::Normalized);
+    }
+
+    fn simple_request(model: &str) -> MessagesRequest {
+        use super::super::types::Message as AnthropicMessage;
+        MessagesRequest {
+            model: model.to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
+            system: None,
+            stream: false,
+            tools: None,
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_convert_request_with_policy_alias_uses_resolved_model_id() {
+        let policy = default_resolution_policy();
+        let req = simple_request("gpt-4");
+        let result = convert_request_with_policy(&req, &policy, None).unwrap();
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .model_id,
+            "claude-sonnet-4.5"
+        );
+    }
+
+    #[test]
+    fn test_convert_request_with_policy_passthrough_uses_catalog_id() {
+        let policy = default_resolution_policy();
+        let mut catalog = HashSet::new();
+        catalog.insert("gpt-5.6-sol".to_string());
+        let req = simple_request("gpt-5.6-sol");
+        let result = convert_request_with_policy(&req, &policy, Some(&catalog)).unwrap();
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .model_id,
+            "gpt-5.6-sol"
+        );
     }
 
     #[test]
@@ -1057,13 +1437,18 @@ mod tests {
 
     #[test]
     fn test_shorten_tool_name_deterministic() {
-        let long_name = "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
+        let long_name =
+            "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
         assert!(long_name.len() > TOOL_NAME_MAX_LEN);
 
         let short1 = shorten_tool_name(long_name);
         let short2 = shorten_tool_name(long_name);
         assert_eq!(short1, short2, "相同输入应产生相同的短名称");
-        assert!(short1.len() <= TOOL_NAME_MAX_LEN, "短名称长度应 <= 63，实际 {}", short1.len());
+        assert!(
+            short1.len() <= TOOL_NAME_MAX_LEN,
+            "短名称长度应 <= 63，实际 {}",
+            short1.len()
+        );
     }
 
     #[test]
@@ -1096,7 +1481,8 @@ mod tests {
     fn test_tool_name_mapping_in_convert_request() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
         assert!(long_tool_name.len() > TOOL_NAME_MAX_LEN);
 
         let mut schema = std::collections::HashMap::new();
@@ -1106,12 +1492,10 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
-            messages: vec![
-                AnthropicMessage {
-                    role: "user".to_string(),
-                    content: serde_json::json!("test"),
-                },
-            ],
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
             system: None,
             stream: false,
             tools: Some(vec![AnthropicTool {
@@ -1138,8 +1522,12 @@ mod tests {
         assert!(short.len() <= TOOL_NAME_MAX_LEN);
 
         // Kiro 请求中的工具名应该是短名称
-        let tools = &result.conversation_state.current_message.user_input_message
-            .user_input_message_context.tools;
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
         assert_eq!(tools[0].tool_specification.name, *short);
     }
 
@@ -1147,7 +1535,8 @@ mod tests {
     fn test_tool_name_mapping_in_history() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
 
         let mut schema = std::collections::HashMap::new();
         schema.insert("type".to_string(), serde_json::json!("object"));
@@ -1742,9 +2131,15 @@ mod tests {
 
         let content = &result.assistant_response_message.content;
         assert!(content.contains("<thinking>"), "应包含 thinking 标签");
-        assert!(content.contains("Let me read that file"), "应包含第二条消息的 text 内容");
+        assert!(
+            content.contains("Let me read that file"),
+            "应包含第二条消息的 text 内容"
+        );
 
-        let tool_uses = result.assistant_response_message.tool_uses.expect("应有 tool_uses");
+        let tool_uses = result
+            .assistant_response_message
+            .tool_uses
+            .expect("应有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_01ABC");
     }
@@ -1794,7 +2189,11 @@ mod tests {
         };
 
         let result = convert_request(&req);
-        assert!(result.is_ok(), "连续 assistant 消息场景不应报错: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "连续 assistant 消息场景不应报错: {:?}",
+            result.err()
+        );
 
         let state = result.unwrap().conversation_state;
         let mut found_tool_use = false;

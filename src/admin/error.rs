@@ -20,6 +20,9 @@ pub enum AdminServiceError {
 
     /// 凭据无效（验证失败）
     InvalidCredential(String),
+
+    /// 模型无法解析 / 不在 catalog（非凭据损坏）
+    ModelUnmapped(String),
 }
 
 impl fmt::Display for AdminServiceError {
@@ -31,6 +34,7 @@ impl fmt::Display for AdminServiceError {
             AdminServiceError::UpstreamError(msg) => write!(f, "上游服务错误: {}", msg),
             AdminServiceError::InternalError(msg) => write!(f, "内部错误: {}", msg),
             AdminServiceError::InvalidCredential(msg) => write!(f, "凭据无效: {}", msg),
+            AdminServiceError::ModelUnmapped(msg) => write!(f, "{}", msg),
         }
     }
 }
@@ -45,6 +49,7 @@ impl AdminServiceError {
             AdminServiceError::UpstreamError(_) => StatusCode::BAD_GATEWAY,
             AdminServiceError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AdminServiceError::InvalidCredential(_) => StatusCode::BAD_REQUEST,
+            AdminServiceError::ModelUnmapped(_) => StatusCode::BAD_REQUEST,
         }
     }
 
@@ -57,6 +62,9 @@ impl AdminServiceError {
                 AdminErrorResponse::internal_error(self.to_string())
             }
             AdminServiceError::InvalidCredential(_) => {
+                AdminErrorResponse::invalid_request(self.to_string())
+            }
+            AdminServiceError::ModelUnmapped(_) => {
                 AdminErrorResponse::invalid_request(self.to_string())
             }
         }
@@ -89,11 +97,21 @@ mod tests {
     }
 
     #[test]
+    fn model_unmapped_message_has_no_credential_prefix() {
+        let err = AdminServiceError::ModelUnmapped("模型不支持或无法映射: weird-model".into());
+        let s = err.to_string();
+        assert!(!s.starts_with("凭据无效"));
+        assert!(s.contains("weird-model"));
+        let resp = err.into_response();
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("凭据无效"));
+        assert!(!json.to_lowercase().contains("refreshtoken"));
+    }
+
+    #[test]
     fn invalid_credential_response_has_no_secret_fields() {
-        let resp = AdminServiceError::InvalidCredential(
-            "model unmapped: gpt-4".into(),
-        )
-        .into_response();
+        let resp =
+            AdminServiceError::InvalidCredential("model unmapped: gpt-4".into()).into_response();
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.to_lowercase().contains("refreshtoken"));
         assert!(!json.to_lowercase().contains("accesstoken"));
@@ -102,10 +120,8 @@ mod tests {
 
     #[test]
     fn upstream_error_response_has_no_secret_fields() {
-        let resp = AdminServiceError::UpstreamError(
-            "upstream generate failed: 403 denied".into(),
-        )
-        .into_response();
+        let resp = AdminServiceError::UpstreamError("upstream generate failed: 403 denied".into())
+            .into_response();
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.to_lowercase().contains("refreshtoken"));
         assert!(!json.to_lowercase().contains("accesstoken"));
@@ -114,6 +130,4 @@ mod tests {
             StatusCode::BAD_GATEWAY
         );
     }
-
 }
-

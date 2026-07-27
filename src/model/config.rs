@@ -113,9 +113,54 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// 模型解析策略（别名 / auto / catalog 透传）
+    #[serde(default)]
+    pub model_resolution: ModelResolutionConfig,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
+}
+
+/// 模型解析配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelResolutionConfig {
+    /// auto 映射到的默认聊天模型
+    #[serde(default = "default_chat_model")]
+    pub default_chat_model: String,
+
+    /// 是否允许 catalog 命中的上游 id 透传
+    #[serde(default = "default_allow_catalog_passthrough")]
+    pub allow_catalog_passthrough: bool,
+
+    /// 是否在 /v1/models 额外暴露兼容别名（gpt-4o 等）
+    #[serde(default)]
+    pub expose_compat_aliases_in_models: bool,
+
+    /// 可选自定义兼容别名（覆盖内置表同名项）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub compat_aliases: HashMap<String, String>,
+}
+
+impl Default for ModelResolutionConfig {
+    fn default() -> Self {
+        Self {
+            default_chat_model: default_chat_model(),
+            allow_catalog_passthrough: default_allow_catalog_passthrough(),
+            expose_compat_aliases_in_models: false,
+            compat_aliases: HashMap::new(),
+        }
+    }
+}
+
+fn default_chat_model() -> String {
+    "claude-sonnet-4.6".to_string()
+}
+
+fn default_allow_catalog_passthrough() -> bool {
+    true
 }
 
 fn default_host() -> String {
@@ -193,6 +238,7 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
+            model_resolution: ModelResolutionConfig::default(),
             config_path: None,
         }
     }
@@ -245,7 +291,8 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content).with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        fs::write(path, content)
+            .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
     }
 }

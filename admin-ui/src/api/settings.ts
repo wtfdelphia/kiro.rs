@@ -2,6 +2,7 @@ import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
   AuthSettings,
+  ClientIdentitySettings,
   EndpointSettings,
   ProxySettings,
   SuccessSettingsResponse,
@@ -56,5 +57,20 @@ export async function updateAuthSettings(body: {
   apiKey?: string | null
 }): Promise<SuccessSettingsResponse> {
   const { data } = await api.put<SuccessSettingsResponse>('/settings/auth', body)
+  return data
+}
+
+
+export async function getClientIdentitySettings(): Promise<ClientIdentitySettings> {
+  const { data } = await api.get<ClientIdentitySettings>('/settings/client-identity')
+  return data
+}
+
+export async function updateClientIdentitySettings(body: {
+  kiroVersion?: string
+  systemVersion?: string
+  nodeVersion?: string
+}): Promise<SuccessSettingsResponse> {
+  const { data } = await api.put<SuccessSettingsResponse>('/settings/client-identity', body)
   return data
 }
