@@ -53,7 +53,8 @@
   - [2. 最小配置](#2-最小配置)
   - [3. 启动](#3-启动)
   - [4. 验证](#4-验证)
-  - [Docker](#docker)
+  - [下载 / Releases](#下载--releases)
+- [Docker](#docker)
 - [配置详解](#配置详解)
   - [config.json](#configjson)
   - [credentials.json](#credentialsjson)
@@ -79,7 +80,10 @@
 
 ### 1. 编译
 
-> PS: 如果不想编辑可以直接前往 Release 下载二进制文件
+> PS: 不想本地编译时可直接下载发布包，详见 [下载 / Releases](#下载--releases)。
+>
+> - 正式版：<https://github.com/wtfdelphia/kiro.rs/releases/latest>
+> - 开发滚动包：<https://github.com/wtfdelphia/kiro.rs/releases/tag/dev-latest>
 
 > **前置步骤**：编译前需要先构建前端 Admin UI（用于嵌入到二进制中）：
 > ```bash
@@ -165,16 +169,117 @@ curl http://127.0.0.1:8990/v1/messages \
 | GET/PUT | `/api/admin/settings/endpoint` | 默认 Kiro 端点（仅已注册名，当前 `ide`） |
 | GET/PUT | `/api/admin/settings/auth` | 客户端 `requireApiKey` / `apiKey`（mask 读；热更新） |
 | GET | `/api/admin/models/catalog` | 全局模型 catalog 摘要 |
+| GET | `/api/admin/public-api` | 对外 API 端点目录（只读；Base URL / 鉴权 / status / curl 示例） |
 | GET | `/api/admin/credentials/{id}/balance?force=true` | 强制刷新余额（跳过 TTL 缓存） |
+
+> `settings/endpoint` 指的是**本代理访问上游 Kiro** 的端点（当前 `ide`）；
+> `public-api` 指的是**客户端访问本代理**的对外端点。两者不可混用。
+> Admin UI 顶栏「对外 API 端点」按钮可查看后者并一键复制配置。
 
 `GET /v1/models`：优先全局模型缓存；仅暴露 `map_model` 可映射的 id；缓存为空时静态 fallback（不阻塞上游全量刷新）。
 
-## Docker
+## 下载 / Releases
 
-也可以通过 Docker 启动：
+构建产物会发布到 GitHub Releases，可直接下载多平台二进制。
+
+### 入口
+
+| 类型 | 说明 | 链接 |
+| --- | --- | --- |
+| Releases 列表 | 所有正式版 / prerelease | <https://github.com/wtfdelphia/kiro.rs/releases> |
+| 最新正式版 | 最近一次 `v*` 自动发布 | <https://github.com/wtfdelphia/kiro.rs/releases/latest> |
+| 开发滚动包 | `dev` 分支滚动 prerelease | <https://github.com/wtfdelphia/kiro.rs/releases/tag/dev-latest> |
+| 指定正式版示例 | 如 `v2026.7.27` | <https://github.com/wtfdelphia/kiro.rs/releases/tag/v2026.7.27> |
+
+> 说明：`push v*` 后，`build.yaml` 会在多平台构建成功后自动创建正式 Release 并挂载二进制。  
+> `dev` 分支成功构建后会更新滚动 prerelease `dev-latest`（不覆盖正式 Latest）。
+
+### 资源命名
+
+```text
+kiro-rs-<version>-<platform>[.exe]
+```
+
+常见 platform：
+
+- `Windows-x64`（`.exe`）
+- `Linux-x64` / `Linux-arm64`
+- `Linux-musl-x64` / `Linux-musl-arm64`
+- `macOS-x64` / `macOS-arm64`
+
+### 直链下载示例
+
+正式版（把版本号换成实际 tag）：
 
 ```bash
-docker-compose up
+# Linux x64
+curl -fL -O https://github.com/wtfdelphia/kiro.rs/releases/download/v2026.7.27/kiro-rs-v2026.7.27-Linux-x64
+
+# Windows x64
+curl -fL -O https://github.com/wtfdelphia/kiro.rs/releases/download/v2026.7.27/kiro-rs-v2026.7.27-Windows-x64.exe
+
+# macOS arm64
+curl -fL -O https://github.com/wtfdelphia/kiro.rs/releases/download/v2026.7.27/kiro-rs-v2026.7.27-macOS-arm64
+```
+
+开发滚动包：
+
+```bash
+# Linux x64
+curl -fL -O https://github.com/wtfdelphia/kiro.rs/releases/download/dev-latest/kiro-rs-dev-latest-Linux-x64
+
+# Windows x64
+curl -fL -O https://github.com/wtfdelphia/kiro.rs/releases/download/dev-latest/kiro-rs-dev-latest-Windows-x64.exe
+```
+
+通用模板：
+
+```text
+https://github.com/wtfdelphia/kiro.rs/releases/download/<tag>/kiro-rs-<tag>-<platform>[.exe]
+```
+
+> Windows / 部分环境下请使用 `curl.exe -fL -O ...`，并确保跟随重定向（`-L`）。
+
+### 和 Docker 镜像的关系
+
+- 二进制：GitHub Releases
+- 容器镜像：GHCR 包页 <https://github.com/wtfdelphia/kiro.rs/pkgs/container/kiro-rs>
+- 镜像名：`ghcr.io/wtfdelphia/kiro-rs`
+
+## Docker
+
+本仓库构建的镜像推送到 GHCR：
+
+- 包页面：<https://github.com/wtfdelphia/kiro.rs/pkgs/container/kiro-rs>
+- 镜像：`ghcr.io/wtfdelphia/kiro-rs`
+
+常用 tag：
+
+| Tag | 含义 |
+| --- | --- |
+| `latest` | 最近一次正式 `v*` 构建 |
+| `v2026.7.27` 等 | 指定正式版本 |
+| `beta` | `master` 分支 beta 构建 |
+| `dev-latest` 相关 | 仅二进制 prerelease；Docker 工作流当前不发 dev 滚动镜像 |
+
+拉取示例：
+
+```bash
+docker pull ghcr.io/wtfdelphia/kiro-rs:latest
+# 或指定版本
+docker pull ghcr.io/wtfdelphia/kiro-rs:v2026.7.27
+```
+
+也可以通过 Docker Compose 启动：
+
+```bash
+# 如使用本仓库镜像，可显式指定 owner/tag
+# Linux/macOS:
+#   IMAGE_OWNER=wtfdelphia IMAGE_TAG=latest docker compose up -d
+# PowerShell:
+#   $env:IMAGE_OWNER="wtfdelphia"; $env:IMAGE_TAG="latest"; docker compose up -d
+
+docker compose up
 ```
 
 需要将 `config.json` 和 `credentials.json` 挂载到容器中，具体参见 `docker-compose.yml`。
@@ -423,6 +528,15 @@ RUST_LOG=debug ./target/release/kiro-rs
 > - `/v1/messages`：实时流式返回，`message_start` 中的 `input_tokens` 是估算值
 > - `/cc/v1/messages`：缓冲模式，等待上游流完成后，用从 `contextUsageEvent` 计算的准确 `input_tokens` 更正 `message_start`，然后一次性返回所有事件
 > - 等待期间会每 25 秒发送 `ping` 事件保活
+
+### 端点清单的单一事实源
+
+上表的对外端点由 `src/public_api/catalog.rs` 统一登记，启动日志的「可用 API」列表与
+Admin `GET /api/admin/public-api` 均由它派生，避免多处手写清单互相漂移。
+单测强制 `status=live` 的端点必须能被真实路由命中，`status=planned` 的必须命中不到（404）。
+
+已登记但尚未实现（`planned`，当前请求返回 404）：`POST /v1/chat/completions`、
+`POST /v1/responses`、`GET /v1/responses/{id}`。
 
 ### Thinking 模式
 

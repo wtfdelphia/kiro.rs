@@ -111,7 +111,7 @@ kiro-rs-<version>-<platform-name>
 
 ### 重要限制
 
-该工作流 **只上传 Artifact，不会自动创建 GitHub Release**。
+对分支 push（`master`/`dev`）仍主要上传 Artifact；对 **`v*` tag** 会在全部平台构建成功后自动创建正式 GitHub Release，并挂载多平台二进制。
 
 如果 README 中“去 Release 下载二进制”可用，通常还需要：
 
@@ -120,6 +120,18 @@ kiro-rs-<version>-<platform-name>
 3. 手工创建 GitHub Release 并挂载文件
 
 或另外增加自动 release workflow。
+
+
+### 正式版自动 Release（v*）
+
+`build.yaml` 在 push `v*` tag 且构建成功后会：
+
+1. 汇总各平台 staged 二进制
+2. 使用 `softprops/action-gh-release` 创建正式 Release
+3. `prerelease: false`、`make_latest: true`
+4. Release 说明中附带 GHCR 拉取命令：`ghcr.io/<owner>/kiro-rs:<tag>` / `:latest`
+
+因此 tag 构建成功后，二进制会出现在仓库首页 Releases，而不仅是 Actions Artifacts。
 
 ## 2. Build and Push Docker Images
 
@@ -140,8 +152,8 @@ ghcr.io/<github.repository_owner>/kiro-rs
 
 例如：
 
-- 上游常见默认：`ghcr.io/hank9999/kiro-rs`
-- 本仓库 fork remote 若为 `wtfdelphia/kiro.rs`，则实际为 `ghcr.io/wtfdelphia/kiro-rs`
+- 本仓库：`ghcr.io/wtfdelphia/kiro-rs`
+- 包页面：https://github.com/wtfdelphia/kiro.rs/pkgs/container/kiro-rs
 
 ### 单架构 tag
 
