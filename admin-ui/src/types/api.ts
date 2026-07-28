@@ -185,7 +185,51 @@ export interface ClientIdentitySettings {
   nodeVersion: string
 }
 
+export interface WebSearchSettings {
+  webSearchEmulation: boolean
+}
+
 export interface SuccessSettingsResponse {
   success: boolean
   message: string
+}
+
+// Public API catalog
+// 注意：这里是「客户端 -> 本代理」的对外端点，与 EndpointSettings
+// （本代理 -> 上游 Kiro 的 ide 端点）是两个不同概念。
+export type PublicEndpointStatus = 'live' | 'beta' | 'planned'
+
+export interface PublicApiServerSummary {
+  listenHost: string
+  port: number
+  requireApiKey: boolean
+  apiKeyMask: string | null
+  hasApiKey: boolean
+  authHeaders: string[]
+  /** 未配置 publicBaseUrl 时为 null，前端回落 window.location.origin */
+  suggestedBaseUrl: string | null
+}
+
+export interface PublicApiEndpoint {
+  id: string
+  method: string
+  path: string
+  aliases: string[]
+  auth: string
+  status: PublicEndpointStatus
+  stream: boolean
+  summary: string
+  clientHints: string[]
+  examples: { curl: string }
+}
+
+export interface PublicApiFamily {
+  family: string
+  label: string
+  endpoints: PublicApiEndpoint[]
+}
+
+export interface PublicApiResponse {
+  server: PublicApiServerSummary
+  families: PublicApiFamily[]
 }

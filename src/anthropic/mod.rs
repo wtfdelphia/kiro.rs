@@ -33,3 +33,17 @@ mod websearch;
 
 pub use converter::resolve_model;
 pub use router::create_router_with_provider_and_auth;
+
+// === 供 openai 模块复用（只扩大可见性，不改实现） ===
+
+pub(crate) use converter::{
+    ConversionError, convert_request_with_policy, get_context_window_size,
+};
+pub(crate) use handlers::{override_thinking_from_model_name, resolution_context_from_state};
+pub(crate) use middleware::{AppState, auth_middleware, cors_layer};
+pub(crate) use router::MAX_BODY_SIZE;
+pub(crate) use stream::extract_thinking_from_complete_text;
+pub(crate) use websearch::{
+    WebSearchResults, call_mcp_api, create_mcp_request, generate_search_summary,
+    parse_search_results,
+};

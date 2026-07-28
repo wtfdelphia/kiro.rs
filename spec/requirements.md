@@ -8,6 +8,9 @@ kiro-rs 是用 Rust 编写的 Anthropic Claude API 兼容代理服务，将 Anth
 
 - Anthropic Messages API 兼容（`/v1`）
 - Claude Code 兼容端点（`/cc/v1`，缓冲模式以修正 input_tokens）
+- OpenAI Chat Completions 兼容（`/v1/chat/completions`）
+- OpenAI Responses 兼容（`/v1/responses`，无状态；可选 web 搜索代执行）
+- 对外端点注册表：状态（live/planned）与真实路由双向防漂移，经 Admin 只读展示
 - SSE 流式响应
 - OAuth Token 自动刷新
 - 多凭据：优先级 / 均衡负载、故障转移、多凭据格式下 token 回写

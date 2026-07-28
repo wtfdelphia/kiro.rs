@@ -636,6 +636,19 @@ pub struct AuthSettingsResponse {
     pub api_key_mask: Option<String>,
 }
 
+/// web_search 代执行设置（仅影响 /v1/responses 端点）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebSearchSettingsResponse {
+    pub web_search_emulation: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateWebSearchSettingsRequest {
+    pub web_search_emulation: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateAuthSettingsRequest {

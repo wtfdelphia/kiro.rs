@@ -65,6 +65,9 @@
 - [API 端点](#api-端点)
   - [标准端点 (/v1)](#标准端点-v1)
   - [Claude Code 兼容端点 (/cc/v1)](#claude-code-兼容端点-ccv1)
+  - [OpenAI 兼容端点](#openai-兼容端点)
+  - [WebSearch 工具](#websearch-工具)
+  - [端点清单的单一事实源](#端点清单的单一事实源)
   - [Thinking 模式](#thinking-模式)
   - [工具调用](#工具调用)
 - [模型映射](#模型映射)
@@ -170,6 +173,7 @@ curl http://127.0.0.1:8990/v1/messages \
 | GET/PUT | `/api/admin/settings/auth` | 客户端 `requireApiKey` / `apiKey`（mask 读；热更新） |
 | GET | `/api/admin/models/catalog` | 全局模型 catalog 摘要 |
 | GET | `/api/admin/public-api` | 对外 API 端点目录（只读；Base URL / 鉴权 / status / curl 示例） |
+| GET/PUT | `/api/admin/settings/websearch` | web_search 代执行开关（默认开启；仅影响 `/v1/responses`） |
 | GET | `/api/admin/credentials/{id}/balance?force=true` | 强制刷新余额（跳过 TTL 缓存） |
 
 > `settings/endpoint` 指的是**本代理访问上游 Kiro** 的端点（当前 `ide`）；
@@ -316,6 +320,7 @@ docker compose up
 | `modelResolution.allowCatalogPassthrough` | bool | `true` | 允许命中 Kiro catalog 的上游模型 ID（如 `gpt-5.6-sol`）透传 |
 | `modelResolution.exposeCompatAliasesInModels` | bool | `false` | 是否在公开 `/v1/models` 额外暴露 `auto` / `gpt-4o` / `gpt-4` 等兼容别名 |
 | `modelResolution.compatAliases` | object | `{}` | 自定义兼容别名，key 为客户端 model，value 为上游 model |
+| `webSearchEmulation` | bool | `true` | `/v1/responses` 的 web 搜索代执行开关。关闭后该端点的 `web_search` 工具走普通工具路径，不代替客户端执行搜索；不影响 Anthropic 端点。可在 Admin「运行时设置」热更新 |
 
 完整配置示例：
 
@@ -524,10 +529,54 @@ RUST_LOG=debug ./target/release/kiro-rs
 | `/cc/v1/messages` | POST | 创建消息（缓冲模式，确保 `input_tokens` 准确） |
 | `/cc/v1/messages/count_tokens` | POST | 估算 Token 数量（与 `/v1` 相同） |
 
+### OpenAI 兼容端点
+
+| 端点 | 方法 | 描述 |
+|------|------|------|
+| `/v1/chat/completions` | POST | OpenAI Chat Completions（流式 + 非流式，含 function tools） |
+| `/v1/responses` | POST | OpenAI Responses（语义事件流 + 非流式，无状态；支持 web_search 代执行） |
+
+接入注意：
+
+- `OPENAI_BASE_URL` 需带 `/v1` 后缀（`ANTHROPIC_BASE_URL` 不带），这是最高频的配置错误
+- 响应回显的 `model` 为客户端请求的原始名（如 `gpt-4o`），不是实际执行的 Claude 模型
+- 流式 `usage` 需客户端传 `stream_options: {"include_usage": true}` 才在末尾返回
+- `temperature` / `top_p` / `tool_choice` 接受但不透传（Kiro 上游无对应字段）
+- 图片仅支持 base64 data URL；远程 http(s) 图片 URL 会被跳过
+- 不支持服务端 `web_search` 工具；名为 `web_search` 的普通 function tool 走正常工具路径
+- 未实现 `logprobs`、`n>1`、`seed`、`stop`、`logit_bias`
+
+`/v1/responses` 额外注意：
+
+- **无状态**：携带 `previous_response_id` 返回 400，请在 `input` 中带上完整对话；`store` 被忽略
+- SSE 为命名语义事件（`event: response.*`），与 `/v1/chat/completions` 的纯 `data:` 行不同
+- `input` 支持字符串 / item 数组 / 单个 item 对象三种形状
+- 声明**单个** web_search 工具时由本代理执行搜索并返回 `web_search_call` + `message` 输出；
+  可在 Admin 运行时设置中关闭（关闭后该工具走正常工具路径）
+- 该端点的 web_search 判定比 `/v1/messages` 宽（含 `web_search_20250305` 等形状），
+  两端点行为差异是有意选择
+- 未实现 `GET /v1/responses/{id}`、`include`、`truncation`、`parallel_tool_calls`
+
 > **`/cc/v1/messages` 与 `/v1/messages` 的区别**：
 > - `/v1/messages`：实时流式返回，`message_start` 中的 `input_tokens` 是估算值
 > - `/cc/v1/messages`：缓冲模式，等待上游流完成后，用从 `contextUsageEvent` 计算的准确 `input_tokens` 更正 `message_start`，然后一次性返回所有事件
 > - 等待期间会每 25 秒发送 `ping` 事件保活
+
+### WebSearch 工具
+
+`/v1/messages` 与 `/cc/v1/messages` 在请求**恰好声明一个** `web_search` 工具时，
+由本代理通过 Kiro MCP 执行搜索并直接构造响应（不走模型生成）。
+响应形态跟随请求的 `stream` 字段：
+
+- `stream: true` → SSE 事件流
+- `stream: false`（或缺省）→ 标准 message JSON 对象
+
+两种模式的内容块一致：`text`（搜索说明）、`server_tool_use`、
+`web_search_tool_result`、`text`（结果摘要），`usage` 中带
+`server_tool_use.web_search_requests`。
+
+混合工具（web_search 与其它工具同时声明）不触发代执行，按普通工具转发上游。
+`/v1/responses` 的 web_search 判定更宽且可开关，见上文 OpenAI 兼容端点。
 
 ### 端点清单的单一事实源
 
@@ -535,8 +584,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 Admin `GET /api/admin/public-api` 均由它派生，避免多处手写清单互相漂移。
 单测强制 `status=live` 的端点必须能被真实路由命中，`status=planned` 的必须命中不到（404）。
 
-已登记但尚未实现（`planned`，当前请求返回 404）：`POST /v1/chat/completions`、
-`POST /v1/responses`、`GET /v1/responses/{id}`。
+已登记但尚未实现（`planned`，当前请求返回 404）：`GET /v1/responses/{id}`。
 
 ### Thinking 模式
 
