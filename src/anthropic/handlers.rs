@@ -103,7 +103,7 @@ pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
-fn resolution_context_from_state(
+pub(crate) fn resolution_context_from_state(
     state: &AppState,
 ) -> (ModelResolutionConfig, Option<HashSet<String>>) {
     if let Some(provider) = &state.kiro_provider {
@@ -831,7 +831,7 @@ async fn handle_non_stream_request(
 /// - Opus 4.6：覆写为 adaptive 类型
 /// - 其他模型：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
-fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
+pub(crate) fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let model_lower = payload.model.to_lowercase();
     if !model_lower.contains("thinking") {
         return;

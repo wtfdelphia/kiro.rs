@@ -339,6 +339,27 @@ pub async fn get_client_identity_settings(State(state): State<AdminState>) -> im
     Json(state.service.get_client_identity_settings())
 }
 
+pub async fn get_websearch_settings(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_websearch_settings())
+}
+
+pub async fn update_websearch_settings(
+    State(state): State<AdminState>,
+    Json(payload): Json<crate::admin::types::UpdateWebSearchSettingsRequest>,
+) -> impl IntoResponse {
+    match state.service.update_websearch_settings(payload) {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/public-api
+///
+/// 只读返回对外 Public API 目录（路径 / 鉴权 / status / 示例）。
+pub async fn get_public_api(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_public_api())
+}
+
 pub async fn update_client_identity_settings(
     State(state): State<AdminState>,
     Json(payload): Json<crate::admin::types::UpdateClientIdentitySettingsRequest>,

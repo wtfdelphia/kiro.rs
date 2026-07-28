@@ -1193,6 +1193,53 @@ impl AdminService {
         }
     }
 
+    /// web_search 代执行开关（仅影响 `/v1/responses` 端点）
+    pub fn get_websearch_settings(&self) -> crate::admin::types::WebSearchSettingsResponse {
+        crate::admin::types::WebSearchSettingsResponse {
+            web_search_emulation: self.token_manager.config().web_search_emulation,
+        }
+    }
+
+    pub fn update_websearch_settings(
+        &self,
+        req: crate::admin::types::UpdateWebSearchSettingsRequest,
+    ) -> Result<super::types::SuccessResponse, AdminServiceError> {
+        let enabled = req.web_search_emulation;
+        self.token_manager
+            .update_config_with(|cfg| {
+                cfg.web_search_emulation = enabled;
+            })
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        self.token_manager
+            .save_config()
+            .map_err(|e| AdminServiceError::InternalError(format!("配置落盘失败: {}", e)))?;
+
+        tracing::info!(enabled = enabled, "web_search 代执行开关已更新");
+        Ok(super::types::SuccessResponse::new(format!(
+            "web_search 代执行已{}（仅影响 /v1/responses 端点）",
+            if enabled { "启用" } else { "关闭" }
+        )))
+    }
+
+    /// 对外 Public API 目录（只读）
+    ///
+    /// 注意：这里描述的是「客户端 -> 本代理」的端点，与 `get_endpoint_settings`
+    /// 管理的「本代理 -> 上游 Kiro」端点是两个不同概念。
+    pub fn get_public_api(&self) -> crate::public_api::PublicApiResponse {
+        let cfg = self.token_manager.config();
+        // 鉴权状态优先取热更新句柄，回落到配置（与 get_auth_settings 同源）
+        let auth = self.get_auth_settings();
+        crate::public_api::build_response(
+            cfg.host.clone(),
+            cfg.port,
+            auth.require_api_key,
+            auth.api_key_mask,
+            // publicBaseUrl 尚未纳入配置，前端回落 window.location.origin
+            None,
+        )
+    }
+
     pub fn update_client_identity_settings(
         &self,
         req: UpdateClientIdentitySettingsRequest,
@@ -1653,6 +1700,116 @@ mod tests {
         assert!(
             force_err.is_err(),
             "force should not return cache-only success without upstream"
+        );
+    }
+
+    #[test]
+    fn test_websearch_setting_defaults_to_enabled() {
+        let service = AdminService::new(manager_with_one(), Vec::<String>::new());
+        assert!(
+            service.get_websearch_settings().web_search_emulation,
+            "缺省时 web_search 代执行应为启用（兼容现网）"
+        );
+    }
+
+    #[test]
+    fn test_websearch_setting_toggle() {
+        let (cfg, path) = temp_config();
+        let service = AdminService::new(manager_with_config(cfg), Vec::<String>::new());
+
+        service
+            .update_websearch_settings(crate::admin::types::UpdateWebSearchSettingsRequest {
+                web_search_emulation: false,
+            })
+            .expect("关闭失败");
+        assert!(!service.get_websearch_settings().web_search_emulation);
+
+        service
+            .update_websearch_settings(crate::admin::types::UpdateWebSearchSettingsRequest {
+                web_search_emulation: true,
+            })
+            .expect("开启失败");
+        assert!(service.get_websearch_settings().web_search_emulation);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_websearch_response_has_no_unrelated_secrets() {
+        let mut cfg = Config::default();
+        cfg.api_key = Some("sk-client-secret-value".to_string());
+        cfg.admin_api_key = Some("sk-admin-secret-value".to_string());
+        cfg.proxy_password = Some("proxy-secret".to_string());
+        let service = AdminService::new(manager_with_config(cfg), Vec::<String>::new());
+
+        let json = serde_json::to_string(&service.get_websearch_settings()).unwrap();
+        assert!(!json.contains("sk-client-secret-value"));
+        assert!(!json.contains("sk-admin-secret-value"));
+        assert!(!json.contains("proxy-secret"));
+        // 响应应只含该开关本身
+        assert_eq!(json, r#"{"webSearchEmulation":true}"#);
+    }
+
+    #[test]
+    fn test_websearch_setting_persisted() {
+        let (cfg, path) = temp_config();
+        let service = AdminService::new(manager_with_config(cfg), Vec::<String>::new());
+        service
+            .update_websearch_settings(crate::admin::types::UpdateWebSearchSettingsRequest {
+                web_search_emulation: false,
+            })
+            .expect("更新失败");
+
+        let saved = std::fs::read_to_string(&path).expect("读取配置失败");
+        assert!(
+            saved.contains("webSearchEmulation"),
+            "变更必须落盘: {}",
+            saved
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_get_public_api_never_leaks_full_key() {
+        let secret = "sk-abcdefghijklmnopqrstuvwxyz";
+        let mut cfg = Config::default();
+        cfg.api_key = Some(secret.to_string());
+        cfg.require_api_key = true;
+        let service = AdminService::new(manager_with_config(cfg), Vec::<String>::new());
+
+        let body = serde_json::to_string(&service.get_public_api()).unwrap();
+        assert!(
+            !body.contains(secret),
+            "public-api 响应中不得出现完整 client apiKey"
+        );
+        assert!(body.contains("API_KEY"), "示例应使用占位符 API_KEY");
+        assert!(
+            body.contains("\"apiKeyMask\""),
+            "应返回掩码字段: {}",
+            body
+        );
+    }
+
+    #[test]
+    fn test_get_public_api_reflects_catalog_and_auth() {
+        let mut cfg = Config::default();
+        cfg.require_api_key = false;
+        cfg.port = 18080;
+        let service = AdminService::new(manager_with_config(cfg), Vec::<String>::new());
+        let resp = service.get_public_api();
+
+        assert!(!resp.server.require_api_key);
+        assert_eq!(resp.server.port, 18080);
+        assert!(
+            resp.server.suggested_base_url.is_none(),
+            "未配置 publicBaseUrl 时应为 null"
+        );
+
+        let total: usize = resp.families.iter().map(|f| f.endpoints.len()).sum();
+        assert_eq!(
+            total,
+            crate::public_api::catalog().len(),
+            "响应端点数应与 catalog 一致"
         );
     }
 }

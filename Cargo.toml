@@ -36,3 +36,6 @@ parking_lot = "0.12"  # 高性能同步原语
 subtle = "2.6"        # 常量时间比较（防止时序攻击）
 rust-embed = "8"      # 嵌入静态文件
 mime_guess = "2"      # MIME 类型推断
+
+[dev-dependencies]
+tower = { version = "0.5.2", features = ["util"] }  # 测试中用 oneshot 打真实 Router

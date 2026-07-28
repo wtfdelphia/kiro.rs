@@ -5,6 +5,8 @@ mod common;
 mod http_client;
 mod kiro;
 mod model;
+mod openai;
+mod public_api;
 pub mod token;
 
 use std::collections::HashMap;
@@ -167,6 +169,10 @@ async fn main() {
         config.require_api_key,
     );
 
+    // 合并 OpenAI 兼容路由（复用同一 app_state）
+    // 注意：merge 不传播 layer，auth/cors/body-limit 由 create_openai_routes 自带
+    let anthropic_app = anthropic_app.merge(openai::create_openai_routes(app_state.clone()));
+
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
     // 安全检查：空字符串被视为未配置，防止空 key 绕过认证
     let admin_key_valid = config
@@ -211,11 +217,13 @@ async fn main() {
         tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2).max(1)]);
     }
     tracing::info!("requireApiKey: {}", config.require_api_key);
+    // 对外 API 清单来自 public_api catalog（单一事实源），勿在此手写第二份
     tracing::info!("可用 API:");
-    tracing::info!("  GET  /v1/models");
-    tracing::info!("  POST /v1/messages");
-    tracing::info!("  POST /v1/messages/count_tokens");
+    for endpoint in public_api::live_endpoints() {
+        tracing::info!("  {:<4} {}", endpoint.method, endpoint.path);
+    }
     if admin_key_valid {
+        // Admin API 不属于 Public Client API，catalog 不覆盖，此处保持手写
         tracing::info!("Admin API:");
         tracing::info!("  GET  /api/admin/credentials");
         tracing::info!("  POST /api/admin/credentials/:index/disabled");

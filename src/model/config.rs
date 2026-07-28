@@ -117,6 +117,13 @@ pub struct Config {
     #[serde(default)]
     pub model_resolution: ModelResolutionConfig,
 
+    /// 是否启用 web_search 代执行（仅 `/v1/responses` 端点，默认 true）
+    ///
+    /// 该端点的 web_search 工具判定较宽（含 `web_search_20250305` 等形状），
+    /// 关闭后此类工具走正常 tools 路径交给模型自行决定。
+    #[serde(default = "default_web_search_emulation")]
+    pub web_search_emulation: bool,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -204,6 +211,10 @@ fn default_extract_thinking() -> bool {
     true
 }
 
+fn default_web_search_emulation() -> bool {
+    true
+}
+
 fn default_require_api_key() -> bool {
     true
 }
@@ -239,6 +250,7 @@ impl Default for Config {
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             model_resolution: ModelResolutionConfig::default(),
+            web_search_emulation: default_web_search_emulation(),
             config_path: None,
         }
     }

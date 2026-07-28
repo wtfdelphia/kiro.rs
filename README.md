@@ -32,7 +32,8 @@
 ## 功能特性
 
 - **Anthropic API 兼容**: 完整支持 Anthropic Claude API 格式
-- **流式响应**: 支持 SSE (Server-Sent Events) 流式输出
+- **OpenAI API 兼容**: `/v1/chat/completions` 与 `/v1/responses`（无状态），可直接对接 OpenAI SDK
+- **流式响应**: 支持 SSE (Server-Sent Events) 流式输出；Responses 端点为命名语义事件
 - **Token 自动刷新**: 自动管理和刷新 OAuth Token
 - **多凭据支持**: 支持配置多个凭据，按优先级自动故障转移
 - **负载均衡**: 支持 `priority`（按优先级）和 `balanced`（均衡分配）两种模式
@@ -40,9 +41,10 @@
 - **凭据回写**: 多凭据格式下自动回写刷新后的 Token
 - **Thinking 模式**: 支持 Claude 的 extended thinking 功能
 - **工具调用**: 完整支持 function calling / tool use
-- **WebSearch**: 内置 WebSearch 工具转换逻辑
+- **WebSearch**: 内置 WebSearch 代执行（Anthropic 端点按 `stream` 返回 SSE 或 JSON；Responses 端点判定更宽且可开关）
+- **端点注册表**: 对外端点由单一事实源登记，单测强制 `live` 可路由 / `planned` 必 404，防止清单漂移
 - **多模型支持**: 支持 Sonnet、Opus、Haiku 系列模型
-- **Admin 管理**: 可选的 Web 管理界面和 API，支持凭据管理、余额查询等
+- **Admin 管理**: 可选的 Web 管理界面和 API，支持凭据管理、余额查询、运行时设置热更新、对外端点目录等
 - **多级 Region 配置**: 支持全局和凭据级别的 Auth Region / API Region 配置
 - **凭据级代理**: 支持为每个凭据单独配置 HTTP/SOCKS5 代理，优先级：凭据代理 > 全局代理 > 无代理
 
@@ -65,6 +67,9 @@
 - [API 端点](#api-端点)
   - [标准端点 (/v1)](#标准端点-v1)
   - [Claude Code 兼容端点 (/cc/v1)](#claude-code-兼容端点-ccv1)
+  - [OpenAI 兼容端点](#openai-兼容端点)
+  - [WebSearch 工具](#websearch-工具)
+  - [端点清单的单一事实源](#端点清单的单一事实源)
   - [Thinking 模式](#thinking-模式)
   - [工具调用](#工具调用)
 - [模型映射](#模型映射)
@@ -170,6 +175,7 @@ curl http://127.0.0.1:8990/v1/messages \
 | GET/PUT | `/api/admin/settings/auth` | 客户端 `requireApiKey` / `apiKey`（mask 读；热更新） |
 | GET | `/api/admin/models/catalog` | 全局模型 catalog 摘要 |
 | GET | `/api/admin/public-api` | 对外 API 端点目录（只读；Base URL / 鉴权 / status / curl 示例） |
+| GET/PUT | `/api/admin/settings/websearch` | web_search 代执行开关（默认开启；仅影响 `/v1/responses`） |
 | GET | `/api/admin/credentials/{id}/balance?force=true` | 强制刷新余额（跳过 TTL 缓存） |
 
 > `settings/endpoint` 指的是**本代理访问上游 Kiro** 的端点（当前 `ide`）；
@@ -316,6 +322,7 @@ docker compose up
 | `modelResolution.allowCatalogPassthrough` | bool | `true` | 允许命中 Kiro catalog 的上游模型 ID（如 `gpt-5.6-sol`）透传 |
 | `modelResolution.exposeCompatAliasesInModels` | bool | `false` | 是否在公开 `/v1/models` 额外暴露 `auto` / `gpt-4o` / `gpt-4` 等兼容别名 |
 | `modelResolution.compatAliases` | object | `{}` | 自定义兼容别名，key 为客户端 model，value 为上游 model |
+| `webSearchEmulation` | bool | `true` | `/v1/responses` 的 web 搜索代执行开关。关闭后该端点的 `web_search` 工具走普通工具路径，不代替客户端执行搜索；不影响 Anthropic 端点。可在 Admin「运行时设置」热更新 |
 
 完整配置示例：
 
@@ -524,10 +531,54 @@ RUST_LOG=debug ./target/release/kiro-rs
 | `/cc/v1/messages` | POST | 创建消息（缓冲模式，确保 `input_tokens` 准确） |
 | `/cc/v1/messages/count_tokens` | POST | 估算 Token 数量（与 `/v1` 相同） |
 
+### OpenAI 兼容端点
+
+| 端点 | 方法 | 描述 |
+|------|------|------|
+| `/v1/chat/completions` | POST | OpenAI Chat Completions（流式 + 非流式，含 function tools） |
+| `/v1/responses` | POST | OpenAI Responses（语义事件流 + 非流式，无状态；支持 web_search 代执行） |
+
+接入注意：
+
+- `OPENAI_BASE_URL` 需带 `/v1` 后缀（`ANTHROPIC_BASE_URL` 不带），这是最高频的配置错误
+- 响应回显的 `model` 为客户端请求的原始名（如 `gpt-4o`），不是实际执行的 Claude 模型
+- 流式 `usage` 需客户端传 `stream_options: {"include_usage": true}` 才在末尾返回
+- `temperature` / `top_p` / `tool_choice` 接受但不透传（Kiro 上游无对应字段）
+- 图片仅支持 base64 data URL；远程 http(s) 图片 URL 会被跳过
+- 不支持服务端 `web_search` 工具；名为 `web_search` 的普通 function tool 走正常工具路径
+- 未实现 `logprobs`、`n>1`、`seed`、`stop`、`logit_bias`
+
+`/v1/responses` 额外注意：
+
+- **无状态**：携带 `previous_response_id` 返回 400，请在 `input` 中带上完整对话；`store` 被忽略
+- SSE 为命名语义事件（`event: response.*`），与 `/v1/chat/completions` 的纯 `data:` 行不同
+- `input` 支持字符串 / item 数组 / 单个 item 对象三种形状
+- 声明**单个** web_search 工具时由本代理执行搜索并返回 `web_search_call` + `message` 输出；
+  可在 Admin 运行时设置中关闭（关闭后该工具走正常工具路径）
+- 该端点的 web_search 判定比 `/v1/messages` 宽（含 `web_search_20250305` 等形状），
+  两端点行为差异是有意选择
+- 未实现 `GET /v1/responses/{id}`、`include`、`truncation`、`parallel_tool_calls`
+
 > **`/cc/v1/messages` 与 `/v1/messages` 的区别**：
 > - `/v1/messages`：实时流式返回，`message_start` 中的 `input_tokens` 是估算值
 > - `/cc/v1/messages`：缓冲模式，等待上游流完成后，用从 `contextUsageEvent` 计算的准确 `input_tokens` 更正 `message_start`，然后一次性返回所有事件
 > - 等待期间会每 25 秒发送 `ping` 事件保活
+
+### WebSearch 工具
+
+`/v1/messages` 与 `/cc/v1/messages` 在请求**恰好声明一个** `web_search` 工具时，
+由本代理通过 Kiro MCP 执行搜索并直接构造响应（不走模型生成）。
+响应形态跟随请求的 `stream` 字段：
+
+- `stream: true` → SSE 事件流
+- `stream: false`（或缺省）→ 标准 message JSON 对象
+
+两种模式的内容块一致：`text`（搜索说明）、`server_tool_use`、
+`web_search_tool_result`、`text`（结果摘要），`usage` 中带
+`server_tool_use.web_search_requests`。
+
+混合工具（web_search 与其它工具同时声明）不触发代执行，按普通工具转发上游。
+`/v1/responses` 的 web_search 判定更宽且可开关，见上文 OpenAI 兼容端点。
 
 ### 端点清单的单一事实源
 
@@ -535,8 +586,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 Admin `GET /api/admin/public-api` 均由它派生，避免多处手写清单互相漂移。
 单测强制 `status=live` 的端点必须能被真实路由命中，`status=planned` 的必须命中不到（404）。
 
-已登记但尚未实现（`planned`，当前请求返回 404）：`POST /v1/chat/completions`、
-`POST /v1/responses`、`GET /v1/responses/{id}`。
+已登记但尚未实现（`planned`，当前请求返回 404）：`GET /v1/responses/{id}`。
 
 ### Thinking 模式
 
@@ -598,29 +648,54 @@ Sonnet 5 的 thinking 行为与已知限制见 [docs/claude-sonnet-5.md](docs/cl
 
 当 `config.json` 配置了非空 `adminApiKey` 时，会启用：
 
-- **Admin API（认证同 API Key）**
+Admin API 使用**独立的** `adminApiKey` 认证（不是客户端 `apiKey`），全部接口都在鉴权中间件之内，未携带有效 key 一律 401。
+
+- **凭据管理**
   - `GET /api/admin/credentials` - 获取所有凭据状态
   - `POST /api/admin/credentials` - 添加新凭据
   - `DELETE /api/admin/credentials/:id` - 删除凭据
+  - `POST /api/admin/credentials/import` - 导入单个凭据
+  - `POST /api/admin/credentials/import/batch` - 批量导入凭据
   - `POST /api/admin/credentials/:id/disabled` - 设置凭据禁用状态
   - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
   - `POST /api/admin/credentials/:id/reset` - 重置失败计数
-  - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
+  - `GET /api/admin/credentials/:id/balance` - 获取凭据余额（`?force=true` 跳过 TTL 缓存）
   - `POST /api/admin/credentials/:id/refresh` - 强制刷新 Token
+
+- **模型目录**
   - `POST /api/admin/credentials/models/refresh` - 刷新全部启用凭据的模型目录
   - `POST /api/admin/credentials/:id/models/refresh` - 刷新单凭据模型目录
   - `GET /api/admin/credentials/:id/models` - 查看凭据模型缓存（`?live=true` 时先刷新）
   - `POST /api/admin/credentials/:id/test` - 对凭据做最小真实推理探测（可选 body model，默认 claude-sonnet-4.6）
+  - `GET /api/admin/models/catalog` - 全局模型 catalog 摘要
+
+- **在线认证**
+  - `POST /api/admin/auth/builderid/start` / `poll` - Builder ID 设备码流程
+  - `POST /api/admin/auth/iam-sso/start` / `complete` - IAM Identity Center (SSO) 流程
+  - `POST /api/admin/auth/sso-token` - 直接导入 SSO Token
+
+- **运行时设置（均为热更新 + 落盘，详见[运行时设置（Admin）](#运行时设置admin)）**
+  - `GET/PUT /api/admin/settings/proxy` - 全局出站代理（不回传明文密码）
+  - `GET/PUT /api/admin/settings/endpoint` - 默认 Kiro **上游**端点
+  - `GET/PUT /api/admin/settings/auth` - 客户端 `requireApiKey` / `apiKey`（读取为掩码）
+  - `GET/PUT /api/admin/settings/websearch` - web_search 代执行开关（默认开启，仅影响 `/v1/responses`）
+  - `GET/PUT /api/admin/settings/client-identity` - Kiro / System / Node 版本标识
+  - `GET/PUT /api/admin/config/load-balancing` - 负载均衡模式
+
+- **对外端点目录**
+  - `GET /api/admin/public-api` - 只读的对外 API 端点清单（Base URL、鉴权方式、status、curl 示例）。永不回传完整客户端 key，只给掩码
 
 - **Admin UI**
   - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）
-  - 页面入口：列表区「刷新全部模型」；凭据卡片「查看模型 / 刷新模型 / 测试」（对接 models refresh / models list / credential test API）
+  - 顶栏入口：「运行时设置」（代理 / 上游端点 / 客户端鉴权 / websearch 开关 / 客户端标识）、「对外 API 端点」（分组端点卡 + 客户端配方 + 一键复制）
+  - 列表区「刷新全部模型」；凭据卡片「查看模型 / 刷新模型 / 测试」
 
 ## 注意事项
 
 1. **凭证安全**: 请妥善保管 `credentials.json` 文件，不要提交到版本控制
 2. **Token 刷新**: 服务会自动刷新过期的 Token，无需手动干预
-3. **WebSearch 工具**: 当 `tools` 列表仅包含一个 `web_search` 工具时，会走内置 WebSearch 转换逻辑
+3. **WebSearch 工具**: 当 `tools` 列表仅包含一个 `web_search` 工具时，由本代理代执行搜索并直接构造响应（不走模型生成）。混合工具不触发。Anthropic 端点的响应形态跟随请求的 `stream` 字段；`/v1/responses` 的判定更宽且可在 Admin 关闭
+4. **Admin 密钥独立**: Admin API 用 `adminApiKey` 认证，与客户端 `apiKey` 是两把不同的钥匙
 
 
 ## SpecCoding / OpenSpec 工作流
@@ -632,6 +707,7 @@ Sonnet 5 的 thinking 行为与已知限制见 [docs/claude-sonnet-5.md](docs/cl
 - [spec/](spec/)：长期需求、设计、目录归属事实
 - [openspec/changes/<change-name>/](openspec/changes/)：单次变更 proposal / design / tasks / specs / evidence
 - [docs/tooling-sources.md](docs/tooling-sources.md)：OpenSpec、CodeGraph、rg、Node、Rust、pnpm 等工具来源与核验版本
+- [docs/multi-protocol-api-design.md](docs/multi-protocol-api-design.md)：多协议对外 API 的设计定稿（OpenAI 兼容层的决策记录与分期落地）
 - [docs/AI 辅助开发工程化落地白皮书.md](docs/AI%20辅助开发工程化落地白皮书.md)：本次工程化落地参考
 
 推荐闭环：
@@ -667,7 +743,22 @@ kiro-rs/
 │   │   ├── types.rs            # 类型定义
 │   │   ├── converter.rs        # 协议转换器
 │   │   ├── stream.rs           # 流式响应处理
-│   │   └── websearch.rs        # WebSearch 工具处理
+│   │   └── websearch.rs        # WebSearch 工具处理（按 stream 返回 SSE 或 JSON）
+│   ├── openai/                 # OpenAI API 兼容层
+│   │   ├── mod.rs              # 路由与鉴权/CORS/体积上限 layer
+│   │   ├── types.rs            # Chat Completions 类型（工具定义双形状）
+│   │   ├── converter.rs        # 映射到内部 Anthropic 形状后复用既有转换核
+│   │   ├── handlers.rs         # 请求处理器（prepare 前置为两端点共用）
+│   │   ├── stream.rs           # Chat Completions chunk 流
+│   │   ├── responses.rs        # Responses 入参归一（含无状态校验）
+│   │   ├── responses_types.rs  # Responses 类型
+│   │   ├── responses_stream.rs # Responses 命名语义事件流
+│   │   ├── websearch.rs        # Responses 端点的 web_search 代执行
+│   │   └── error.rs            # OpenAI 错误方言
+│   ├── public_api/             # 对外端点注册表
+│   │   ├── catalog.rs          # canonical 端点清单（单一事实源）
+│   │   ├── dto.rs              # Admin 只读视图 DTO（密钥仅掩码）
+│   │   └── routes_test.rs      # 双向防漂移断言（live 可路由 / planned 必 404）
 │   ├── kiro/                   # Kiro API 客户端
 │   │   ├── provider.rs         # API 提供者
 │   │   ├── token_manager.rs    # Token 管理

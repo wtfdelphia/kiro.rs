@@ -14,6 +14,17 @@
 | ECC | https://github.com/affaan-m/ECC | 仅参考，不安装 | rules / skills 结构借鉴 | 用户级配置、密钥 |
 | Karpathy skills | https://github.com/multica-ai/andrej-karpathy-skills | 仅参考 | 行为纪律项目化 | 未裁剪外部配置 |
 
+## Cargo 依赖登记（非 CLI）
+
+仅记录在既有依赖之外新引入的 crate。运行时依赖见 `Cargo.toml`。
+
+| crate | 类型 | 版本 | 用途 | 引入变更 |
+| --- | --- | --- | --- | --- |
+| tower | dev-dependency | 0.5.2（features: util） | 单测中用 `ServiceExt::oneshot` 对真实 Axum Router 发请求，支撑 `live ⊆ routes` 防漂移断言与 auth / body-limit 矩阵 | `public-api-catalog-admin-display` |
+
+`tower` 已是 axum 的传递依赖（`Cargo.lock` 中原本存在），此处只是显式声明为
+dev-dependency 以便测试直接引用；不增加运行时依赖，不进入发布产物。
+
 ## 安装核验命令（示例）
 
 ```bash

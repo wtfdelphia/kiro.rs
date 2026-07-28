@@ -5,6 +5,8 @@ kiro-rs/
 ├── src/                    # Rust 服务端源码
 │   ├── main.rs
 │   ├── anthropic/          # Anthropic API 兼容
+│   ├── openai/             # OpenAI 兼容（Chat Completions / Responses）
+│   ├── public_api/         # 对外端点注册表（单一事实源 + 防漂移断言）
 │   ├── kiro/               # Kiro 上游与解析
 │   ├── admin/              # Admin API
 │   ├── admin_ui/           # 嵌入 UI 路由

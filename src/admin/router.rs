@@ -10,11 +10,13 @@ use super::{
         add_credential, complete_iam_sso, delete_credential, force_refresh_token,
         get_all_credentials, get_auth_settings, get_client_identity_settings,
         get_credential_balance, get_credential_models, get_endpoint_settings,
-        get_global_models_catalog, get_load_balancing_mode, get_proxy_settings, import_credential,
+        get_global_models_catalog, get_load_balancing_mode, get_proxy_settings, get_public_api,
+        import_credential,
         import_credentials_batch, import_sso_token, poll_builder_id, refresh_all_models,
         refresh_credential_models, reset_failure_count, set_credential_disabled,
         set_credential_priority, set_load_balancing_mode, start_builder_id, start_iam_sso,
         test_credential, update_auth_settings, update_client_identity_settings,
+        get_websearch_settings, update_websearch_settings,
         update_endpoint_settings, update_proxy_settings,
     },
     middleware::{AdminState, admin_auth_middleware},
@@ -44,6 +46,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/models", get(get_credential_models))
         .route("/credentials/{id}/test", post(test_credential))
         .route("/models/catalog", get(get_global_models_catalog))
+        // 对外 Public API 目录（只读）；勿与 /settings/endpoint（上游 Kiro 端点）混淆
+        .route("/public-api", get(get_public_api))
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),
@@ -64,6 +68,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/settings/auth",
             get(get_auth_settings).put(update_auth_settings),
+        )
+        .route(
+            "/settings/websearch",
+            get(get_websearch_settings).put(update_websearch_settings),
         )
         .route(
             "/settings/client-identity",

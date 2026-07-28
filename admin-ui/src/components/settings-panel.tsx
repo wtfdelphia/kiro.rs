@@ -18,10 +18,12 @@ import {
   getClientIdentitySettings,
   getEndpointSettings,
   getProxySettings,
+  getWebSearchSettings,
   updateAuthSettings,
   updateClientIdentitySettings,
   updateEndpointSettings,
   updateProxySettings,
+  updateWebSearchSettings,
 } from '@/api/settings'
 import { extractErrorMessage } from '@/lib/utils'
 
@@ -48,6 +50,8 @@ export function SettingsPanel({ open, onOpenChange }: SettingsPanelProps) {
   const [newApiKey, setNewApiKey] = useState('')
   const [confirmDisableAuth, setConfirmDisableAuth] = useState(false)
 
+  const [webSearchEmulation, setWebSearchEmulation] = useState(true)
+
   const [kiroVersion, setKiroVersion] = useState('')
   const [systemVersion, setSystemVersion] = useState('')
   const [nodeVersion, setNodeVersion] = useState('')
@@ -55,11 +59,12 @@ export function SettingsPanel({ open, onOpenChange }: SettingsPanelProps) {
   const load = async () => {
     setLoading(true)
     try {
-      const [proxy, endpoint, auth, identity] = await Promise.all([
+      const [proxy, endpoint, auth, identity, websearch] = await Promise.all([
         getProxySettings(),
         getEndpointSettings(),
         getAuthSettings(),
         getClientIdentitySettings(),
+        getWebSearchSettings(),
       ])
       setProxyUrl(proxy.proxyUrl ?? '')
       setProxyUsername(proxy.proxyUsername ?? '')
@@ -75,6 +80,7 @@ export function SettingsPanel({ open, onOpenChange }: SettingsPanelProps) {
       setKiroVersion(identity.kiroVersion)
       setSystemVersion(identity.systemVersion)
       setNodeVersion(identity.nodeVersion)
+      setWebSearchEmulation(websearch.webSearchEmulation)
     } catch (e) {
       toast.error('加载设置失败: ' + extractErrorMessage(e))
     } finally {
@@ -108,6 +114,7 @@ export function SettingsPanel({ open, onOpenChange }: SettingsPanelProps) {
         systemVersion: systemVersion.trim(),
         nodeVersion: nodeVersion.trim(),
       })
+      await updateWebSearchSettings({ webSearchEmulation })
       toast.success('设置已保存并热更新')
       await load()
     } catch (e) {
@@ -233,6 +240,24 @@ export function SettingsPanel({ open, onOpenChange }: SettingsPanelProps) {
                 value={newApiKey}
                 onChange={(e) => setNewApiKey(e.target.value)}
               />
+            </section>
+
+            <section className="space-y-2">
+              <h3 className="text-sm font-medium">Web 搜索代执行</h3>
+              <div className="flex items-center justify-between rounded-md border p-3">
+                <div>
+                  <div className="text-sm">启用 web_search 代执行</div>
+                  <div className="text-xs text-muted-foreground">
+                    仅影响 <code className="font-mono">/v1/responses</code>：声明单个
+                    web_search 工具时由本代理执行搜索。关闭后该工具走正常工具路径，
+                    交给模型自行决定。
+                  </div>
+                </div>
+                <Switch
+                  checked={webSearchEmulation}
+                  onCheckedChange={setWebSearchEmulation}
+                />
+              </div>
             </section>
           </div>
         )}

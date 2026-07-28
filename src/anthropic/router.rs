@@ -17,7 +17,7 @@ use super::{
 };
 
 /// 请求体最大大小限制 (50MB)
-const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
+pub(crate) const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 
 /// 创建带有 KiroProvider 的 Anthropic API 路由
 pub fn create_router_with_provider(

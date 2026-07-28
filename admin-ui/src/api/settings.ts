@@ -6,6 +6,7 @@ import type {
   EndpointSettings,
   ProxySettings,
   SuccessSettingsResponse,
+  WebSearchSettings,
 } from '@/types/api'
 
 const api = axios.create({
@@ -72,5 +73,18 @@ export async function updateClientIdentitySettings(body: {
   nodeVersion?: string
 }): Promise<SuccessSettingsResponse> {
   const { data } = await api.put<SuccessSettingsResponse>('/settings/client-identity', body)
+  return data
+}
+
+
+export async function getWebSearchSettings(): Promise<WebSearchSettings> {
+  const { data } = await api.get<WebSearchSettings>('/settings/websearch')
+  return data
+}
+
+export async function updateWebSearchSettings(body: {
+  webSearchEmulation: boolean
+}): Promise<SuccessSettingsResponse> {
+  const { data } = await api.put<SuccessSettingsResponse>('/settings/websearch', body)
   return data
 }

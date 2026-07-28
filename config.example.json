@@ -10,6 +10,7 @@
   "kiroVersion": "0.11.107",
   "systemVersion": "win32#10.0.22631",
   "nodeVersion": "22.22.0",
+  "webSearchEmulation": true,
   "modelResolution": {
     "defaultChatModel": "claude-sonnet-4.6",
     "allowCatalogPassthrough": true,
