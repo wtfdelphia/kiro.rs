@@ -108,6 +108,27 @@ impl fmt::Display for RefreshTokenInvalidError {
 
 impl std::error::Error for RefreshTokenInvalidError {}
 
+/// 刷新是否走 AWS SSO OIDC 端点（而非 Kiro 自有 refreshToken 端点）
+///
+/// 这是 `refresh_token` 的分流条件。提取为独立函数供 profile ARN 解析共用：
+/// OIDC 端点的响应不含 profileArn，因此该类凭据不应为取 profileArn 而强制刷新
+/// （见 `crate::kiro::profile::decide_profile_action`）。
+///
+/// 如果未指定 auth_method，根据是否有 clientId/clientSecret 自动判断。
+pub(crate) fn refresh_routes_to_idc(credentials: &KiroCredentials) -> bool {
+    let auth_method = credentials.auth_method.as_deref().unwrap_or_else(|| {
+        if credentials.client_id.is_some() && credentials.client_secret.is_some() {
+            "idc"
+        } else {
+            "social"
+        }
+    });
+
+    auth_method.eq_ignore_ascii_case("idc")
+        || auth_method.eq_ignore_ascii_case("builder-id")
+        || auth_method.eq_ignore_ascii_case("iam")
+}
+
 /// 刷新 Token
 pub(crate) async fn refresh_token(
     credentials: &KiroCredentials,
@@ -124,19 +145,7 @@ pub(crate) async fn refresh_token(
     validate_refresh_token(credentials)?;
 
     // 根据 auth_method 选择刷新方式
-    // 如果未指定 auth_method，根据是否有 clientId/clientSecret 自动判断
-    let auth_method = credentials.auth_method.as_deref().unwrap_or_else(|| {
-        if credentials.client_id.is_some() && credentials.client_secret.is_some() {
-            "idc"
-        } else {
-            "social"
-        }
-    });
-
-    if auth_method.eq_ignore_ascii_case("idc")
-        || auth_method.eq_ignore_ascii_case("builder-id")
-        || auth_method.eq_ignore_ascii_case("iam")
-    {
+    if refresh_routes_to_idc(credentials) {
         refresh_idc_token(credentials, config, proxy).await
     } else {
         refresh_social_token(credentials, config, proxy).await

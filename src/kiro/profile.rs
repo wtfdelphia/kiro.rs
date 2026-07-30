@@ -118,6 +118,64 @@ pub fn trusted_profile_arn(credentials: &KiroCredentials) -> Option<&str> {
         .filter(|s| !is_known_placeholder_profile_arn(s))
 }
 
+/// Outcome of the ListAvailableProfiles stage, decoupled from HTTP details.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ListOutcome {
+    /// Trusted (non-placeholder) ARN obtained.
+    Resolved(String),
+    /// Upstream returned a known placeholder ARN.
+    Placeholder,
+    /// Upstream returned an empty profile list.
+    Empty,
+    /// Request failed.
+    Failed,
+}
+
+/// What the caller should do after the list stage. Keeps the decision testable offline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolveAction {
+    /// Use and persist this ARN.
+    Use(String),
+    /// Credential type does not support profile ARN.
+    Unsupported,
+    /// Proceed without profileArn.
+    SoftUnavailable,
+    /// Force refresh may yield an ARN (Kiro-owned refresh endpoint).
+    ForceRefresh,
+    /// No path left; bail with list context.
+    Fail,
+}
+
+/// Decide what to do given a credential and the list stage outcome.
+///
+/// Pure: no I/O, no token manager. Cache hits and unsupported credential types are
+/// short-circuited before this point by `resolve_profile_arn`.
+///
+/// A refresh MUST NOT be issued when it cannot possibly return a profileArn: AWS SSO
+/// OIDC (`refresh_routes_to_idc`) is a plain OAuth2 token endpoint whose response carries
+/// no profileArn, so refreshing for that purpose is a guaranteed-useless round trip on
+/// every request. Only the Kiro-owned refresh endpoint may return one.
+fn decide_profile_action(credentials: &KiroCredentials, list: ListOutcome) -> ResolveAction {
+    if credentials.is_api_key_credential() {
+        return ResolveAction::Unsupported;
+    }
+
+    if let ListOutcome::Resolved(arn) = list {
+        return ResolveAction::Use(arn);
+    }
+
+    // Refresh cannot produce an ARN for these; proceed without one instead.
+    if crate::kiro::token_manager::refresh_routes_to_idc(credentials) {
+        return ResolveAction::SoftUnavailable;
+    }
+
+    if credentials.refresh_token.is_some() {
+        return ResolveAction::ForceRefresh;
+    }
+
+    ResolveAction::Fail
+}
+
 /// Soft miss: proceed without profileArn (common for BuilderId after list failure).
 #[derive(Debug)]
 pub struct ProfileArnUnavailable;
@@ -169,58 +227,59 @@ pub async fn resolve_profile_arn(
     let config = token_manager.config();
     let proxy = credentials.effective_proxy(token_manager.global_proxy().as_ref());
 
-    let list_err = match list_available_profiles_with_retry(credentials, &config, token, proxy.as_ref()).await {
-        Ok(arn) if !arn.is_empty() && !is_known_placeholder_profile_arn(&arn) => {
-            let _ = token_manager.set_profile_arn(credential_id, Some(arn.clone()), provider.clone());
-            return Ok(arn);
-        }
-        Ok(arn) if !arn.is_empty() => {
-            // Upstream somehow returned a known placeholder — do not trust/persist.
-            Some(anyhow!("list returned placeholder profileArn"))
-        }
-        Ok(_) => Some(anyhow!("empty profile list")),
-        Err(e) => Some(e),
-    };
+    let (list, list_err) =
+        match list_available_profiles_with_retry(credentials, &config, token, proxy.as_ref()).await {
+            Ok(arn) if !arn.is_empty() && !is_known_placeholder_profile_arn(&arn) => {
+                (ListOutcome::Resolved(arn), None)
+            }
+            Ok(arn) if !arn.is_empty() => {
+                // Upstream somehow returned a known placeholder — do not trust/persist.
+                (
+                    ListOutcome::Placeholder,
+                    Some(anyhow!("list returned placeholder profileArn")),
+                )
+            }
+            Ok(_) => (ListOutcome::Empty, Some(anyhow!("empty profile list"))),
+            Err(e) => (ListOutcome::Failed, Some(e)),
+        };
 
-    // Fallback: force refresh may return profileArn
-    if credentials.refresh_token.is_some() {
-        match token_manager.force_refresh_token_for(credential_id).await {
-            Ok(()) => {
-                if let Some(arn) = token_manager.profile_arn_of(credential_id) {
-                    if !is_known_placeholder_profile_arn(&arn) {
-                        return Ok(arn);
+    match decide_profile_action(credentials, list) {
+        ResolveAction::Use(arn) => {
+            let _ = token_manager.set_profile_arn(credential_id, Some(arn.clone()), provider);
+            Ok(arn)
+        }
+        ResolveAction::Unsupported => Err(anyhow!(ProfileArnUnsupported)),
+        ResolveAction::SoftUnavailable => Err(anyhow!(ProfileArnUnavailable)),
+        ResolveAction::ForceRefresh => {
+            match token_manager.force_refresh_token_for(credential_id).await {
+                Ok(()) => {
+                    if let Some(arn) = token_manager.profile_arn_of(credential_id) {
+                        if !is_known_placeholder_profile_arn(&arn) {
+                            return Ok(arn);
+                        }
+                        let _ = token_manager.clear_profile_arn(credential_id);
                     }
-                    let _ = token_manager.clear_profile_arn(credential_id);
+                    // refresh succeeded but no trusted profileArn — proceed without
+                    Err(anyhow!(ProfileArnUnavailable))
                 }
-                // refresh succeeded but no trusted profileArn — proceed without
-                return Err(anyhow!(ProfileArnUnavailable));
-            }
-            Err(refresh_err) => {
-                if let Some(le) = list_err {
-                    bail!("no available Kiro profile (list: {}; refresh: {})", le, refresh_err);
+                Err(refresh_err) => {
+                    if let Some(le) = list_err {
+                        bail!("no available Kiro profile (list: {}; refresh: {})", le, refresh_err);
+                    }
+                    bail!("no available Kiro profile (refresh: {})", refresh_err);
                 }
-                bail!("no available Kiro profile (refresh: {})", refresh_err);
             }
         }
+        ResolveAction::Fail => {
+            if let Some(le) = list_err {
+                bail!(
+                    "no available Kiro profile (list: {}; no refreshToken to fall back on)",
+                    le
+                );
+            }
+            bail!("no available Kiro profile")
+        }
     }
-
-    // List failed / empty: for IdC/BuilderId-style accounts, generate often works without ARN.
-    if looks_like_idc(credentials)
-        || provider
-            .as_deref()
-            .map(|p| eq_ci(p, "BuilderId"))
-            .unwrap_or(false)
-    {
-        return Err(anyhow!(ProfileArnUnavailable));
-    }
-
-    if let Some(le) = list_err {
-        bail!(
-            "no available Kiro profile (list: {}; refresh succeeded but returned no profileArn)",
-            le
-        );
-    }
-    bail!("no available Kiro profile")
 }
 
 async fn list_available_profiles_with_retry(
@@ -476,6 +535,121 @@ mod tests {
         c.client_secret = Some("s".to_string());
         assert_eq!(infer_provider(&c).as_deref(), Some("BuilderId"));
         assert_eq!(get_fixed_profile_arn("BuilderId"), Some(BUILDER_ID_PROFILE_ARN));
+    }
+
+    /// IdC credential: authMethod=idc with clientId/clientSecret.
+    fn idc_cred() -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.auth_method = Some("idc".to_string());
+        c.client_id = Some("cid".to_string());
+        c.client_secret = Some("sec".to_string());
+        c.refresh_token = Some("rt".to_string());
+        c
+    }
+
+    /// Social credential: refresh goes to the Kiro-owned endpoint.
+    fn social_cred() -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.auth_method = Some("social".to_string());
+        c.refresh_token = Some("rt".to_string());
+        c
+    }
+
+    const MISSED: [ListOutcome; 3] = [
+        ListOutcome::Failed,
+        ListOutcome::Empty,
+        ListOutcome::Placeholder,
+    ];
+
+    #[test]
+    fn test_decide_idc_never_force_refreshes() {
+        let c = idc_cred();
+        for list in MISSED {
+            assert_eq!(
+                decide_profile_action(&c, list.clone()),
+                ResolveAction::SoftUnavailable,
+                "IdC must proceed without ARN, not force refresh (list: {:?})",
+                list
+            );
+        }
+    }
+
+    #[test]
+    fn test_decide_social_still_force_refreshes() {
+        let c = social_cred();
+        for list in MISSED {
+            assert_eq!(
+                decide_profile_action(&c, list.clone()),
+                ResolveAction::ForceRefresh,
+                "Social refresh may return an ARN; must not regress (list: {:?})",
+                list
+            );
+        }
+    }
+
+    /// Contradictory but importable: explicit provider=BuilderId with authMethod=social.
+    /// Refresh routes to the Kiro endpoint, so it must NOT be soft-released.
+    #[test]
+    fn test_decide_builder_provider_with_social_auth_force_refreshes() {
+        let mut c = social_cred();
+        c.provider = Some("BuilderId".to_string());
+        for list in MISSED {
+            assert_eq!(
+                decide_profile_action(&c, list.clone()),
+                ResolveAction::ForceRefresh,
+                "provider=BuilderId must not override actual refresh routing (list: {:?})",
+                list
+            );
+        }
+    }
+
+    /// Missing authMethod + clientId/clientSecret is inferred as idc, so refresh routes
+    /// to OIDC and must be soft-released too.
+    #[test]
+    fn test_decide_missing_auth_method_with_client_creds_is_soft() {
+        let mut c = idc_cred();
+        c.auth_method = None;
+        for list in MISSED {
+            assert_eq!(
+                decide_profile_action(&c, list.clone()),
+                ResolveAction::SoftUnavailable,
+                "inferred idc must be soft-released (list: {:?})",
+                list
+            );
+        }
+    }
+
+    #[test]
+    fn test_decide_resolved_arn_is_used() {
+        let arn = "arn:aws:codewhisperer:us-east-1:1:profile/REAL".to_string();
+        for c in [idc_cred(), social_cred()] {
+            assert_eq!(
+                decide_profile_action(&c, ListOutcome::Resolved(arn.clone())),
+                ResolveAction::Use(arn.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn test_decide_api_key_unsupported() {
+        let mut c = KiroCredentials::default();
+        c.kiro_api_key = Some("ksk_x".to_string());
+        c.auth_method = Some("api_key".to_string());
+        for list in MISSED {
+            assert_eq!(
+                decide_profile_action(&c, list),
+                ResolveAction::Unsupported
+            );
+        }
+    }
+
+    #[test]
+    fn test_decide_social_without_refresh_token_fails() {
+        let mut c = social_cred();
+        c.refresh_token = None;
+        for list in MISSED {
+            assert_eq!(decide_profile_action(&c, list), ResolveAction::Fail);
+        }
     }
 
     #[test]
