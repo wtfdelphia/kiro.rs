@@ -36,6 +36,7 @@ interface CredentialCardProps {
   onToggleSelect: () => void
   balance: BalanceResponse | null
   loadingBalance: boolean
+  onBalanceRefreshed?: (id: number, balance: BalanceResponse) => void
 }
 
 function formatLastUsed(lastUsedAt: string | null): string {
@@ -61,6 +62,7 @@ export function CredentialCard({
   onToggleSelect,
   balance,
   loadingBalance,
+  onBalanceRefreshed,
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
@@ -70,7 +72,6 @@ export function CredentialCard({
   const [testInitialModel, setTestInitialModel] = useState('')
   const [refreshingModels, setRefreshingModels] = useState(false)
   const [refreshingBalance, setRefreshingBalance] = useState(false)
-  const [localBalance, setLocalBalance] = useState<BalanceResponse | null>(null)
   const queryClient = useQueryClient()
 
   const setDisabled = useSetDisabled()
@@ -159,7 +160,8 @@ export function CredentialCard({
     setRefreshingBalance(true)
     try {
       const resp = await getCredentialBalance(credential.id, true)
-      setLocalBalance(resp)
+      // 结果回流父级共享数据源，卡片自身不留副本（否则会遮蔽后续批量查询结果）
+      onBalanceRefreshed?.(credential.id, resp)
       toast.success(
         `余额已刷新：剩余 ${resp.remaining}${resp.subscriptionTitle ? `（${resp.subscriptionTitle}）` : ''}`
       )
@@ -169,8 +171,6 @@ export function CredentialCard({
       setRefreshingBalance(false)
     }
   }
-
-  const displayBalance = localBalance ?? balance
 
   const handleDelete = () => {
     if (!credential.disabled) {
@@ -334,7 +334,7 @@ export function CredentialCard({
               <span className="font-medium">
                 {loadingBalance ? (
                   <Loader2 className="inline w-3 h-3 animate-spin" />
-                ) : displayBalance?.subscriptionTitle || '未知'}
+                ) : balance?.subscriptionTitle || '未知'}
               </span>
             </div>
             <div>
@@ -357,11 +357,11 @@ export function CredentialCard({
                 <span className="text-sm ml-1">
                   <Loader2 className="inline w-3 h-3 animate-spin" /> 加载中...
                 </span>
-              ) : displayBalance ? (
+              ) : balance ? (
                 <span className="font-medium ml-1">
-                  {displayBalance.remaining.toFixed(2)} / {displayBalance.usageLimit.toFixed(2)}
+                  {balance.remaining.toFixed(2)} / {balance.usageLimit.toFixed(2)}
                   <span className="text-xs text-muted-foreground ml-1">
-                    ({(100 - displayBalance.usagePercentage).toFixed(1)}% 剩余)
+                    ({(100 - balance.usagePercentage).toFixed(1)}% 剩余)
                   </span>
                 </span>
               ) : (
