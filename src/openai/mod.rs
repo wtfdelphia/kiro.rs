@@ -10,6 +10,7 @@ pub mod error;
 pub mod handlers;
 pub mod responses;
 pub mod responses_stream;
+pub mod responses_tools;
 pub mod responses_types;
 pub mod stream;
 pub mod types;

@@ -115,6 +115,29 @@ fn prepare(state: &AppState, req: &ChatCompletionRequest) -> Result<PreparedRequ
         conversation_state: conversion.conversation_state,
         profile_arn: None,
     };
+    // 到达上游的工具清单：工具透传是本服务最易静默失效的环节
+    // （客户端可能用 tools 字段、也可能藏在 input 的 additional_tools 里），
+    // 只打名字与数量，完整请求体仍走 debug。
+    let upstream_tools = &kiro_request
+        .conversation_state
+        .current_message
+        .user_input_message
+        .user_input_message_context
+        .tools;
+    if upstream_tools.is_empty() {
+        tracing::info!("上游工具清单为空（客户端未提供工具，或工具在转换中丢失）");
+    } else {
+        tracing::info!(
+            count = upstream_tools.len(),
+            names = %upstream_tools
+                .iter()
+                .map(|t| t.tool_specification.name.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            "工具已送达上游"
+        );
+    }
+
     let body = serde_json::to_string(&kiro_request)
         .map_err(|e| OpenAiError::Internal(format!("序列化请求失败: {}", e)))?;
     tracing::debug!("Kiro request body: {}", body);
@@ -725,7 +748,7 @@ mod tests {
     /// 走完 Responses 归一 + prepare，返回发往上游的请求体
     fn responses_prepared(body: &str) -> PreparedRequest {
         let req = responses_req(body);
-        let chat_json = super::super::responses::to_chat_request_json(&req).expect("归一失败");
+        let (chat_json, _) = super::super::responses::to_chat_request_json(&req).expect("归一失败");
         let chat: ChatCompletionRequest =
             serde_json::from_value(chat_json).expect("归一结果不可解析");
         prepare(&state(), &chat).expect("prepare 失败")
@@ -809,9 +832,172 @@ mod tests {
             serde_json::from_value(json!({"type":"text","text":"x"})).unwrap();
         assert_eq!(block.block_type, "text");
     }
+
+    // === 响应侧还原：build_tool_call_item ===
+
+    use super::super::responses_tools::ToolRewriteMap;
+
+    fn rewrite_with_freeform(name: &str) -> ToolRewriteMap {
+        let mut r = ToolRewriteMap::default();
+        r.freeform.insert(name.to_string());
+        r
+    }
+
+    #[test]
+    fn test_plain_tool_stays_function_call() {
+        let item = build_tool_call_item("c1", "wait", r#"{"cell_id":"x"}"#, &Default::default());
+        assert_eq!(item.item_type, "function_call");
+        assert_eq!(item.arguments.as_deref(), Some(r#"{"cell_id":"x"}"#));
+        assert!(item.input.is_none());
+        assert!(item.namespace.is_none());
+    }
+
+    #[test]
+    fn test_freeform_tool_becomes_custom_tool_call() {
+        let item = build_tool_call_item(
+            "c1",
+            "exec",
+            r#"{"input":"const x = 1;"}"#,
+            &rewrite_with_freeform("exec"),
+        );
+        assert_eq!(item.item_type, "custom_tool_call");
+        assert_eq!(item.input.as_deref(), Some("const x = 1;"));
+        assert!(
+            item.arguments.is_none(),
+            "custom_tool_call 不应带 arguments（客户端只读 input）"
+        );
+        assert_eq!(item.call_id.as_deref(), Some("c1"));
+        assert_eq!(item.name.as_deref(), Some("exec"));
+    }
+
+    #[test]
+    fn test_freeform_tool_raw_source_passthrough() {
+        // 模型照 description 要求直接回裸源码（非 JSON）
+        let raw = "await tools.exec_command({cmd: \"git status\"});";
+        let item = build_tool_call_item("c1", "exec", raw, &rewrite_with_freeform("exec"));
+        assert_eq!(item.input.as_deref(), Some(raw));
+    }
+
+    #[test]
+    fn test_freeform_input_preserves_newlines_and_quotes() {
+        let src = "const s = \"a\\nb\";\ntext(\"ok\");";
+        let args = serde_json::to_string(&json!({"input": src})).unwrap();
+        let item = build_tool_call_item("c1", "exec", &args, &rewrite_with_freeform("exec"));
+        assert_eq!(item.input.as_deref(), Some(src), "换行与引号须无损");
+    }
+
+    /// 锁定：freeform 集合的 key 是展平/原始名，超长工具名往返后仍能命中
+    ///
+    /// `tool_name_map` 在 `aggregate` 内已把上游的缩短名还原成原名，
+    /// 因此这里查到的必须是原名。若集合存缩短名则失配，
+    /// freeform 工具静默退化成 function_call，客户端拒绝执行。
+    #[test]
+    fn test_long_freeform_tool_name_roundtrip_still_custom_tool_call() {
+        let long_name = format!("exec_{}", "x".repeat(80));
+
+        // 请求侧：归一层记入的是原名
+        let (_, rewrite) = super::super::responses_tools::normalize_tools(vec![json!({
+            "type":"custom","name":long_name.clone(),"description":"d",
+            "format":{"type":"grammar","syntax":"lark","definition":"start: X"}
+        })])
+        .expect("归一应成功");
+
+        // 响应侧：aggregate 已用 tool_name_map 把缩短名还原为原名
+        let item = build_tool_call_item("c1", &long_name, r#"{"input":"src"}"#, &rewrite);
+        assert_eq!(
+            item.item_type, "custom_tool_call",
+            "超长 freeform 工具名往返后仍须回 custom_tool_call"
+        );
+        assert_eq!(item.input.as_deref(), Some("src"));
+    }
+
+    #[test]
+    fn test_flattened_tool_restored_to_namespace_and_original_name() {
+        let (_, rewrite) = super::super::responses_tools::normalize_tools(vec![json!({
+            "type":"namespace","name":"collaboration",
+            "tools":[{"type":"function","name":"spawn_agent","parameters":{"type":"object"}}]
+        })])
+        .expect("归一应成功");
+
+        let item = build_tool_call_item("c1", "collaboration__spawn_agent", "{}", &rewrite);
+        assert_eq!(item.item_type, "function_call");
+        assert_eq!(item.name.as_deref(), Some("spawn_agent"), "须还原为原名");
+        assert_eq!(
+            item.namespace.as_deref(),
+            Some("collaboration"),
+            "须补 namespace（客户端按 (namespace, name) 匹配）"
+        );
+    }
+
+    /// 锁定：两级映射叠加 —— tool_name_map 还原 + 逆映射还原
+    ///
+    /// 超长展平名经 `tool_name_map` 缩短后回传，`aggregate` 还原为展平名，
+    /// 再经逆映射还原为 (namespace, 原名)。两级都漏则工具调用链断。
+    #[test]
+    fn test_two_level_mapping_long_flattened_name() {
+        let long_child = "c".repeat(80);
+        let flat = super::super::responses_tools::flatten_namespace_name("ns", &long_child);
+        assert!(flat.len() > 63, "展平名须超长以触发缩短");
+
+        let (_, rewrite) = super::super::responses_tools::normalize_tools(vec![json!({
+            "type":"namespace","name":"ns",
+            "tools":[{"type":"function","name":long_child.clone(),
+                      "parameters":{"type":"object"}}]
+        })])
+        .expect("归一应成功");
+
+        // 第一级由 tool_name_map 完成（既有机制），这里给出其产物：展平名
+        let item = build_tool_call_item("c1", &flat, "{}", &rewrite);
+        assert_eq!(item.name.as_deref(), Some(long_child.as_str()));
+        assert_eq!(item.namespace.as_deref(), Some("ns"));
+    }
+
+    #[test]
+    fn test_freeform_and_namespace_combined() {
+        // 展平自 namespace 的 custom 工具：两项还原同时生效
+        let mut rewrite = ToolRewriteMap::default();
+        rewrite.freeform.insert("ns__exec".to_string());
+        rewrite
+            .namespaces
+            .insert("ns__exec".to_string(), ("ns".to_string(), "exec".to_string()));
+
+        let item = build_tool_call_item("c1", "ns__exec", r#"{"input":"src"}"#, &rewrite);
+        assert_eq!(item.item_type, "custom_tool_call");
+        assert_eq!(item.input.as_deref(), Some("src"));
+        assert_eq!(item.name.as_deref(), Some("exec"));
+        assert_eq!(item.namespace.as_deref(), Some("ns"));
+    }
+
+    #[test]
+    fn test_custom_tool_call_item_serialization_shape() {
+        let item = build_tool_call_item(
+            "c1",
+            "exec",
+            r#"{"input":"x"}"#,
+            &rewrite_with_freeform("exec"),
+        );
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["type"], "custom_tool_call");
+        assert_eq!(v["input"], "x");
+        assert!(v.get("arguments").is_none(), "不应序列化 arguments");
+        assert!(v.get("namespace").is_none(), "无 namespace 时不应出现该字段");
+    }
 }
 
 // === Responses 端点 ===
+
+/// Responses 端点专属的响应侧状态
+///
+/// 与 `PreparedRequest` 分开：后者是 Chat 端点共享的前置产物，
+/// 不注入 Responses 概念（design D2/D3）。
+struct ResponsesContext {
+    /// 回显给客户端的模型名：请求原值（D9）
+    echo_model: String,
+    instructions: Option<String>,
+    metadata: Option<HashMap<String, String>>,
+    /// 客户端方言工具的还原映射（design D3）
+    tool_rewrite: super::responses_tools::ToolRewriteMap,
+}
 
 pub async fn post_responses(State(state): State<AppState>, body: Bytes) -> Response {
     let req: super::responses_types::ResponsesRequest = match serde_json::from_slice(&body) {
@@ -829,7 +1015,7 @@ pub async fn post_responses(State(state): State<AppState>, body: Bytes) -> Respo
 
     // 归一（含 previous_response_id 报错 —— D2）
     // 放在 provider 检查之前：请求本身不合法时应回 400，而非被 503 掩盖
-    let chat_json = match super::responses::to_chat_request_json(&req) {
+    let (chat_json, tool_rewrite) = match super::responses::to_chat_request_json(&req) {
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
@@ -877,11 +1063,17 @@ pub async fn post_responses(State(state): State<AppState>, body: Bytes) -> Respo
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
+    let ctx = ResponsesContext {
+        echo_model,
+        instructions,
+        metadata: req.metadata,
+        tool_rewrite,
+    };
+
     if req.stream {
-        handle_responses_stream(provider, prepared, echo_model, instructions, req.metadata).await
+        handle_responses_stream(provider, prepared, ctx).await
     } else {
-        handle_responses_non_stream(provider, prepared, echo_model, instructions, req.metadata)
-            .await
+        handle_responses_non_stream(provider, prepared, ctx).await
     }
 }
 
@@ -981,9 +1173,7 @@ fn estimate_chars(text: &str) -> i32 {
 async fn handle_responses_stream(
     provider: Arc<KiroProvider>,
     prepared: PreparedRequest,
-    echo_model: String,
-    instructions: Option<String>,
-    metadata: Option<HashMap<String, String>>,
+    rctx: ResponsesContext,
 ) -> Response {
     let response = match provider.call_api_stream(&prepared.body).await {
         Ok(r) => r,
@@ -992,12 +1182,13 @@ async fn handle_responses_stream(
 
     let ctx = ResponsesStreamContext::new(
         super::responses_types::response_id(),
-        echo_model,
-        instructions,
-        metadata,
+        rctx.echo_model,
+        rctx.instructions,
+        rctx.metadata,
         prepared.input_tokens,
         prepared.thinking_enabled,
         prepared.tool_name_map,
+        rctx.tool_rewrite,
     );
 
     let sse = create_responses_sse_stream(response, ctx);
@@ -1102,9 +1293,7 @@ fn create_responses_sse_stream(
 async fn handle_responses_non_stream(
     provider: Arc<KiroProvider>,
     prepared: PreparedRequest,
-    echo_model: String,
-    instructions: Option<String>,
-    metadata: Option<HashMap<String, String>>,
+    ctx: ResponsesContext,
 ) -> Response {
     use super::responses_types::{
         ResponseOutputItem, ResponsesObject, ResponsesUsage, output_item_id, response_id,
@@ -1140,11 +1329,11 @@ async fn handle_responses_non_stream(
         output.push(ResponseOutputItem::message(output_item_id("msg"), &text));
     }
     for call in &agg.tool_calls {
-        output.push(ResponseOutputItem::function_call(
-            output_item_id("fc"),
+        output.push(build_tool_call_item(
             &call.id,
             &call.function.name,
             &call.function.arguments,
+            &ctx.tool_rewrite,
         ));
     }
 
@@ -1161,15 +1350,61 @@ async fn handle_responses_non_stream(
         object: "response",
         created_at: chrono::Utc::now().timestamp(),
         status: "completed",
-        model: echo_model,
+        model: ctx.echo_model,
         output,
         usage: ResponsesUsage::new(input_tokens, output_tokens.max(1)),
-        instructions,
-        metadata,
+        instructions: ctx.instructions,
+        metadata: ctx.metadata,
         error: None,
     };
 
     (StatusCode::OK, Json(obj)).into_response()
+}
+
+/// 按还原映射产出工具调用 item
+///
+/// 两项还原都是**功能性必需**，不是格式偏好：
+/// - freeform 工具收到 `function_call` 会被客户端自身拒绝（客户端为其登记的
+///   payload 类型只接受裸文本 `input`），模型陷入重试
+/// - 展平自 namespace 的工具若不带 `namespace` 字段，客户端按
+///   `(namespace, name)` 查注册表会找不到工具
+///
+/// `name` 已由 `tool_name_map` 还原为展平名（见 design D3.1），直接用作 key。
+fn build_tool_call_item(
+    call_id: &str,
+    name: &str,
+    arguments: &str,
+    rewrite: &super::responses_tools::ToolRewriteMap,
+) -> super::responses_types::ResponseOutputItem {
+    use super::responses_types::{ResponseOutputItem, output_item_id};
+
+    let is_freeform = rewrite.freeform.contains(name);
+    let item = if is_freeform {
+        ResponseOutputItem::custom_tool_call(
+            output_item_id("ctc"),
+            call_id,
+            name,
+            super::responses_tools::extract_custom_input(arguments),
+        )
+    } else {
+        ResponseOutputItem::function_call(output_item_id("fc"), call_id, name, arguments)
+    };
+
+    let restored = match rewrite.namespaces.get(name) {
+        Some((namespace, original)) => item.with_namespace(namespace, original),
+        None => item,
+    };
+
+    // 分派结果直接决定客户端能否执行该调用：freeform 工具收到 function_call
+    // 会被客户端拒绝，展平工具缺 namespace 会匹配失败。
+    tracing::info!(
+        upstream_name = %name,
+        item_type = %restored.item_type,
+        namespace = restored.namespace.as_deref().unwrap_or("-"),
+        "工具调用已分派"
+    );
+
+    restored
 }
 
 fn estimate_completion_tokens(

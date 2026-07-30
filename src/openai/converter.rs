@@ -287,7 +287,18 @@ fn convert_tools(tools: Option<&[OpenAiTool]>) -> Option<Vec<Tool>> {
     }
     let converted: Vec<Tool> = tools
         .iter()
-        .filter(|t| !t.name.is_empty())
+        .filter(|t| {
+            if t.name.is_empty() {
+                // 无名工具（web_search / tool_search 序列化后不带 name）在此丢弃。
+                // 必须留痕：静默丢弃会让「模型说没有某能力」无从诊断。
+                tracing::warn!(
+                    tool_type = %t.tool_type,
+                    "工具定义缺少 name，已丢弃（上游要求具名 toolSpecification）"
+                );
+                return false;
+            }
+            true
+        })
         .map(|t| Tool {
             tool_type: None,
             name: t.name.clone(),
@@ -524,6 +535,29 @@ mod tests {
             tools[0].tool_type.is_none(),
             "不得被当成 Anthropic server-side web_search 工具"
         );
+    }
+
+    #[test]
+    fn test_unnamed_tool_dropped_others_kept() {
+        // web_search / tool_search 序列化后不带 name，会被丢弃（带 warn）
+        let req = convert(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "tools":[{"type":"web_search"},
+                         {"type":"function","name":"keep",
+                          "parameters":{"type":"object"}}]}"#,
+        );
+        let tools = req.tools.expect("其余工具应保留");
+        assert_eq!(tools.len(), 1, "无名工具被丢弃，具名工具不受影响");
+        assert_eq!(tools[0].name, "keep");
+    }
+
+    #[test]
+    fn test_all_tools_unnamed_yields_none() {
+        let req = convert(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                "tools":[{"type":"web_search"}]}"#,
+        );
+        assert!(req.tools.is_none(), "全部被丢弃时不应留空数组");
     }
 
     #[test]

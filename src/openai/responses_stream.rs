@@ -62,6 +62,8 @@ pub struct ResponsesStreamContext {
     thinking_enabled: bool,
     /// 短名 -> 原始工具名（D8 第二项）
     tool_name_map: HashMap<String, String>,
+    /// 客户端方言工具的还原映射（design D3）
+    tool_rewrite: super::responses_tools::ToolRewriteMap,
 
     estimated_input_tokens: i32,
     context_input_tokens: Option<i32>,
@@ -99,6 +101,7 @@ impl ResponsesStreamContext {
         estimated_input_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
+        tool_rewrite: super::responses_tools::ToolRewriteMap,
     ) -> Self {
         Self {
             id,
@@ -108,6 +111,7 @@ impl ResponsesStreamContext {
             metadata,
             thinking_enabled,
             tool_name_map,
+            tool_rewrite,
             estimated_input_tokens,
             context_input_tokens: None,
             output_index: 0,
@@ -318,47 +322,90 @@ impl ResponsesStreamContext {
 
         let id = tool_use.tool_use_id.clone();
         if !self.tool_buffers.contains_key(&id) {
-            // 工具名还原（D8 第二项）
+            // 工具名还原（D8 第二项）。还原后的名字即 ToolRewriteMap 的 key（design D3.1）
             let name = self
                 .tool_name_map
                 .get(&tool_use.name)
                 .cloned()
                 .unwrap_or_else(|| tool_use.name.clone());
-            let item_id = output_item_id("fc");
+            let is_freeform = self.tool_rewrite.freeform.contains(&name);
+            tracing::info!(
+                upstream_name = %name,
+                item_type = if is_freeform { "custom_tool_call" } else { "function_call" },
+                namespace = self
+                    .tool_rewrite
+                    .namespaces
+                    .get(&name)
+                    .map(|(ns, _)| ns.as_str())
+                    .unwrap_or("-"),
+                "工具调用已分派（流式）"
+            );
+            let item_id = output_item_id(if is_freeform { "ctc" } else { "fc" });
             self.tool_buffers
                 .insert(id.clone(), (item_id.clone(), name.clone(), String::new()));
             self.tool_order.push(id.clone());
+
+            // freeform 工具的 item 形状：客户端只读 `input`，不读 `arguments`
+            let item = if is_freeform {
+                let (display_name, namespace) = self.restore_name(&name);
+                let mut item = json!({
+                    "id": item_id,
+                    "type": "custom_tool_call",
+                    "status": "in_progress",
+                    "call_id": id,
+                    "name": display_name,
+                    "input": "",
+                });
+                if let Some(ns) = namespace {
+                    item["namespace"] = json!(ns);
+                }
+                item
+            } else {
+                let (display_name, namespace) = self.restore_name(&name);
+                let mut item = json!({
+                    "id": item_id,
+                    "type": "function_call",
+                    "status": "in_progress",
+                    "call_id": id,
+                    "name": display_name,
+                    "arguments": "",
+                });
+                if let Some(ns) = namespace {
+                    item["namespace"] = json!(ns);
+                }
+                item
+            };
 
             out.push(ResponsesSseEvent::named(
                 "response.output_item.added",
                 json!({
                     "type": "response.output_item.added",
                     "output_index": self.output_index,
-                    "item": {
-                        "id": item_id,
-                        "type": "function_call",
-                        "status": "in_progress",
-                        "call_id": id,
-                        "name": name,
-                        "arguments": "",
-                    },
+                    "item": item,
                 }),
             ));
         }
 
         if !tool_use.input.is_empty() {
-            let (item_id, _, args) = self.tool_buffers.get_mut(&id).expect("刚插入必存在");
+            let (item_id, name, args) = self.tool_buffers.get_mut(&id).expect("刚插入必存在");
             args.push_str(&tool_use.input);
             let item_id = item_id.clone();
-            out.push(ResponsesSseEvent::named(
-                "response.function_call_arguments.delta",
-                json!({
-                    "type": "response.function_call_arguments.delta",
-                    "item_id": item_id,
-                    "output_index": self.output_index,
-                    "delta": tool_use.input,
-                }),
-            ));
+            let is_freeform = self.tool_rewrite.freeform.contains(name);
+
+            // freeform 工具：**吞掉增量不转发**。
+            // `custom_tool_call_input.delta` 的载荷是已提取的 `input`，
+            // 而提取要求参数 JSON 完整，因此只能缓冲到 stop 再一次性发出。
+            if !is_freeform {
+                out.push(ResponsesSseEvent::named(
+                    "response.function_call_arguments.delta",
+                    json!({
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": item_id,
+                        "output_index": self.output_index,
+                        "delta": tool_use.input,
+                    }),
+                ));
+            }
         }
 
         if tool_use.stop {
@@ -366,16 +413,87 @@ impl ResponsesStreamContext {
         }
     }
 
+    /// 展平名 -> (回给客户端的名字, namespace)
+    ///
+    /// 客户端按 `(namespace, name)` 查注册表，只回展平名会匹配失败。
+    fn restore_name(&self, name: &str) -> (String, Option<String>) {
+        match self.tool_rewrite.namespaces.get(name) {
+            Some((ns, original)) => (original.clone(), Some(ns.clone())),
+            None => (name.to_string(), None),
+        }
+    }
+
     fn close_tool_item(&mut self, id: &str, out: &mut Vec<ResponsesSseEvent>) {
         let Some((item_id, name, args)) = self.tool_buffers.remove(id) else {
             return;
         };
+
+        if self.tool_rewrite.freeform.contains(&name) {
+            self.close_freeform_tool_item(&item_id, id, &name, &args, out);
+            return;
+        }
+
         let arguments = if args.is_empty() {
             "{}".to_string()
         } else {
             args
         };
-        let item = ResponseOutputItem::function_call(item_id, id, name, arguments);
+        let (display_name, namespace) = self.restore_name(&name);
+        let mut item = ResponseOutputItem::function_call(item_id, id, display_name, arguments);
+        item.namespace = namespace;
+        out.push(ResponsesSseEvent::named(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": self.output_index,
+                "item": serde_json::to_value(&item).expect("item 序列化失败"),
+            }),
+        ));
+        self.finished_items.push(item);
+        self.output_index += 1;
+    }
+
+    /// freeform 工具收尾：先补发被吞掉的输入事件，再发 item.done
+    ///
+    /// 一个上游 stop 事件在此对应 3 个下游事件（input.delta + input.done + item.done），
+    /// 而先前的每个参数增量对应 0 个。
+    fn close_freeform_tool_item(
+        &mut self,
+        item_id: &str,
+        call_id: &str,
+        name: &str,
+        args: &str,
+        out: &mut Vec<ResponsesSseEvent>,
+    ) {
+        let input = super::responses_tools::extract_custom_input(args);
+
+        if !input.is_empty() {
+            out.push(ResponsesSseEvent::named(
+                "response.custom_tool_call_input.delta",
+                json!({
+                    "type": "response.custom_tool_call_input.delta",
+                    "item_id": item_id,
+                    "output_index": self.output_index,
+                    "call_id": call_id,
+                    "delta": input,
+                }),
+            ));
+        }
+        out.push(ResponsesSseEvent::named(
+            "response.custom_tool_call_input.done",
+            json!({
+                "type": "response.custom_tool_call_input.done",
+                "item_id": item_id,
+                "output_index": self.output_index,
+                "call_id": call_id,
+                "input": input,
+            }),
+        ));
+
+        let (display_name, namespace) = self.restore_name(name);
+        let mut item =
+            ResponseOutputItem::custom_tool_call(item_id, call_id, display_name, input);
+        item.namespace = namespace;
         out.push(ResponsesSseEvent::named(
             "response.output_item.done",
             json!({
@@ -515,6 +633,7 @@ mod tests {
             100,
             thinking,
             HashMap::new(),
+            Default::default(),
         )
     }
 
@@ -746,6 +865,7 @@ mod tests {
             10,
             false,
             map,
+            Default::default(),
         );
         let all = ctx.process_kiro_event(&tool_event("c1", "short_x", "", false));
         let p = payloads(&all);
@@ -866,6 +986,7 @@ mod tests {
             10,
             false,
             HashMap::new(),
+            Default::default(),
         );
         let mut all = ctx.process_kiro_event(&text_event("x"));
         all.extend(ctx.finish());
@@ -889,5 +1010,199 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    // === freeform 工具的流式还原 ===
+
+    fn freeform_ctx(name: &str) -> ResponsesStreamContext {
+        let mut rewrite = super::super::responses_tools::ToolRewriteMap::default();
+        rewrite.freeform.insert(name.to_string());
+        ResponsesStreamContext::new(
+            "resp_test".to_string(),
+            "gpt-4o".to_string(),
+            None,
+            None,
+            100,
+            false,
+            HashMap::new(),
+            rewrite,
+        )
+    }
+
+    /// 锁定：上游参数增量不得透传
+    ///
+    /// `custom_tool_call_input.delta` 的载荷是已提取的 `input`，
+    /// 逐条改名转发会让客户端收到语义错误的增量。
+    #[test]
+    fn test_freeform_upstream_arguments_delta_not_forwarded() {
+        let mut ctx = freeform_ctx("exec");
+        let mut all = ctx.process_kiro_event(&tool_event("c1", "exec", r#"{"input":"#, false));
+        all.extend(ctx.process_kiro_event(&tool_event("c1", "exec", r#""src"}"#, false)));
+
+        let n = names(&all);
+        assert!(
+            !n.iter().any(|e| e == "response.function_call_arguments.delta"),
+            "freeform 工具不得透传上游参数增量: {:?}",
+            n
+        );
+        assert!(
+            !n.iter().any(|e| e.contains("custom_tool_call_input")),
+            "参数未完成时不得发出 input 事件: {:?}",
+            n
+        );
+    }
+
+    #[test]
+    fn test_freeform_input_events_emitted_once_after_stop() {
+        let mut ctx = freeform_ctx("exec");
+        let mut all = ctx.process_kiro_event(&tool_event("c1", "exec", r#"{"input":"#, false));
+        all.extend(ctx.process_kiro_event(&tool_event("c1", "exec", r#""src"}"#, false)));
+        all.extend(ctx.process_kiro_event(&tool_event("c1", "exec", "", true)));
+
+        let n = names(&all);
+        let delta_count = n
+            .iter()
+            .filter(|e| *e == "response.custom_tool_call_input.delta")
+            .count();
+        assert_eq!(delta_count, 1, "input.delta 须只出现一次: {:?}", n);
+
+        // 序列：added -> input.delta -> input.done -> item.done
+        let tool_events: Vec<&String> = n
+            .iter()
+            .filter(|e| e.starts_with("response.output_item") || e.contains("custom_tool_call"))
+            .collect();
+        assert_eq!(
+            tool_events,
+            vec![
+                "response.output_item.added",
+                "response.custom_tool_call_input.delta",
+                "response.custom_tool_call_input.done",
+                "response.output_item.done",
+            ],
+            "事件序列不符: {:?}",
+            n
+        );
+    }
+
+    #[test]
+    fn test_freeform_item_shape_added_and_done() {
+        let mut ctx = freeform_ctx("exec");
+        let mut all = ctx.process_kiro_event(&tool_event("c1", "exec", r#"{"input":"x"}"#, false));
+        all.extend(ctx.process_kiro_event(&tool_event("c1", "exec", "", true)));
+        let p = payloads(&all);
+
+        let added = p
+            .iter()
+            .find(|e| e["type"] == "response.output_item.added")
+            .expect("须有 added");
+        assert_eq!(added["item"]["type"], "custom_tool_call");
+        assert_eq!(added["item"]["input"], "", "added 时 input 为空串");
+        assert!(
+            added["item"].get("arguments").is_none(),
+            "custom_tool_call 不应带 arguments"
+        );
+
+        let done = p
+            .iter()
+            .find(|e| e["type"] == "response.output_item.done")
+            .expect("须有 done");
+        assert_eq!(done["item"]["type"], "custom_tool_call");
+        assert_eq!(done["item"]["input"], "x", "done 时填完整提取结果");
+    }
+
+    #[test]
+    fn test_freeform_raw_source_input_extracted() {
+        // 模型直接回裸源码（非 JSON）
+        let raw = "await tools.exec_command({cmd: \"ls\"});";
+        let mut ctx = freeform_ctx("exec");
+        let mut all = ctx.process_kiro_event(&tool_event("c1", "exec", raw, false));
+        all.extend(ctx.process_kiro_event(&tool_event("c1", "exec", "", true)));
+
+        let p = payloads(&all);
+        let done = p
+            .iter()
+            .find(|e| e["type"] == "response.output_item.done")
+            .unwrap();
+        assert_eq!(done["item"]["input"], raw);
+    }
+
+    #[test]
+    fn test_plain_tool_still_forwards_arguments_delta() {
+        // 非 freeform 工具的既有行为不变
+        let mut ctx = new_ctx(false);
+        let mut all = ctx.process_kiro_event(&tool_event("c1", "wait", r#"{"a":1}"#, false));
+        all.extend(ctx.process_kiro_event(&tool_event("c1", "wait", "", true)));
+
+        let n = names(&all);
+        assert!(
+            n.iter().any(|e| e == "response.function_call_arguments.delta"),
+            "普通工具须继续透传参数增量: {:?}",
+            n
+        );
+        let p = payloads(&all);
+        let done = p
+            .iter()
+            .find(|e| e["type"] == "response.output_item.done")
+            .unwrap();
+        assert_eq!(done["item"]["type"], "function_call");
+    }
+
+    #[test]
+    fn test_stream_namespace_restored_in_items() {
+        let mut rewrite = super::super::responses_tools::ToolRewriteMap::default();
+        rewrite.namespaces.insert(
+            "collaboration__spawn_agent".to_string(),
+            ("collaboration".to_string(), "spawn_agent".to_string()),
+        );
+        let mut ctx = ResponsesStreamContext::new(
+            "resp_test".to_string(),
+            "gpt-4o".to_string(),
+            None,
+            None,
+            100,
+            false,
+            HashMap::new(),
+            rewrite,
+        );
+
+        let mut all = ctx.process_kiro_event(&tool_event(
+            "c1",
+            "collaboration__spawn_agent",
+            "{}",
+            false,
+        ));
+        all.extend(ctx.process_kiro_event(&tool_event(
+            "c1",
+            "collaboration__spawn_agent",
+            "",
+            true,
+        )));
+
+        let p = payloads(&all);
+        for kind in ["response.output_item.added", "response.output_item.done"] {
+            let e = p.iter().find(|e| e["type"] == kind).expect(kind);
+            assert_eq!(e["item"]["name"], "spawn_agent", "{} 须还原原名", kind);
+            assert_eq!(
+                e["item"]["namespace"], "collaboration",
+                "{} 须带 namespace",
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn test_freeform_unfinished_tool_closed_on_finish() {
+        // 未收到 stop 也要收尾，且走 freeform 分支
+        let mut ctx = freeform_ctx("exec");
+        let mut all = ctx.process_kiro_event(&tool_event("c1", "exec", r#"{"input":"y"}"#, false));
+        all.extend(ctx.finish());
+
+        let p = payloads(&all);
+        let done = p
+            .iter()
+            .find(|e| e["type"] == "response.output_item.done")
+            .expect("finish 须收尾未完成的工具");
+        assert_eq!(done["item"]["type"], "custom_tool_call");
+        assert_eq!(done["item"]["input"], "y");
     }
 }

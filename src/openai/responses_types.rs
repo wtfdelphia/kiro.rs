@@ -29,8 +29,7 @@ pub struct ResponsesRequest {
     pub stream: bool,
     #[serde(default)]
     pub tools: Option<Vec<OpenAiTool>>,
-    /// 接受但不透传
-    #[allow(dead_code)]
+    /// 仅在客户端方言（`custom` / `namespace`）时改写后透传，其余形状忽略
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
     #[serde(default)]
@@ -47,6 +46,11 @@ pub struct ResponsesRequest {
     pub max_output_tokens: Option<i32>,
     #[serde(default)]
     pub metadata: Option<HashMap<String, String>>,
+    /// 结构化输出请求（`text.format`）。**读取仅为可观测性**：
+    /// Kiro 上游 `userInputMessageContext` 只有 `toolResults` / `tools`，
+    /// 没有 response format 概念，无处透传（见 design D10）。收到时打 warn，不参与转换。
+    #[serde(default)]
+    pub text: Option<serde_json::Value>,
 }
 
 impl ResponsesRequest {
@@ -115,6 +119,12 @@ pub struct ResponseOutputItem {
     /// web_search_call item
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<serde_json::Value>,
+    /// custom_tool_call item：裸文本输入（非 JSON）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    /// 展平自 namespace 的工具：客户端按 (namespace, name) 匹配，缺此字段会匹配失败
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 impl ResponseOutputItem {
@@ -129,6 +139,8 @@ impl ResponseOutputItem {
             name: None,
             arguments: None,
             action: None,
+            input: None,
+            namespace: None,
         }
     }
 
@@ -148,7 +160,41 @@ impl ResponseOutputItem {
             name: Some(name.into()),
             arguments: Some(arguments.into()),
             action: None,
+            input: None,
+            namespace: None,
         }
+    }
+
+    /// custom_tool_call item：freeform（wire `type: "custom"`）工具的调用
+    ///
+    /// 客户端为 freeform 工具登记的 payload 类型只接受裸文本 `input`，
+    /// 回 `function_call` 会被客户端自身拒绝并触发模型重试（见 design D9）。
+    pub fn custom_tool_call(
+        id: impl Into<String>,
+        call_id: impl Into<String>,
+        name: impl Into<String>,
+        input: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            item_type: "custom_tool_call".to_string(),
+            role: None,
+            status: Some("completed"),
+            content: None,
+            call_id: Some(call_id.into()),
+            name: Some(name.into()),
+            arguments: None,
+            action: None,
+            input: Some(input.into()),
+            namespace: None,
+        }
+    }
+
+    /// 展平自 namespace 的工具：还原 `name` 为原名并补 `namespace`
+    pub fn with_namespace(mut self, namespace: impl Into<String>, name: impl Into<String>) -> Self {
+        self.namespace = Some(namespace.into());
+        self.name = Some(name.into());
+        self
     }
 
     pub fn web_search_call(id: impl Into<String>, query: &str) -> Self {
@@ -162,6 +208,8 @@ impl ResponseOutputItem {
             name: None,
             arguments: None,
             action: Some(serde_json::json!({"type": "search", "query": query})),
+            input: None,
+            namespace: None,
         }
     }
 }

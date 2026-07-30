@@ -97,9 +97,8 @@ pub struct OpenAiTool {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
-    /// 原始 type。Chat 端点不使用（它不提供 server-side 工具，见 D10），
-    /// 保留供 Responses 端点（Phase C）判定 web_search 等 server-side tool。
-    #[allow(dead_code)]
+    /// 原始 type：Responses 端点用于判定 web_search 等 server-side tool，
+    /// Chat 端点用于丢弃无名工具时的诊断日志。
     pub tool_type: String,
 }
 
