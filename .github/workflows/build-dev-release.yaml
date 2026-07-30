@@ -82,15 +82,15 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '22'
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v5
         with:
           version: 11
 
@@ -145,7 +145,7 @@ jobs:
           ls -la staged
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: kiro-rs-${{ needs.prepare.outputs.version }}-${{ matrix.name }}
           if-no-files-found: error
@@ -159,12 +159,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: release-assets
           pattern: kiro-rs-${{ needs.prepare.outputs.version }}-*
@@ -196,7 +196,7 @@ jobs:
           gh release delete "${TAG}" --yes 2>/dev/null || true
 
       - name: Create or update GitHub prerelease
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.prepare.outputs.release_tag }}
           name: Dev rolling build (${{ needs.prepare.outputs.short_sha }})
