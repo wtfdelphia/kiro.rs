@@ -40,7 +40,8 @@
 - **智能重试**: 单凭据最多重试 3 次，单请求最多重试 9 次
 - **凭据回写**: 多凭据格式下自动回写刷新后的 Token
 - **Thinking 模式**: 支持 Claude 的 extended thinking 功能
-- **工具调用**: 完整支持 function calling / tool use
+- **工具调用**: 完整支持 function calling / tool use；`/v1/responses` 额外兼容 Codex 的
+  `additional_tools` / `custom` / `namespace` 工具方言（降级送达上游并在响应侧还原原形状）
 - **WebSearch**: 内置 WebSearch 代执行（Anthropic 端点按 `stream` 返回 SSE 或 JSON；Responses 端点判定更宽且可开关）
 - **端点注册表**: 对外端点由单一事实源登记，单测强制 `live` 可路由 / `planned` 必 404，防止清单漂移
 - **多模型支持**: 支持 Sonnet、Opus、Haiku 系列模型
@@ -536,7 +537,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 | 端点 | 方法 | 描述 |
 |------|------|------|
 | `/v1/chat/completions` | POST | OpenAI Chat Completions（流式 + 非流式，含 function tools） |
-| `/v1/responses` | POST | OpenAI Responses（语义事件流 + 非流式，无状态；支持 web_search 代执行） |
+| `/v1/responses` | POST | OpenAI Responses（语义事件流 + 非流式，无状态；支持 web_search 代执行与 Codex 工具方言兼容） |
 
 接入注意：
 
@@ -545,7 +546,8 @@ RUST_LOG=debug ./target/release/kiro-rs
 - 流式 `usage` 需客户端传 `stream_options: {"include_usage": true}` 才在末尾返回
 - `temperature` / `top_p` / `tool_choice` 接受但不透传（Kiro 上游无对应字段）
 - 图片仅支持 base64 data URL；远程 http(s) 图片 URL 会被跳过
-- 不支持服务端 `web_search` 工具；名为 `web_search` 的普通 function tool 走正常工具路径
+- `/v1/chat/completions` 不劫持 `web_search`：名为 `web_search` 的工具作为普通 function tool
+  透传上游（代执行仅存在于 `/v1/responses`，见下文）
 - 未实现 `logprobs`、`n>1`、`seed`、`stop`、`logit_bias`
 
 `/v1/responses` 额外注意：
@@ -553,11 +555,33 @@ RUST_LOG=debug ./target/release/kiro-rs
 - **无状态**：携带 `previous_response_id` 返回 400，请在 `input` 中带上完整对话；`store` 被忽略
 - SSE 为命名语义事件（`event: response.*`），与 `/v1/chat/completions` 的纯 `data:` 行不同
 - `input` 支持字符串 / item 数组 / 单个 item 对象三种形状
-- 声明**单个** web_search 工具时由本代理执行搜索并返回 `web_search_call` + `message` 输出；
-  可在 Admin 运行时设置中关闭（关闭后该工具走正常工具路径）
+- 顶层 `tools` 只声明**单个** web_search 工具时由本代理执行搜索并返回 `web_search_call` +
+  `message` 输出；可在 Admin 运行时设置中关闭（关闭后该工具走正常工具路径）
 - 该端点的 web_search 判定比 `/v1/messages` 宽（含 `web_search_20250305` 等形状），
   两端点行为差异是有意选择
 - 未实现 `GET /v1/responses/{id}`、`include`、`truncation`、`parallel_tool_calls`
+- 不支持结构化输出：请求携带 `text.format` 时该字段被忽略并打 warning。
+  Kiro 上游的消息上下文只有工具定义与工具结果，没有 response format 概念，无处透传；
+  不做 prompt 层模拟（模拟会把 `strict: true` 降级成「尽力」，属假装支持）
+
+**客户端工具方言兼容**（面向 OpenAI Codex 等发送非标准工具形状的客户端）：
+
+| 客户端形状 | 本代理的处理 |
+| --- | --- |
+| `input[0]` 的 `additional_tools` item | 提取其 `tools[]` 并入顶层工具列表（该 item 不产生对话消息）。部分模型不发顶层 `tools` 字段，工具全在这里 |
+| `type: "custom"`（裸文本输入工具） | 降级为 schema 为 `{input: string}` 的 function；原 description 保留并在前面加调用约定说明，`format.definition`（如 lark 文法）追加到末尾 |
+| `type: "namespace"`（工具分组） | 内层工具展平为 `<namespace>__<name>` 的独立工具；响应侧还原为 `(namespace, 原名)` |
+| 历史 `custom_tool_call` / `custom_tool_call_output` | 改写为 function 调用与 tool 结果，保证上一轮的调用与结果成对存活 |
+
+- 由 `custom` 降级而来的工具，其调用在响应中还原为 `custom_tool_call`（带 `input` 而非
+  `arguments`），流式与非流式都做。这不是可选的美化：客户端为此类工具登记的 payload
+  类型只接受裸文本，收到 `function_call` 会拒绝自己的工具调用并触发模型重试
+- 展平名或原工具名超长时沿用既有工具名缩短机制，响应侧按两级映射还原
+- 展平后与顶层工具重名、或两个 namespace 展平到同名时返回 400 并指出冲突双方，
+  不自动改名（自动改名会让同一工具在不同轮次有不同名字，客户端无法预测）
+- 一次发送多个工具的客户端（如 Codex）不会触发 web_search 代执行：
+  代执行要求顶层 `tools` 恰好一个工具，而这类客户端的工具通常经 `additional_tools` 承载、
+  顶层 `tools` 为空。这是确定结果而非边界情况
 
 > **`/cc/v1/messages` 与 `/v1/messages` 的区别**：
 > - `/v1/messages`：实时流式返回，`message_start` 中的 `input_tokens` 是估算值
