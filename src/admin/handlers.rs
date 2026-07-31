@@ -120,6 +120,18 @@ pub async fn import_credentials_batch(
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
+/// POST /api/admin/credentials/import/kam
+///
+/// 接收原始 KAM 导出文档，服务端完成容器判别与认证分类后逐条入库。
+pub async fn import_kam_document(
+    State(state): State<AdminState>,
+    Json(payload): Json<crate::admin::types::KamImportRequest>,
+) -> impl IntoResponse {
+    match state.service.import_kam_document(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
 
 /// DELETE /api/admin/credentials/:id
 /// 删除凭据

@@ -670,4 +670,82 @@ mod tests {
             Some("arn:aws:codewhisperer:us-east-1:1:profile/REAL")
         );
     }
+
+    // ============ external_idp 回归（逻辑未改，仅锁定行为）============
+
+    fn external_cred() -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.refresh_token = Some("x".repeat(150));
+        c.auth_method = Some("external_idp".to_string());
+        c.client_id = Some("ms-cid".to_string());
+        c.token_endpoint =
+            Some("https://login.microsoftonline.com/t/oauth2/v2.0/token".to_string());
+        c
+    }
+
+    #[test]
+    fn test_supports_profiles_external_idp() {
+        // supports_profiles 的 external 分支此前无测试覆盖
+        let c = external_cred();
+        assert!(
+            supports_profiles(&c),
+            "external_idp 应支持 profile ARN 解析"
+        );
+
+        // 由 provider 触发的等价路径
+        let mut by_provider = KiroCredentials::default();
+        by_provider.refresh_token = Some("x".repeat(150));
+        by_provider.provider = Some("ExternalIdp".to_string());
+        assert!(supports_profiles(&by_provider));
+    }
+
+    #[test]
+    fn test_external_real_profile_arn_is_trusted() {
+        // external 账号的 profileArn 是真实值而非占位，必须原样保留
+        let mut c = external_cred();
+        let real = "arn:aws:codewhisperer:us-east-1:000000000000:profile/FAKEEXTERNAL";
+        c.profile_arn = Some(real.to_string());
+        assert_eq!(trusted_profile_arn(&c), Some(real));
+
+        // 占位值仍不可信
+        c.profile_arn = Some(BUILDER_ID_PROFILE_ARN.to_string());
+        assert!(trusted_profile_arn(&c).is_none());
+    }
+
+    #[test]
+    fn test_external_uses_arn_from_list() {
+        // 缓存命中由 resolve_profile_arn 在调用 decide 之前处理（trusted_profile_arn），
+        // decide 只负责 list 阶段之后的决策。此处验证 list 得到可信 ARN 时直接采用。
+        let c = external_cred();
+        let real = "arn:aws:codewhisperer:us-east-1:000000000000:profile/FAKEEXTERNAL";
+        assert_eq!(
+            decide_profile_action(&c, ListOutcome::Resolved(real.to_string())),
+            ResolveAction::Use(real.to_string())
+        );
+    }
+
+    #[test]
+    fn test_external_without_arn_currently_force_refreshes() {
+        // 已知遗留（非期望终态）：Microsoft token 端点不返回 profileArn，
+        // 逻辑上 external 应与 IdC 一样软放行；但 refresh_routes_to_idc 对
+        // external 返回 false，故此处判定为 ForceRefresh——一次注定无收益的往返。
+        // 修它需重新定义该谓词语义，会牵连本 capability 的既有 spec 场景。
+        // 本测试锁定当前行为，使将来的修复必须显式更新它。
+        let c = external_cred();
+        assert_eq!(
+            decide_profile_action(&c, ListOutcome::Failed),
+            ResolveAction::ForceRefresh,
+            "记录现状：external 目前落在强刷分支"
+        );
+    }
+
+    #[test]
+    fn test_external_api_key_still_unsupported() {
+        let mut c = external_cred();
+        c.kiro_api_key = Some("ksk_x".to_string());
+        assert!(
+            !supports_profiles(&c),
+            "API Key 凭据不支持 profile，优先于 external 判定"
+        );
+    }
 }

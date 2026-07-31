@@ -69,15 +69,19 @@ export interface SetPriorityRequest {
   priority: number
 }
 
+// 认证方式（与后端规范化取值一致）
+export type AuthMethod = 'social' | 'idc' | 'external_idp' | 'api_key'
+
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken?: string
-  authMethod?: 'social' | 'idc' | 'api_key'
+  authMethod?: AuthMethod
   provider?: string
   profileArn?: string
   clientId?: string
   clientSecret?: string
   priority?: number
+  region?: string
   authRegion?: string
   apiRegion?: string
   machineId?: string
@@ -91,6 +95,12 @@ export interface AddCredentialRequest {
   nickname?: string
   startUrl?: string
   onConflict?: 'reject' | 'upsert' | 'replace_token_only'
+  /** external_idp 的 OAuth2 token 端点 */
+  tokenEndpoint?: string
+  /** external_idp 的 issuer URL（未给 tokenEndpoint 时据此派生） */
+  issuerUrl?: string
+  /** external_idp 的 OAuth2 scopes，空格分隔 */
+  scopes?: string
 }
 
 // 添加凭据响应

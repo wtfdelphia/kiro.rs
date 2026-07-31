@@ -32,6 +32,7 @@ bytes = "1"         # 高效的字节缓冲区
 tower-http = { version = "0.6", features = ["cors"] }
 clap = { version = "4.5", features = ["derive"] }
 urlencoding = "2"
+url = "2"             # external_idp token endpoint 解析与白名单校验
 parking_lot = "0.12"  # 高性能同步原语
 subtle = "2.6"        # 常量时间比较（防止时序攻击）
 rust-embed = "8"      # 嵌入静态文件

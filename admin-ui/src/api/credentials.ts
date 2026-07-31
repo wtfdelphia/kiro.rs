@@ -159,6 +159,50 @@ export async function importCredentialsBatch(
   return data
 }
 
+// ============ KAM 导入 ============
+
+export interface KamImportRequest {
+  /** 原始 KAM 文档，容器判别与认证分类均由服务端完成 */
+  document: unknown
+  options?: BatchImportOptions
+  /** 仅预检不入库 */
+  dryRun?: boolean
+}
+
+/** 逐条预检结果：只含「是否已配置」状态，不含任何字段值 */
+export interface KamPreviewItem {
+  index: number
+  path: string
+  authMethod?: string
+  provider?: string
+  email?: string
+  nickname?: string
+  hasRefreshToken: boolean
+  hasClientId: boolean
+  hasClientSecret: boolean
+  hasTokenEndpoint: boolean
+  hasIssuerUrl: boolean
+  hasScopes: boolean
+  hasProfileArn: boolean
+  disabled: boolean
+  valid: boolean
+  error?: string
+}
+
+export interface KamImportResponse {
+  success: boolean
+  /** 识别出的容器形态：FlatArray | FlatObject | Wrapper | LegacyNested */
+  container: string
+  preview: KamPreviewItem[]
+  summary?: { created: number; updated: number; duplicate: number; failed: number }
+  results: BatchImportItemResult[]
+}
+
+export async function importKamDocument(req: KamImportRequest): Promise<KamImportResponse> {
+  const { data } = await api.post<KamImportResponse>('/credentials/import/kam', req)
+  return data
+}
+
 // ============ 在线授权 ============
 
 export interface BuilderIdStartResponse {

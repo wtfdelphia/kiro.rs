@@ -115,6 +115,11 @@ impl std::error::Error for RefreshTokenInvalidError {}
 /// （见 `crate::kiro::profile::decide_profile_action`）。
 ///
 /// 如果未指定 auth_method，根据是否有 clientId/clientSecret 自动判断。
+///
+/// 注意：`external_idp` 在此返回 false。external 的刷新走 Microsoft 端点，
+/// 该端点同样不返回 profileArn，因此逻辑上应享受与 IdC 相同的软放行；
+/// 但改这条语义会牵连 `profile-arn-resolution` 的既有 spec 场景，留作独立 change。
+/// 见 `test_external_currently_not_routed_to_idc_predicate`。
 pub(crate) fn refresh_routes_to_idc(credentials: &KiroCredentials) -> bool {
     let auth_method = credentials.auth_method.as_deref().unwrap_or_else(|| {
         if credentials.client_id.is_some() && credentials.client_secret.is_some() {
@@ -127,6 +132,18 @@ pub(crate) fn refresh_routes_to_idc(credentials: &KiroCredentials) -> bool {
     auth_method.eq_ignore_ascii_case("idc")
         || auth_method.eq_ignore_ascii_case("builder-id")
         || auth_method.eq_ignore_ascii_case("iam")
+}
+
+/// 刷新是否走 external_idp（Microsoft OAuth2）端点
+///
+/// 判据是规范化后的认证类型，而非 client 字段——external 账号也可能同时具备
+/// clientId 与 clientSecret，按 client 字段判会把它误分到 IdC，向 AWS 发送
+/// Microsoft client ID 并得到 400 invalid_request。
+fn refresh_routes_to_external(credentials: &KiroCredentials) -> bool {
+    matches!(
+        credentials.classify_auth_method(),
+        Ok(crate::kiro::model::credentials::AuthMethod::ExternalIdp)
+    )
 }
 
 /// 刷新 Token
@@ -145,11 +162,104 @@ pub(crate) async fn refresh_token(
     validate_refresh_token(credentials)?;
 
     // 根据 auth_method 选择刷新方式
-    if refresh_routes_to_idc(credentials) {
+    //
+    // external 判定必须先于 IdC：external 账号可能同时具备 clientId 与
+    // clientSecret，若先判 IdC 则机密客户端会被送到 AWS OIDC 并得到
+    // 400 invalid_request。
+    if refresh_routes_to_external(credentials) {
+        refresh_external_token(credentials, config, proxy).await
+    } else if refresh_routes_to_idc(credentials) {
         refresh_idc_token(credentials, config, proxy).await
     } else {
         refresh_social_token(credentials, config, proxy).await
     }
+}
+
+/// 刷新 external_idp Token (Microsoft OAuth2 refresh_token grant)
+async fn refresh_external_token(
+    credentials: &KiroCredentials,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<KiroCredentials> {
+    use crate::kiro::external_idp;
+    use crate::kiro::model::token_refresh::ExternalRefreshResponse;
+
+    tracing::info!("正在刷新 external_idp Token...");
+
+    // endpoint 校验先于任何出站请求：导入文件是外部输入
+    let endpoint = external_idp::resolve_token_endpoint(
+        credentials.token_endpoint.as_deref(),
+        credentials.issuer_url.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("external_idp 刷新端点不可用: {}", e))?;
+
+    let refresh_token = credentials.refresh_token.as_ref().unwrap();
+    let client_id = credentials
+        .client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("external_idp 刷新需要 clientId"))?;
+
+    let form = external_idp::build_refresh_form(
+        client_id,
+        refresh_token,
+        credentials.client_secret.as_deref(),
+        credentials.scopes.as_deref(),
+    );
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+    let response = client
+        .post(endpoint.as_str())
+        .header("accept", "application/json")
+        .header("Connection", "close")
+        .form(&form)
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        // 上游响应体可能含租户信息与 token 材料，不整体回显
+        let body_text = response.text().await.unwrap_or_default();
+
+        if status.as_u16() == 400 && body_text.contains("invalid_grant") {
+            return Err(RefreshTokenInvalidError {
+                message: "external_idp refreshToken 已失效 (invalid_grant)".to_string(),
+            }
+            .into());
+        }
+
+        let error_msg = match status.as_u16() {
+            400 => "external_idp 刷新请求被拒绝",
+            401 => "external_idp 凭证已过期或无效，需要重新认证",
+            403 => "权限不足，无法刷新 external_idp Token",
+            429 => "请求过于频繁，已被限流",
+            500..=599 => "服务器错误，Microsoft 身份平台暂时不可用",
+            _ => "external_idp Token 刷新失败",
+        };
+        bail!("{}: {}", error_msg, status);
+    }
+
+    let data: ExternalRefreshResponse = response.json().await?;
+
+    let mut new_credentials = credentials.clone();
+    new_credentials.access_token = Some(data.access_token);
+
+    // 轮换 refresh token，语义与 Social/IdC 一致
+    if let Some(new_refresh_token) = data.refresh_token {
+        new_credentials.refresh_token = Some(new_refresh_token);
+    }
+
+    if let Some(expires_in) = data.expires_in {
+        let expires_at = Utc::now() + Duration::seconds(expires_in);
+        new_credentials.expires_at = Some(expires_at.to_rfc3339());
+    } else if let Some(expires_at) = data.expires_at {
+        new_credentials.expires_at = Some(expires_at);
+    }
+
+    // Microsoft token 端点不返回 profileArn：保留导入时的真实值，不清除、不覆盖
+
+    Ok(new_credentials)
 }
 
 /// 刷新 Social Token
@@ -1219,12 +1329,16 @@ impl MultiTokenManager {
         // 序列化为 pretty JSON
         let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
 
-        // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
+        // 原子写入（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
+        //
+        // 与迁移路径共用同一个原子写工具：在同一个文件上同时存在原子与非原子两条
+        // 写路径，比两者都不原子更糟——读者无法判断当前内容出自哪条路径。
+        let write = || crate::common::atomic_file::write_atomic(path, &json);
         if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| std::fs::write(path, &json))
+            tokio::task::block_in_place(write)
                 .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
         } else {
-            std::fs::write(path, &json).with_context(|| format!("回写凭据文件失败: {:?}", path))?;
+            write().with_context(|| format!("回写凭据文件失败: {:?}", path))?;
         }
 
         tracing::debug!("已回写凭据到文件: {:?}", path);
@@ -1982,6 +2096,16 @@ impl MultiTokenManager {
         validated_cred.proxy_password = new_cred.proxy_password.clone();
         validated_cred.kiro_api_key = new_cred.kiro_api_key.clone();
         validated_cred.endpoint = new_cred.endpoint.clone().or(validated_cred.endpoint.take());
+        // external_idp 元数据必须进 overlay，否则 upsert 会静默抹掉该凭据的刷新配置
+        validated_cred.token_endpoint = new_cred
+            .token_endpoint
+            .clone()
+            .or(validated_cred.token_endpoint.take());
+        validated_cred.issuer_url = new_cred
+            .issuer_url
+            .clone()
+            .or(validated_cred.issuer_url.take());
+        validated_cred.scopes = new_cred.scopes.clone().or(validated_cred.scopes.take());
         validated_cred.nickname = new_cred.nickname.clone().or(validated_cred.nickname.take());
         validated_cred.start_url = new_cred.start_url.clone().or(validated_cred.start_url.take());
         validated_cred.email = new_cred.email.clone().or(validated_cred.email.take());
@@ -2737,6 +2861,148 @@ mod tests {
         );
     }
 
+    // ============ 四路刷新分派 ============
+
+    fn external_confidential_cred() -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        // 长度需通过 validate_refresh_token 的截断检查（该检查先于分派）
+        c.refresh_token = Some("x".repeat(150));
+        c.auth_method = Some("external_idp".to_string());
+        c.client_id = Some("ms-client-id".to_string());
+        // 机密客户端：同时具备 clientSecret，按 client 字段判会误落 IdC
+        c.client_secret = Some("ms-client-secret".to_string());
+        c.token_endpoint =
+            Some("https://login.microsoftonline.com/tenant/oauth2/v2.0/token".to_string());
+        c
+    }
+
+    #[test]
+    fn test_external_confidential_routes_to_external_not_idc() {
+        let c = external_confidential_cred();
+        assert!(
+            refresh_routes_to_external(&c),
+            "带 clientSecret 的 external 凭据必须选 external 分支"
+        );
+        assert!(
+            !refresh_routes_to_idc(&c),
+            "external 凭据不得被判为 IdC（否则会向 AWS 发送 Microsoft clientId）"
+        );
+    }
+
+    #[test]
+    fn test_external_public_client_routes_to_external() {
+        let mut c = external_confidential_cred();
+        c.client_secret = None;
+        assert!(refresh_routes_to_external(&c));
+        assert!(!refresh_routes_to_idc(&c));
+    }
+
+    #[test]
+    fn test_external_inferred_without_auth_method_routes_to_external() {
+        // 无显式 authMethod，靠白名单 endpoint 推断
+        let mut c = external_confidential_cred();
+        c.auth_method = None;
+        assert!(
+            refresh_routes_to_external(&c),
+            "白名单 endpoint 应使其被推断为 external"
+        );
+    }
+
+    #[test]
+    fn test_social_and_idc_routing_unchanged() {
+        // Social：仅 refreshToken
+        let mut social = KiroCredentials::default();
+        social.refresh_token = Some("rt".to_string());
+        social.auth_method = Some("social".to_string());
+        assert!(!refresh_routes_to_external(&social));
+        assert!(!refresh_routes_to_idc(&social));
+
+        // IdC 显式
+        let mut idc = KiroCredentials::default();
+        idc.refresh_token = Some("rt".to_string());
+        idc.auth_method = Some("idc".to_string());
+        idc.client_id = Some("cid".to_string());
+        idc.client_secret = Some("sec".to_string());
+        assert!(!refresh_routes_to_external(&idc));
+        assert!(refresh_routes_to_idc(&idc));
+
+        // IdC 推断（无 authMethod + client 字段齐全，无 external endpoint）
+        let mut inferred = KiroCredentials::default();
+        inferred.refresh_token = Some("rt".to_string());
+        inferred.client_id = Some("cid".to_string());
+        inferred.client_secret = Some("sec".to_string());
+        assert!(!refresh_routes_to_external(&inferred));
+        assert!(refresh_routes_to_idc(&inferred));
+
+        // builder-id / iam 别名仍走 IdC
+        for alias in ["builder-id", "iam", "BUILDER-ID"] {
+            let mut c = KiroCredentials::default();
+            c.refresh_token = Some("rt".to_string());
+            c.auth_method = Some(alias.to_string());
+            assert!(refresh_routes_to_idc(&c), "别名 {alias} 应走 IdC");
+            assert!(!refresh_routes_to_external(&c));
+        }
+    }
+
+    #[test]
+    fn test_non_whitelisted_endpoint_does_not_route_to_external() {
+        // 非白名单 endpoint 不构成 external 判据；显式 authMethod 缺省时回落 IdC
+        let mut c = KiroCredentials::default();
+        c.refresh_token = Some("rt".to_string());
+        c.client_id = Some("cid".to_string());
+        c.client_secret = Some("sec".to_string());
+        c.token_endpoint = Some("https://attacker.example/token".to_string());
+        assert!(!refresh_routes_to_external(&c));
+        assert!(refresh_routes_to_idc(&c));
+    }
+
+    #[tokio::test]
+    async fn test_external_without_endpoint_fails_before_network() {
+        // 缺 endpoint 时必须在发起请求前失败
+        let config = Config::default();
+        let mut c = external_confidential_cred();
+        c.token_endpoint = None;
+        c.issuer_url = None;
+
+        let result = refresh_token(&c, &config, None).await;
+        assert!(result.is_err(), "缺 endpoint 的 external 凭据应刷新失败");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("刷新端点不可用"),
+            "期望端点不可用错误，实际: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_external_rejects_non_whitelisted_endpoint_before_network() {
+        let config = Config::default();
+        let mut c = external_confidential_cred();
+        c.token_endpoint = Some("https://attacker.example/token".to_string());
+        // 显式 authMethod 使其仍走 external 分支，endpoint 校验在出站前拦下
+        let result = refresh_token(&c, &config, None).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("刷新端点不可用"),
+            "非白名单 endpoint 应在出站前被拒，实际: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_external_currently_not_routed_to_idc_predicate() {
+        // 已知遗留（非期望终态）：external 的刷新端点同样不返回 profileArn，
+        // 逻辑上应与 IdC 一样软放行、不为取 ARN 强刷；但 refresh_routes_to_idc
+        // 对 external 返回 false，故 profile 解析会对其执行一次注定无收益的强刷。
+        // 修它需重新定义该谓词语义（从「是否走 OIDC」变为「是否返回 ARN」），
+        // 会牵连 profile-arn-resolution 的既有 spec 场景，留作独立 change。
+        // 本测试锁定当前行为，避免无意改动后无人察觉。
+        let c = external_confidential_cred();
+        assert!(
+            !refresh_routes_to_idc(&c),
+            "记录现状：external 不被 refresh_routes_to_idc 判定为 true"
+        );
+    }
+
     #[tokio::test]
     async fn test_add_credential_reject_duplicate_refresh_token() {
         let config = Config::default();
@@ -3352,6 +3618,52 @@ mod tests {
         assert_eq!(manager.snapshot().total, 2);
     }
 
+    #[tokio::test]
+    async fn test_ingest_overlay_preserves_external_metadata() {
+        // api_key 路径跳过 refresh，可在无网络下验证 overlay 的字段传递。
+        // 若三个 external 字段未进 overlay，upsert 会静默抹掉该凭据的刷新配置。
+        let config = Config::default();
+        let mut existing = KiroCredentials::default();
+        existing.kiro_api_key = Some("ksk_overlay_base".into());
+        existing.auth_method = Some("api_key".into());
+        existing.user_id = Some("overlay-user".into());
+        let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
+
+        let mut incoming = KiroCredentials::default();
+        incoming.kiro_api_key = Some("ksk_overlay_new".into());
+        incoming.auth_method = Some("api_key".into());
+        incoming.user_id = Some("overlay-user-2".into());
+        incoming.token_endpoint =
+            Some("https://login.microsoftonline.com/t/oauth2/v2.0/token".into());
+        incoming.issuer_url = Some("https://login.microsoftonline.com/t".into());
+        incoming.scopes = Some("openid profile".into());
+
+        let r = manager
+            .ingest_credential(
+                incoming,
+                IngestOptions {
+                    on_conflict: OnConflict::Upsert,
+                },
+            )
+            .await
+            .unwrap();
+
+        let entries = manager.entries.lock();
+        let stored = entries
+            .iter()
+            .find(|e| e.id == r.id)
+            .expect("入库后应能取到该凭据");
+        assert_eq!(
+            stored.credentials.token_endpoint.as_deref(),
+            Some("https://login.microsoftonline.com/t/oauth2/v2.0/token"),
+            "tokenEndpoint 必须进 overlay"
+        );
+        assert_eq!(
+            stored.credentials.issuer_url.as_deref(),
+            Some("https://login.microsoftonline.com/t")
+        );
+        assert_eq!(stored.credentials.scopes.as_deref(), Some("openid profile"));
+    }
 
     fn sample_cred(priority: u32) -> KiroCredentials {
         let mut c = KiroCredentials::default();

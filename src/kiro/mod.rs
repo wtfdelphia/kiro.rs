@@ -1,6 +1,8 @@
 //! Kiro API 客户端模块
 
 pub mod endpoint;
+pub mod external_idp;
+pub mod kam_adapter;
 pub mod machine_id;
 pub mod model;
 pub mod models_api;

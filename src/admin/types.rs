@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::kiro::model::credentials::{parse_auth_method, AuthMethod};
+
 // ============ 凭据状态 ============
 
 /// 所有凭据状态响应
@@ -137,7 +139,7 @@ pub struct SetPriorityRequest {
 }
 
 /// 添加凭据请求
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddCredentialRequest {
     /// 刷新令牌（OAuth 凭据必填，API Key 凭据不需要）
@@ -209,10 +211,82 @@ pub struct AddCredentialRequest {
     /// 端点名称（可选，未配置时使用 config.defaultEndpoint）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// external_idp 的 OAuth2 token 端点（external_idp 需要，或用 issuerUrl 派生）
+    pub token_endpoint: Option<String>,
+
+    /// external_idp 的 issuer URL（可选，用于派生 tokenEndpoint）
+    pub issuer_url: Option<String>,
+
+    /// external_idp 的 OAuth2 scopes（可选，空格分隔单串）
+    pub scopes: Option<String>,
 }
 
 fn default_auth_method() -> String {
     "social".to_string()
+}
+
+impl AddCredentialRequest {
+    /// 按认证族校验必需字段
+    ///
+    /// 返回 Err 时错误信息面向操作者，不含任何密钥材料。
+    ///
+    /// external_idp **不要求** clientSecret：公共客户端本就没有 secret，
+    /// 强制要求会逼用户伪造，既过不了上游也污染存储。
+    pub fn validate_shape(&self) -> Result<AuthMethod, String> {
+        let method = parse_auth_method(&self.auth_method).map_err(|e| e.to_string())?;
+
+        let non_empty = |v: &Option<String>| {
+            v.as_deref()
+                .map(str::trim)
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+        };
+
+        match method {
+            AuthMethod::ApiKey => {
+                if !non_empty(&self.kiro_api_key) {
+                    return Err("api_key 凭据需要非空 kiroApiKey".to_string());
+                }
+            }
+            AuthMethod::Social => {
+                if !non_empty(&self.refresh_token) {
+                    return Err("social 凭据需要 refreshToken".to_string());
+                }
+            }
+            AuthMethod::Idc => {
+                if !non_empty(&self.refresh_token) {
+                    return Err("idc 凭据需要 refreshToken".to_string());
+                }
+                if !non_empty(&self.client_id) || !non_empty(&self.client_secret) {
+                    return Err(
+                        "idc 凭据需要同时提供 clientId 和 clientSecret".to_string()
+                    );
+                }
+            }
+            AuthMethod::ExternalIdp => {
+                if !non_empty(&self.refresh_token) {
+                    return Err("external_idp 凭据需要 refreshToken".to_string());
+                }
+                if !non_empty(&self.client_id) {
+                    return Err("external_idp 凭据需要 clientId".to_string());
+                }
+                if !non_empty(&self.token_endpoint) && !non_empty(&self.issuer_url) {
+                    return Err(
+                        "external_idp 凭据需要 tokenEndpoint 或 issuerUrl 之一".to_string(),
+                    );
+                }
+                // 校验 endpoint 合法性：不合法则不得进入后续任何出站请求
+                crate::kiro::external_idp::resolve_token_endpoint(
+                    self.token_endpoint.as_deref(),
+                    self.issuer_url.as_deref(),
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+
+        Ok(method)
+    }
 }
 
 /// 添加凭据成功响应
@@ -475,6 +549,71 @@ pub struct BatchImportResponse {
     pub results: Vec<BatchImportItemResult>,
 }
 
+/// KAM 导出文件导入请求
+///
+/// 直接接收原始 KAM 文档，容器判别与认证分类均在服务端完成——客户端再实现一套
+/// 判别规则会让同一文件在不同入口得到不同结果。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KamImportRequest {
+    /// 原始 KAM 文档（平铺单对象 / 平铺数组 / wrapper / 旧版嵌套）
+    pub document: serde_json::Value,
+    #[serde(default)]
+    pub options: Option<BatchImportOptions>,
+    /// 仅预检不入库
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// KAM 导入的逐条预检结果（不含任何密钥材料）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KamPreviewItem {
+    pub index: usize,
+    /// JSON 位置，便于定位源文件中的记录
+    pub path: String,
+    /// 识别出的认证方式（失败时为 None）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nickname: Option<String>,
+    /// 字段完整性：是否具备各类必需/可选字段（不回传字段值）
+    pub has_refresh_token: bool,
+    pub has_client_id: bool,
+    pub has_client_secret: bool,
+    pub has_token_endpoint: bool,
+    pub has_issuer_url: bool,
+    pub has_scopes: bool,
+    pub has_profile_arn: bool,
+    /// 该记录是否会被禁用（来自 enabled 取反）
+    pub disabled: bool,
+    /// 预检是否通过
+    pub valid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// KAM 导入响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KamImportResponse {
+    pub success: bool,
+    /// 识别出的容器形态
+    pub container: String,
+    /// 逐条预检结果
+    pub preview: Vec<KamPreviewItem>,
+    /// 实际入库汇总（dryRun 时为 None）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<BatchImportSummary>,
+    /// 实际入库逐条结果（dryRun 时为空）
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub results: Vec<BatchImportItemResult>,
+}
+
 // ============ 在线授权 ============
 
 #[derive(Debug, Deserialize)]
@@ -593,6 +732,190 @@ mod tests {
         assert_eq!(v["action"], "created");
         assert_eq!(v["userId"], "u");
         assert_eq!(v["credentialId"], 3);
+    }
+
+    // ============ external_idp 契约 ============
+
+    fn base_request(auth_method: &str) -> AddCredentialRequest {
+        AddCredentialRequest {
+            refresh_token: Some("z".repeat(150)),
+            auth_method: auth_method.to_string(),
+            provider: None,
+            profile_arn: None,
+            client_id: None,
+            client_secret: None,
+            priority: 0,
+            region: None,
+            auth_region: None,
+            api_region: None,
+            machine_id: None,
+            email: None,
+            user_id: None,
+            nickname: None,
+            start_url: None,
+            on_conflict: None,
+            proxy_url: None,
+            proxy_username: None,
+            proxy_password: None,
+            kiro_api_key: None,
+            endpoint: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
+        }
+    }
+
+    #[test]
+    fn add_credential_request_accepts_external_fields() {
+        let token = "e".repeat(150);
+        let json = format!(
+            r#"{{"refreshToken":"{}","authMethod":"external_idp","clientId":"ms-cid","tokenEndpoint":"https://login.microsoftonline.com/t/oauth2/v2.0/token","issuerUrl":"https://login.microsoftonline.com/t","scopes":"openid profile"}}"#,
+            token
+        );
+        let req: AddCredentialRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req.auth_method, "external_idp");
+        assert_eq!(
+            req.token_endpoint.as_deref(),
+            Some("https://login.microsoftonline.com/t/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            req.issuer_url.as_deref(),
+            Some("https://login.microsoftonline.com/t")
+        );
+        assert_eq!(req.scopes.as_deref(), Some("openid profile"));
+    }
+
+    #[test]
+    fn default_auth_method_is_still_social() {
+        let token = "d".repeat(150);
+        let json = format!(r#"{{"refreshToken":"{}"}}"#, token);
+        let req: AddCredentialRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req.auth_method, "social", "缺省值不得改变");
+    }
+
+    #[test]
+    fn validate_shape_rejects_unknown_auth_method() {
+        let req = base_request("oauth2");
+        let err = req.validate_shape().expect_err("未知 authMethod 应被拒");
+        assert!(err.contains("oauth2"));
+        assert!(err.contains("social"), "错误应列出合法取值");
+        assert!(err.contains("external_idp"));
+    }
+
+    #[test]
+    fn validate_shape_accepts_all_canonical_methods() {
+        // social
+        assert_eq!(base_request("social").validate_shape(), Ok(AuthMethod::Social));
+
+        // idc
+        let mut idc = base_request("idc");
+        idc.client_id = Some("cid".into());
+        idc.client_secret = Some("sec".into());
+        assert_eq!(idc.validate_shape(), Ok(AuthMethod::Idc));
+
+        // api_key
+        let mut ak = base_request("api_key");
+        ak.kiro_api_key = Some("ksk_x".into());
+        assert_eq!(ak.validate_shape(), Ok(AuthMethod::ApiKey));
+
+        // external_idp
+        let mut ext = base_request("external_idp");
+        ext.client_id = Some("ms-cid".into());
+        ext.token_endpoint =
+            Some("https://login.microsoftonline.com/t/oauth2/v2.0/token".into());
+        assert_eq!(ext.validate_shape(), Ok(AuthMethod::ExternalIdp));
+    }
+
+    #[test]
+    fn validate_shape_external_public_client_passes_without_secret() {
+        let mut req = base_request("external_idp");
+        req.client_id = Some("ms-public-cid".into());
+        req.token_endpoint =
+            Some("https://login.microsoftonline.com/t/oauth2/v2.0/token".into());
+        // 公共客户端没有 clientSecret：不得因此被拒
+        assert!(req.client_secret.is_none());
+        assert_eq!(req.validate_shape(), Ok(AuthMethod::ExternalIdp));
+    }
+
+    #[test]
+    fn validate_shape_external_requires_endpoint_or_issuer() {
+        let mut req = base_request("external_idp");
+        req.client_id = Some("ms-cid".into());
+        let err = req.validate_shape().expect_err("缺 endpoint 应被拒");
+        assert!(err.contains("tokenEndpoint 或 issuerUrl"), "实际: {err}");
+    }
+
+    #[test]
+    fn validate_shape_external_requires_client_id() {
+        let mut req = base_request("external_idp");
+        req.token_endpoint =
+            Some("https://login.microsoftonline.com/t/oauth2/v2.0/token".into());
+        let err = req.validate_shape().expect_err("缺 clientId 应被拒");
+        assert!(err.contains("clientId"), "实际: {err}");
+    }
+
+    #[test]
+    fn validate_shape_external_rejects_non_whitelisted_endpoint() {
+        let mut req = base_request("external_idp");
+        req.client_id = Some("ms-cid".into());
+        req.token_endpoint = Some("https://attacker.example/token".into());
+        let err = req
+            .validate_shape()
+            .expect_err("非白名单 endpoint 应在入口被拒");
+        assert!(err.contains("Microsoft 登录域"), "实际: {err}");
+    }
+
+    #[test]
+    fn validate_shape_external_accepts_issuer_only() {
+        let mut req = base_request("external_idp");
+        req.client_id = Some("ms-cid".into());
+        req.issuer_url = Some("https://login.microsoftonline.com/tenant".into());
+        assert_eq!(req.validate_shape(), Ok(AuthMethod::ExternalIdp));
+    }
+
+    #[test]
+    fn validate_shape_idc_still_requires_both_client_fields() {
+        let mut req = base_request("idc");
+        req.client_id = Some("cid".into());
+        let err = req.validate_shape().expect_err("IdC 缺 secret 应被拒");
+        assert!(err.contains("clientId 和 clientSecret"));
+    }
+
+    #[test]
+    fn kam_import_request_deserializes() {
+        let json = r#"{"document":{"accounts":[]},"dryRun":true}"#;
+        let req: KamImportRequest = serde_json::from_str(json).unwrap();
+        assert!(req.dry_run);
+        assert!(req.document.get("accounts").is_some());
+    }
+
+    #[test]
+    fn kam_preview_item_never_serializes_secrets() {
+        let item = KamPreviewItem {
+            index: 0,
+            path: "$[0]".into(),
+            auth_method: Some("external_idp".into()),
+            provider: None,
+            email: Some("a@b.c".into()),
+            nickname: Some("n".into()),
+            has_refresh_token: true,
+            has_client_id: true,
+            has_client_secret: false,
+            has_token_endpoint: true,
+            has_issuer_url: false,
+            has_scopes: true,
+            has_profile_arn: true,
+            disabled: false,
+            valid: true,
+            error: None,
+        };
+        let v = serde_json::to_string(&item).unwrap();
+        // 只有布尔状态，没有任何字段值
+        assert!(v.contains("hasClientSecret"));
+        assert!(v.contains("hasTokenEndpoint"));
+        for forbidden in ["refreshToken\":\"", "clientSecret\":\"", "tokenEndpoint\":\""] {
+            assert!(!v.contains(forbidden), "预检不得回传字段值: {forbidden}");
+        }
     }
 }
 

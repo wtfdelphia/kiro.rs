@@ -376,10 +376,13 @@ docker compose up
 | `refreshToken` | string | OAuth 刷新令牌                                  |
 | `profileArn`   | string | AWS Profile ARN（可选，登录时返回）                   |
 | `expiresAt`    | string | Token 过期时间 (RFC3339)                        |
-| `authMethod`   | string | 认证方式：`social` 或 `idc`                       |
+| `authMethod`   | string | 认证方式：`social` / `idc` / `external_idp` / `api_key`  |
 | `provider`     | string | 身份提供方：`BuilderId` / `Github` / `Google` / `Enterprise` 等（可选，用于 profileArn 固定表） |
-| `clientId`     | string | IdC 登录的客户端 ID（IdC 认证必填）                     |
-| `clientSecret` | string | IdC 登录的客户端密钥（IdC 认证必填）                      |
+| `clientId`     | string | 客户端 ID（IdC 与 external_idp 认证必填）                |
+| `clientSecret` | string | 客户端密钥（IdC 必填；external_idp 公共客户端可不填）        |
+| `tokenEndpoint`| string | external_idp 的 OAuth2 token 端点（与 `issuerUrl` 二选一必填） |
+| `issuerUrl`    | string | external_idp 的 issuer URL（未给 `tokenEndpoint` 时据此派生） |
+| `scopes`       | string | external_idp 的 OAuth2 scopes，空格分隔（可选）          |
 | `priority`     | number | 凭据优先级，数字越小越优先，默认为 0                         |
 | `region`       | string | 凭据级 Auth Region, 兼容字段                       |
 | `authRegion`   | string | 凭据级 Auth Region，用于 Token 刷新, 未配置时回退到 region |
@@ -394,7 +397,51 @@ docker compose up
 说明：
 - IdC / Builder-ID / IAM 在本项目里属于同一种登录方式，配置时统一使用 `authMethod: "idc"`
 - 为兼容旧配置，`builder-id` / `iam` 仍可被识别，但会按 `idc` 处理
+- `external_idp` 亦可写作 `external-idp` / `azure` / `azuread` / `azure_ad`（大小写不敏感）
+- **不在上述取值内的 `authMethod` 会被拒绝**，并在错误中列出合法取值；不会静默按 `social` 处理
 - KAM 导入的 IdC 账号建议带 `provider`（缺省按 `BuilderId`）与可选 `profileArn`；服务会在请求前自动解析并缓存 `profileArn`（固定表 / ListAvailableProfiles / refresh fallback）
+- `external_idp` 账号的 `provider` 应留空，`profileArn` 若有真实值会原样保留
+
+##### external_idp（Microsoft Entra ID / Azure AD）
+
+刷新走 Microsoft OAuth2 `refresh_token` grant，而非 AWS SSO OIDC。安全限制：
+
+- `tokenEndpoint` 只接受 HTTPS，且域名必须是 `login.microsoftonline.com`、
+  `login.microsoftonline.us`、`login.partner.microsoftonline.cn`、
+  `login.chinacloudapi.cn` 之一或其子域
+- 域名判定基于 URL 解析结果，不做字符串匹配；含 userinfo、IP 地址、`localhost` 的
+  endpoint 一律拒绝
+- 只给了 `issuerUrl` 时按 `{issuer}/oauth2/v2.0/token` 派生，派生结果再次校验
+- 白名单硬编码、不可通过配置修改：可配置的白名单等于可绕过的白名单
+
+公共客户端（无 `clientSecret`）可直接导入，不需要伪造密钥。
+
+示例见 `credentials.example.external.json`。
+
+#### KAM（kiro-account-manager）导出文件导入
+
+支持四种容器格式：平铺单对象、平铺数组、`{ version, accounts: [...] }`、
+旧版 `{ credentials: {...} }` 嵌套（单个或数组）。
+
+**推荐路径是 Admin UI 的 KAM 导入**（`POST /api/admin/credentials/import/kam`）：
+服务端完成容器判别与认证分类，逐条返回预检与导入结果，失败记录带明确原因。
+
+也可以直接把 KAM 导出文件当作 `credentials.json` 使用，属离线迁移能力：
+
+- 启动时识别到 KAM 容器格式后，会先备份原文件（`credentials.json.kam-backup-<时间戳>`），
+  再原子写回为原生数组格式
+- 迁移失败不影响启动，原文件保持不变，下次启动重试
+- 无法识别的 JSON 结构会明确报错并指出位置与顶层字段名，不会静默加载为空凭据
+
+导入时的字段映射需注意两点：
+
+- KAM 的 `enabled`（默认 `true`）与本项目的 `disabled`（默认 `false`）语义相反，
+  导入时会取反映射，上游禁用的账号不会变成启用
+- KAM 的 `label` 映射为 `nickname`；`region` 写入通用 `region` 字段
+  （Auth Region 经回退链派生；API Region 需要时请显式设置 `apiRegion`）
+
+KAM 导出文件包含明文 `refreshToken`、`clientSecret` 以及账号与代理密码。
+导入预览只显示字段是否已配置，不显示这些值；账号密码与代理配置不会被导入。
 
 #### 单凭据格式（旧格式，向后兼容）
 

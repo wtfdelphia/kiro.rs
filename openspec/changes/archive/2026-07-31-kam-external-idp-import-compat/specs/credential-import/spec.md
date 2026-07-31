@@ -1,10 +1,4 @@
-# Capability: credential-import
-
-## Purpose
-
-Admin API and KAM JSON import accept optional provider/profileArn and identity fields (userId/nickname/startUrl), attempt profile resolution after add, support server-side batch import as the primary multi-item path, and distinguish balance-only success from full chat readiness when profileArn remains unresolved.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: KAM/Admin 导入接收 provider 与 profileArn
 
@@ -129,6 +123,8 @@ Container parsing and authentication classification MUST be performed server-sid
 - **WHEN** 用户提交导入
 - **THEN** 客户端 MUST NOT 以「需要同时提供 clientId 和 clientSecret」为由本地判失败
 - **AND** 该记录 MUST 到达服务端并按 external_idp 规则处理
+
+## ADDED Requirements
 
 ### Requirement: 导入容器格式支持范围明确且逐条可诊断
 

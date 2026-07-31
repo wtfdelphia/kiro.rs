@@ -1,10 +1,4 @@
-# Capability: credential-ingest
-
-## Purpose
-
-Define the unified credential ingest pipeline for Admin add/import: identity fields, refresh gate, user-info enrichment, conflict/upsert rules, and single/batch import APIs.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: 统一 ingest 管道为唯一入库路径
 
@@ -74,21 +68,6 @@ The same backward-compatibility guarantee MUST hold for external endpoint metada
 - **THEN** 加载 MUST 成功，三字段为空
 - **AND** 既有 social/idc/api_key 凭据的行为 MUST 不变
 
-### Requirement: OAuth 用户信息 enrich（best-effort）
-
-After a successful OAuth refresh during ingest, the system MUST attempt to fetch user info (email and userId) using the new access token.
-
-#### Scenario: GetUserInfo 成功写回
-
-- **WHEN** GetUserInfo succeeds
-- **THEN** the persisted credential MUST store returned email and userId unless the request already provided non-empty values (request body takes priority)
-
-#### Scenario: GetUserInfo 失败不阻断入库
-
-- **WHEN** GetUserInfo fails after successful refresh
-- **THEN** ingest MUST still persist the credential if other checks pass
-- **AND** MUST log a warning without secret material
-
 ### Requirement: 冲突与 upsert 策略
 
 Ingest MUST apply conflict rules in this order of identity strength: API Key hash; OAuth userId; OAuth refreshToken hash.
@@ -156,37 +135,6 @@ The `authMethod` field MUST be validated against the canonical alias set. It is 
 - **AND** MUST NOT persist the credential
 - **AND** MUST NOT defer the failure to refresh time
 
-### Requirement: 单条 import API
-
-The system MUST provide POST /api/admin/credentials/import for import-oriented single ingest with forced OAuth refresh and user-info enrich semantics aligned to Kiro-Go import.
-
-#### Scenario: import 成功返回身份
-
-- **WHEN** import receives a valid refreshToken and refresh succeeds
-- **THEN** response MUST report success with credentialId
-- **AND** SHOULD include email and userId when available
-
-### Requirement: 批量 import API
-
-The system MUST provide POST /api/admin/credentials/import/batch that ingests multiple items and returns per-item results without requiring the client to orchestrate N independent create calls as the primary path.
-
-#### Scenario: 混合结果汇总
-
-- **WHEN** a batch contains create, update, duplicate, and failed items
-- **THEN** the response MUST include per-item status and a summary of counts
-- **AND** successful items MUST remain persisted even if later items fail (unless stopOnError is true and documented short-circuit applies only to subsequent items)
-
-#### Scenario: 默认串行
-
-- **WHEN** batch options omit concurrency
-- **THEN** the server MUST process with concurrency 1 by default to reduce upstream rate-limit risk
-
-#### Scenario: refresh 失败条目不写盘
-
-- **WHEN** one batch item fails refresh
-- **THEN** that item MUST be marked failed
-- **AND** MUST NOT create a partial OAuth entry for that item
-
 ### Requirement: 密钥与日志安全
 
 Ingest and import APIs MUST NOT return full refreshToken, clientSecret, or kiroApiKey in JSON responses, and MUST NOT write those secrets in clear text to logs.
@@ -208,6 +156,8 @@ This MUST extend to material introduced by import-tool formats: the account pass
 - **WHEN** external OAuth2 刷新请求失败
 - **THEN** 日志与 API 错误体 MUST NOT 包含请求 form 原文、refresh token、
   access token 或完整 client secret
+
+## ADDED Requirements
 
 ### Requirement: region 解析链不得因导入能力而改变
 

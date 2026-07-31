@@ -46,10 +46,27 @@ async fn main() {
     let credentials_path = args
         .credentials
         .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
-    let credentials_config = CredentialsConfig::load(&credentials_path).unwrap_or_else(|e| {
+    let loaded = CredentialsConfig::load_detailed(&credentials_path).unwrap_or_else(|e| {
         tracing::error!("加载凭证失败: {}", e);
         std::process::exit(1);
     });
+
+    // 导入工具容器格式（wrapper / 旧版嵌套）：备份后规范化写回为原生格式。
+    // 迁移失败不阻止启动——凭据已在内存中正确解析，下次启动会再试一次。
+    if loaded.needs_migration {
+        match CredentialsConfig::migrate_to_native(&credentials_path, &loaded.config) {
+            Ok(backup) => tracing::info!(
+                "凭据文件已从导入工具格式迁移为原生格式，原文件备份于 {:?}",
+                backup
+            ),
+            Err(e) => tracing::warn!(
+                "凭据文件格式迁移失败（不影响本次启动，原文件未被修改）: {}",
+                e
+            ),
+        }
+    }
+
+    let credentials_config = loaded.config;
 
     // 判断是否为多凭据格式（用于刷新后回写）
     let is_multiple_format = credentials_config.is_multiple();

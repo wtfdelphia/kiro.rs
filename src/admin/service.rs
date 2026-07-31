@@ -348,6 +348,11 @@ impl AdminService {
             }
         }
 
+        // 按认证族校验必需字段与 endpoint 合法性。
+        // external_idp 的 endpoint 校验必须在此完成：不合法则不得发起任何出站请求。
+        req.validate_shape()
+            .map_err(AdminServiceError::InvalidCredential)?;
+
         let on_conflict = crate::kiro::token_manager::OnConflict::parse(req.on_conflict.as_deref());
         let opts = crate::kiro::token_manager::IngestOptions { on_conflict };
 
@@ -377,6 +382,9 @@ impl AdminService {
             disabled: false,
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
+            token_endpoint: req.token_endpoint,
+            issuer_url: req.issuer_url,
+            scopes: req.scopes,
         };
 
         let result = self
@@ -524,6 +532,145 @@ impl AdminService {
                 duplicate,
                 failed,
             },
+            results,
+        })
+    }
+
+    /// 导入 KAM 导出文件
+    ///
+    /// 容器判别与认证分类在服务端完成，与启动加载共用同一个 adapter，
+    /// 使同一份文件在两个入口得到等价结果。
+    pub async fn import_kam_document(
+        &self,
+        req: crate::admin::types::KamImportRequest,
+    ) -> Result<crate::admin::types::KamImportResponse, AdminServiceError> {
+        use crate::admin::types::{
+            AddCredentialRequest, KamImportResponse, KamPreviewItem,
+        };
+        use crate::kiro::kam_adapter;
+
+        let adapted = kam_adapter::adapt(&req.document)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        let container = format!("{:?}", adapted.shape);
+
+        // 逐条预检：不回传任何密钥材料，只回传「是否配置」状态
+        let mut preview = Vec::with_capacity(adapted.records.len());
+        let mut importable: Vec<(usize, AddCredentialRequest)> = Vec::new();
+
+        for (index, record) in adapted.records.iter().enumerate() {
+            match record {
+                Ok(cred) => {
+                    preview.push(KamPreviewItem {
+                        index,
+                        path: format!("$[{index}]"),
+                        auth_method: cred.auth_method.clone(),
+                        provider: cred.provider.clone(),
+                        email: cred.email.clone(),
+                        nickname: cred.nickname.clone(),
+                        has_refresh_token: cred.refresh_token.is_some(),
+                        has_client_id: cred.client_id.is_some(),
+                        has_client_secret: cred.client_secret.is_some(),
+                        has_token_endpoint: cred.token_endpoint.is_some(),
+                        has_issuer_url: cred.issuer_url.is_some(),
+                        has_scopes: cred.scopes.is_some(),
+                        has_profile_arn: cred.profile_arn.is_some(),
+                        disabled: cred.disabled,
+                        valid: true,
+                        error: None,
+                    });
+
+                    importable.push((
+                        index,
+                        AddCredentialRequest {
+                            refresh_token: cred.refresh_token.clone(),
+                            auth_method: cred
+                                .auth_method
+                                .clone()
+                                .unwrap_or_else(|| "social".to_string()),
+                            provider: cred.provider.clone(),
+                            profile_arn: cred.profile_arn.clone(),
+                            client_id: cred.client_id.clone(),
+                            client_secret: cred.client_secret.clone(),
+                            priority: cred.priority,
+                            region: cred.region.clone(),
+                            auth_region: cred.auth_region.clone(),
+                            api_region: cred.api_region.clone(),
+                            machine_id: cred.machine_id.clone(),
+                            email: cred.email.clone(),
+                            user_id: cred.user_id.clone(),
+                            nickname: cred.nickname.clone(),
+                            start_url: cred.start_url.clone(),
+                            on_conflict: None,
+                            proxy_url: cred.proxy_url.clone(),
+                            proxy_username: cred.proxy_username.clone(),
+                            proxy_password: cred.proxy_password.clone(),
+                            kiro_api_key: cred.kiro_api_key.clone(),
+                            endpoint: cred.endpoint.clone(),
+                            token_endpoint: cred.token_endpoint.clone(),
+                            issuer_url: cred.issuer_url.clone(),
+                            scopes: cred.scopes.clone(),
+                        },
+                    ));
+                }
+                Err(rejected) => {
+                    preview.push(KamPreviewItem {
+                        index,
+                        path: rejected.path.clone(),
+                        auth_method: None,
+                        provider: None,
+                        email: None,
+                        nickname: None,
+                        has_refresh_token: false,
+                        has_client_id: false,
+                        has_client_secret: false,
+                        has_token_endpoint: false,
+                        has_issuer_url: false,
+                        has_scopes: false,
+                        has_profile_arn: false,
+                        disabled: false,
+                        valid: false,
+                        error: Some(rejected.reason.clone()),
+                    });
+                }
+            }
+        }
+
+        if req.dry_run {
+            return Ok(KamImportResponse {
+                success: !adapted.has_failures(),
+                container,
+                preview,
+                summary: None,
+                results: Vec::new(),
+            });
+        }
+
+        // 走既有 batch 管道入库，保持冲突策略与逐条结果语义一致
+        let batch = self
+            .import_credentials_batch(crate::admin::types::BatchImportRequest {
+                items: importable.iter().map(|(_, r)| r.clone()).collect(),
+                options: req.options,
+            })
+            .await?;
+
+        // 把 batch 的相对 index 映射回源文件 index
+        let mut results = batch.results;
+        for item in results.iter_mut() {
+            if let Some((src_index, _)) = importable.get(item.index) {
+                item.index = *src_index;
+            }
+        }
+
+        let adapter_failed = adapted.records.iter().filter(|r| r.is_err()).count();
+        let mut summary = batch.summary;
+        summary.failed += adapter_failed;
+
+        Ok(KamImportResponse {
+            success: summary.failed == 0,
+            container,
+            preview,
+            summary: Some(summary),
             results,
         })
     }
@@ -947,6 +1094,9 @@ impl AdminService {
             proxy_password: None,
             kiro_api_key: None,
             endpoint: None,
+            token_endpoint: None,
+            issuer_url: None,
+            scopes: None,
             on_conflict: Some("upsert".into()),
         };
         // Prefer import path defaults
@@ -1811,5 +1961,353 @@ mod tests {
             crate::public_api::catalog().len(),
             "响应端点数应与 catalog 一致"
         );
+    }
+
+    // ============ KAM 导入 ============
+
+    fn kam_service() -> AdminService {
+        AdminService::new(manager_with_one(), Vec::<String>::new())
+    }
+
+    fn fake_rt(tag: &str) -> String {
+        format!("fake-refresh-token-{tag}-{}", "0".repeat(120))
+    }
+
+    #[tokio::test]
+    async fn kam_import_dry_run_reports_per_record_results() {
+        let service = kam_service();
+        let doc = serde_json::json!({
+            "version": "1.9.2",
+            "accounts": [
+                {
+                    "label": "Social 号",
+                    "authMethod": "social",
+                    "provider": "Google",
+                    "refreshToken": fake_rt("social"),
+                    "email": "placeholder@example.invalid",
+                    "enabled": true
+                },
+                {
+                    "label": "external 机密",
+                    "authMethod": "external_idp",
+                    "provider": null,
+                    "refreshToken": fake_rt("ext"),
+                    "clientId": "ms-cid",
+                    "clientSecret": "ms-sec",
+                    "tokenEndpoint": "https://login.microsoftonline.com/t/oauth2/v2.0/token",
+                    "scopes": "openid profile",
+                    "enabled": false
+                },
+                {
+                    "label": "未知类型",
+                    "authMethod": "oauth2",
+                    "refreshToken": fake_rt("bad")
+                },
+                {
+                    "label": "非法 endpoint",
+                    "authMethod": "external_idp",
+                    "refreshToken": fake_rt("ssrf"),
+                    "clientId": "cid",
+                    "tokenEndpoint": "https://attacker.example/token"
+                }
+            ]
+        });
+
+        let resp = service
+            .import_kam_document(crate::admin::types::KamImportRequest {
+                document: doc,
+                options: None,
+                dry_run: true,
+            })
+            .await
+            .expect("dry run 不应整体失败");
+
+        assert_eq!(resp.container, "Wrapper");
+        assert_eq!(resp.preview.len(), 4);
+        assert!(!resp.success, "存在无效记录时 success 应为 false");
+        assert!(resp.summary.is_none(), "dry run 不入库");
+        assert!(resp.results.is_empty());
+
+        // 记录 0：social 有效
+        assert!(resp.preview[0].valid);
+        assert_eq!(resp.preview[0].auth_method.as_deref(), Some("social"));
+        assert_eq!(resp.preview[0].provider.as_deref(), Some("Google"));
+        assert!(resp.preview[0].has_refresh_token);
+        assert!(!resp.preview[0].disabled);
+
+        // 记录 1：external 机密客户端有效，enabled:false → disabled:true
+        assert!(resp.preview[1].valid);
+        assert_eq!(resp.preview[1].auth_method.as_deref(), Some("external_idp"));
+        assert!(
+            resp.preview[1].provider.is_none(),
+            "external 不得回填 provider"
+        );
+        assert!(resp.preview[1].has_client_secret);
+        assert!(resp.preview[1].has_token_endpoint);
+        assert!(resp.preview[1].has_scopes);
+        assert!(resp.preview[1].disabled, "enabled:false 应映射为 disabled");
+        assert_eq!(resp.preview[1].nickname.as_deref(), Some("external 机密"));
+
+        // 记录 2：未知 authMethod 逐条失败
+        assert!(!resp.preview[2].valid);
+        let err2 = resp.preview[2].error.as_deref().unwrap();
+        assert!(err2.contains("oauth2"));
+        assert!(err2.contains("external_idp"), "应列出合法取值");
+
+        // 记录 3：非法 endpoint 逐条失败
+        assert!(!resp.preview[3].valid);
+        let err3 = resp.preview[3].error.as_deref().unwrap();
+        assert!(err3.contains("Microsoft 登录域"), "实际: {err3}");
+        // 错误不得含 token 材料
+        assert!(!err3.contains("fake-refresh-token"));
+    }
+
+    #[tokio::test]
+    async fn kam_import_public_client_passes_precheck() {
+        let service = kam_service();
+        let doc = serde_json::json!([{
+            "label": "公共客户端",
+            "authMethod": "external_idp",
+            "refreshToken": fake_rt("pub"),
+            "clientId": "ms-public-cid",
+            "clientSecret": null,
+            "tokenEndpoint": "https://login.microsoftonline.com/t/oauth2/v2.0/token"
+        }]);
+
+        let resp = service
+            .import_kam_document(crate::admin::types::KamImportRequest {
+                document: doc,
+                options: None,
+                dry_run: true,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.container, "FlatArray");
+        assert!(
+            resp.preview[0].valid,
+            "公共客户端不得因缺 clientSecret 被拒: {:?}",
+            resp.preview[0].error
+        );
+        assert!(!resp.preview[0].has_client_secret);
+        assert!(resp.success);
+    }
+
+    #[tokio::test]
+    async fn kam_import_rejects_unrecognized_container_wholesale() {
+        let service = kam_service();
+        let err = service
+            .import_kam_document(crate::admin::types::KamImportRequest {
+                document: serde_json::json!({ "version": "1.0", "data": [] }),
+                options: None,
+                dry_run: true,
+            })
+            .await
+            .expect_err("未知容器应整体失败");
+        assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        let msg = err.to_string();
+        assert!(msg.contains("version"), "错误应含顶层 key 名: {msg}");
+        assert!(msg.contains("无法识别"));
+    }
+
+    #[tokio::test]
+    async fn kam_import_preview_never_leaks_secrets() {
+        let service = kam_service();
+        let doc = serde_json::json!([{
+            "label": "含敏感字段",
+            "authMethod": "external_idp",
+            "refreshToken": fake_rt("leak-check"),
+            "clientId": "ms-cid",
+            "clientSecret": "super-secret-value",
+            "password": "account-password-value",
+            "tokenEndpoint": "https://login.microsoftonline.com/t/oauth2/v2.0/token",
+            "proxyConfig": { "password": "proxy-password-value" }
+        }]);
+
+        let resp = service
+            .import_kam_document(crate::admin::types::KamImportRequest {
+                document: doc,
+                options: None,
+                dry_run: true,
+            })
+            .await
+            .unwrap();
+
+        let body = serde_json::to_string(&resp).unwrap();
+        for secret in [
+            "super-secret-value",
+            "account-password-value",
+            "proxy-password-value",
+            "fake-refresh-token-leak-check",
+        ] {
+            assert!(!body.contains(secret), "响应泄露了 {secret}");
+        }
+        // 但应回传「是否已配置」状态
+        assert!(body.contains("hasClientSecret"));
+    }
+
+    #[tokio::test]
+    async fn kam_import_and_file_load_produce_equivalent_credentials() {
+        // 本 change 的核心验收标准：同一份 fixture 经 Admin 导入与启动加载，
+        // 产出的规范化凭据必须等价。改动前 external 账号在两条路径分别走
+        // AWS OIDC 与 Kiro Social 两个错误端点。
+        let doc = serde_json::json!({
+            "version": "1.9.2",
+            "accounts": [
+                {
+                    "label": "Social 号",
+                    "authMethod": "social",
+                    "provider": "Google",
+                    "refreshToken": fake_rt("eq-social"),
+                    "email": "eq-social@example.invalid",
+                    "userId": "eq-u1",
+                    "region": "us-east-1",
+                    "enabled": true
+                },
+                {
+                    "label": "external 机密",
+                    "authMethod": "external_idp",
+                    "provider": null,
+                    "refreshToken": fake_rt("eq-ext"),
+                    "clientId": "ms-cid",
+                    "clientSecret": "ms-sec",
+                    "tokenEndpoint": "https://login.microsoftonline.com/t/oauth2/v2.0/token",
+                    "issuerUrl": "https://login.microsoftonline.com/t",
+                    "scopes": "openid profile",
+                    "profileArn": "arn:aws:codewhisperer:us-east-1:000000000000:profile/EQEXTERNAL",
+                    "enabled": false
+                },
+                {
+                    "label": "BuilderId 号",
+                    "authMethod": "IdC",
+                    "refreshToken": fake_rt("eq-idc"),
+                    "clientId": "idc-cid",
+                    "clientSecret": "idc-sec",
+                    "region": "eu-west-1",
+                    "enabled": true
+                }
+            ]
+        });
+
+        // 路径 A：Admin 导入的预检结果（dry run，不触发网络）
+        let service = kam_service();
+        let via_admin = service
+            .import_kam_document(crate::admin::types::KamImportRequest {
+                document: doc.clone(),
+                options: None,
+                dry_run: true,
+            })
+            .await
+            .expect("Admin 导入预检应成功");
+        assert!(via_admin.success, "全部记录应通过预检");
+
+        // 路径 B：写入临时文件后经启动加载器解析
+        let dir = std::env::temp_dir().join(format!("kiro-rs-equiv-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("credentials.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+
+        let loaded = crate::kiro::model::credentials::CredentialsConfig::load_detailed(&path)
+            .expect("启动加载应成功");
+        assert!(loaded.needs_migration, "wrapper 格式应标记为需迁移");
+        let via_file = loaded.config.into_sorted_credentials();
+
+        // 两条路径的记录数一致
+        assert_eq!(via_admin.preview.len(), via_file.len(), "记录数应一致");
+        assert_eq!(via_file.len(), 3);
+
+        // 逐条比对：认证类型、provider、身份字段、endpoint 元数据、禁用状态
+        for (i, cred) in via_file.iter().enumerate() {
+            let p = &via_admin.preview[i];
+            assert_eq!(
+                p.auth_method, cred.auth_method,
+                "第 {i} 条的 authMethod 在两条路径不一致"
+            );
+            assert_eq!(p.provider, cred.provider, "第 {i} 条的 provider 不一致");
+            assert_eq!(p.email, cred.email, "第 {i} 条的 email 不一致");
+            assert_eq!(p.nickname, cred.nickname, "第 {i} 条的 nickname 不一致");
+            assert_eq!(p.disabled, cred.disabled, "第 {i} 条的 disabled 不一致");
+            assert_eq!(
+                p.has_token_endpoint,
+                cred.token_endpoint.is_some(),
+                "第 {i} 条的 tokenEndpoint 存在性不一致"
+            );
+            assert_eq!(
+                p.has_issuer_url,
+                cred.issuer_url.is_some(),
+                "第 {i} 条的 issuerUrl 存在性不一致"
+            );
+            assert_eq!(
+                p.has_scopes,
+                cred.scopes.is_some(),
+                "第 {i} 条的 scopes 存在性不一致"
+            );
+            assert_eq!(
+                p.has_client_secret,
+                cred.client_secret.is_some(),
+                "第 {i} 条的 clientSecret 存在性不一致"
+            );
+            assert_eq!(
+                p.has_profile_arn,
+                cred.profile_arn.is_some(),
+                "第 {i} 条的 profileArn 存在性不一致"
+            );
+        }
+
+        // external 账号：两条路径都必须选中同一个刷新去向
+        let external = via_file
+            .iter()
+            .find(|c| c.auth_method.as_deref() == Some("external_idp"))
+            .expect("应有 external 凭据");
+        assert!(
+            !crate::kiro::token_manager::refresh_routes_to_idc(external),
+            "external 不得走 AWS OIDC"
+        );
+        assert_eq!(
+            crate::kiro::external_idp::resolve_token_endpoint(
+                external.token_endpoint.as_deref(),
+                external.issuer_url.as_deref(),
+            )
+            .expect("endpoint 应可解析")
+            .host_str(),
+            Some("login.microsoftonline.com"),
+            "external 必须发往 Microsoft 端点"
+        );
+        assert!(external.disabled, "enabled:false 应映射为 disabled");
+        assert!(external.provider.is_none(), "external 不得回填 provider");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn kam_import_legacy_nested_maps_label() {
+        let service = kam_service();
+        let doc = serde_json::json!({
+            "label": "嵌套形态号",
+            "email": "nested@example.invalid",
+            "credentials": {
+                "authMethod": "social",
+                "provider": "Github",
+                "refreshToken": fake_rt("nested")
+            }
+        });
+
+        let resp = service
+            .import_kam_document(crate::admin::types::KamImportRequest {
+                document: doc,
+                options: None,
+                dry_run: true,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.container, "LegacyNested");
+        assert!(resp.preview[0].valid);
+        assert_eq!(
+            resp.preview[0].nickname.as_deref(),
+            Some("嵌套形态号"),
+            "嵌套形态的 label 也必须映射为 nickname"
+        );
+        assert_eq!(resp.preview[0].email.as_deref(), Some("nested@example.invalid"));
     }
 }

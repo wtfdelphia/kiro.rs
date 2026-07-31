@@ -12,7 +12,8 @@ use super::{
         get_credential_balance, get_credential_models, get_endpoint_settings,
         get_global_models_catalog, get_load_balancing_mode, get_proxy_settings, get_public_api,
         import_credential,
-        import_credentials_batch, import_sso_token, poll_builder_id, refresh_all_models,
+        import_credentials_batch, import_kam_document, import_sso_token, poll_builder_id,
+        refresh_all_models,
         refresh_credential_models, reset_failure_count, set_credential_disabled,
         set_credential_priority, set_load_balancing_mode, start_builder_id, start_iam_sso,
         test_credential, update_auth_settings, update_client_identity_settings,
@@ -31,6 +32,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         .route("/credentials/import", post(import_credential))
         .route("/credentials/import/batch", post(import_credentials_batch))
+        .route("/credentials/import/kam", post(import_kam_document))
         .route("/credentials/{id}", delete(delete_credential))
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))
