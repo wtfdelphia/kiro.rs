@@ -3,6 +3,7 @@
 //! Order: trusted cache → ListAvailableProfiles → refresh fallback → persist.
 //! Known fixed placeholder ARNs are never trusted or persisted (they cause upstream 403).
 
+use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
@@ -11,7 +12,10 @@ use serde::Deserialize;
 use crate::http_client::{build_client, ProxyConfig};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{
+    CooldownKind, MultiTokenManager, ProfileArnResolveAttempt, RefreshTokenInvalidError,
+    NO_ARN_COOLDOWN,
+};
 use crate::model::config::Config;
 
 /// REST base used by Kiro-Go ListAvailableProfiles (fixed us-east-1).
@@ -198,6 +202,35 @@ pub async fn resolve_profile_arn(
     credentials: &KiroCredentials,
     token: &str,
 ) -> anyhow::Result<String> {
+    let config = token_manager.config();
+    let proxy = credentials.effective_proxy(token_manager.global_proxy().as_ref());
+    resolve_profile_arn_inner(
+        token_manager,
+        credential_id,
+        credentials,
+        || list_available_profiles_with_retry(credentials, &config, token, proxy.as_ref()),
+        || token_manager.force_refresh_token_for(credential_id),
+    )
+    .await
+}
+
+/// `resolve_profile_arn` 的实现，list 与强刷两个上游边界以参数注入。
+///
+/// 抽出这一层只为可测性：本 change 的核心验收项是「命中冷却时 list 未被调用」，
+/// 而公开签名必须逐字不变（生效 spec 的 MUST）。
+async fn resolve_profile_arn_inner<L, LFut, R, RFut>(
+    token_manager: &MultiTokenManager,
+    credential_id: u64,
+    credentials: &KiroCredentials,
+    list_stage: L,
+    refresh_stage: R,
+) -> anyhow::Result<String>
+where
+    L: FnOnce() -> LFut,
+    LFut: Future<Output = anyhow::Result<String>>,
+    R: FnOnce() -> RFut,
+    RFut: Future<Output = anyhow::Result<()>>,
+{
     if let Some(arn) = trusted_profile_arn(credentials) {
         return Ok(arn.to_string());
     }
@@ -224,45 +257,94 @@ pub async fn resolve_profile_arn(
         return Err(anyhow!(ProfileArnUnsupported));
     }
 
-    let config = token_manager.config();
-    let proxy = credentials.effective_proxy(token_manager.global_proxy().as_ref());
+    // 冷却检查必须在 list **之前**：list 无条件先于决策执行，一次往返是完整 TLS
+    // 握手加最多 3 次重试，量级与强刷相当。抢占与检查在同一次锁内完成。
+    let _resolve_guard = match token_manager.try_begin_profile_arn_resolve(credential_id) {
+        ProfileArnResolveAttempt::Granted(guard) => guard,
+        ProfileArnResolveAttempt::Cooling { kind, remaining } => {
+            tracing::debug!(
+                "凭据 #{} profileArn 解析冷却中（{}，剩余 {} 秒），以无 ARN 继续",
+                credential_id,
+                kind.reason(),
+                remaining.as_secs()
+            );
+            return Err(anyhow!(ProfileArnUnavailable));
+        }
+        ProfileArnResolveAttempt::AlreadyResolving => {
+            tracing::debug!(
+                "凭据 #{} 已有 profileArn 解析在进行，本次以无 ARN 继续",
+                credential_id
+            );
+            return Err(anyhow!(ProfileArnUnavailable));
+        }
+    };
 
-    let (list, list_err) =
-        match list_available_profiles_with_retry(credentials, &config, token, proxy.as_ref()).await {
-            Ok(arn) if !arn.is_empty() && !is_known_placeholder_profile_arn(&arn) => {
-                (ListOutcome::Resolved(arn), None)
-            }
-            Ok(arn) if !arn.is_empty() => {
-                // Upstream somehow returned a known placeholder — do not trust/persist.
-                (
-                    ListOutcome::Placeholder,
-                    Some(anyhow!("list returned placeholder profileArn")),
-                )
-            }
-            Ok(_) => (ListOutcome::Empty, Some(anyhow!("empty profile list"))),
-            Err(e) => (ListOutcome::Failed, Some(e)),
-        };
+    let (list, list_err) = match list_stage().await {
+        Ok(arn) if !arn.is_empty() && !is_known_placeholder_profile_arn(&arn) => {
+            (ListOutcome::Resolved(arn), None)
+        }
+        Ok(arn) if !arn.is_empty() => {
+            // Upstream somehow returned a known placeholder — do not trust/persist.
+            (
+                ListOutcome::Placeholder,
+                Some(anyhow!("list returned placeholder profileArn")),
+            )
+        }
+        Ok(_) => (ListOutcome::Empty, Some(anyhow!("empty profile list"))),
+        Err(e) => (ListOutcome::Failed, Some(e)),
+    };
+
+    if let Some(err) = list_err.as_ref() {
+        tracing::debug!(
+            "凭据 #{} ListAvailableProfiles 未得可信 profileArn（{:?}）: {}",
+            credential_id,
+            list,
+            err
+        );
+    }
 
     match decide_profile_action(credentials, list) {
         ResolveAction::Use(arn) => {
             let _ = token_manager.set_profile_arn(credential_id, Some(arn.clone()), provider);
+            token_manager.clear_profile_arn_cooldown(credential_id);
             Ok(arn)
         }
         ResolveAction::Unsupported => Err(anyhow!(ProfileArnUnsupported)),
         ResolveAction::SoftUnavailable => Err(anyhow!(ProfileArnUnavailable)),
         ResolveAction::ForceRefresh => {
-            match token_manager.force_refresh_token_for(credential_id).await {
+            tracing::info!(
+                "凭据 #{} 无可信 profileArn，尝试刷新 Token 以获取（后续 {} 分钟内不再重试）",
+                credential_id,
+                NO_ARN_COOLDOWN.as_secs() / 60
+            );
+            match refresh_stage().await {
                 Ok(()) => {
                     if let Some(arn) = token_manager.profile_arn_of(credential_id) {
                         if !is_known_placeholder_profile_arn(&arn) {
+                            token_manager.clear_profile_arn_cooldown(credential_id);
                             return Ok(arn);
                         }
                         let _ = token_manager.clear_profile_arn(credential_id);
                     }
-                    // refresh succeeded but no trusted profileArn — proceed without
+                    // refresh succeeded but no trusted profileArn — proceed without.
+                    // 冷却必须在强刷**之后**写入，记录的才是刷新已递增过的新版本号；
+                    // 否则下次请求会因版本不符而放行，冷却在最常见路径上永不生效。
+                    token_manager.set_profile_arn_cooldown(credential_id, CooldownKind::NoArn);
                     Err(anyhow!(ProfileArnUnavailable))
                 }
                 Err(refresh_err) => {
+                    // 分类依据是错误**类型**而非文本：Social 的 invalid_grant 判据是
+                    // 两个条件的合取，按文本匹配会把普通 400 误判为永久失效。
+                    // 永久失效的凭据会被立即禁用、不再被选中，冷却对其无意义。
+                    if refresh_err
+                        .downcast_ref::<RefreshTokenInvalidError>()
+                        .is_none()
+                    {
+                        token_manager
+                            .set_profile_arn_cooldown(credential_id, CooldownKind::TransientFailure);
+                    }
+                    // 冷却抑制的是后续请求的往返，不是本次请求的错误：错误对象逐字不变，
+                    // 各调用点的既有处理因此保持原样。
                     if let Some(le) = list_err {
                         bail!("no available Kiro profile (list: {}; refresh: {})", le, refresh_err);
                     }
@@ -747,5 +829,498 @@ mod tests {
             !supports_profiles(&c),
             "API Key 凭据不支持 profile，优先于 external 判定"
         );
+    }
+
+    // ============ 解析调度：冷却 / 并发去重 / 结局分类 ============
+
+    use crate::kiro::token_manager::CooldownKind;
+    use crate::model::config::Config;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration as StdDuration;
+
+    const REAL_ARN: &str = "arn:aws:codewhisperer:us-east-1:1:profile/REAL";
+
+    /// 两个上游边界的调用计数，用于断言「命中冷却时 list 未被调用」
+    #[derive(Default)]
+    struct StageCalls {
+        list: AtomicUsize,
+        refresh: AtomicUsize,
+    }
+
+    impl StageCalls {
+        fn list(&self) -> usize {
+            self.list.load(Ordering::SeqCst)
+        }
+        fn refresh(&self) -> usize {
+            self.refresh.load(Ordering::SeqCst)
+        }
+    }
+
+    fn manager_with(cred: KiroCredentials) -> (Arc<MultiTokenManager>, u64) {
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
+        );
+        let id = manager.snapshot().entries[0].id;
+        (manager, id)
+    }
+
+    /// 走注入版解析：list 与强刷的结果由参数给定，不发任何真实请求
+    async fn resolve_with(
+        manager: &MultiTokenManager,
+        id: u64,
+        cred: &KiroCredentials,
+        calls: &StageCalls,
+        list_result: anyhow::Result<String>,
+        refresh_result: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<String> {
+        resolve_profile_arn_inner(
+            manager,
+            id,
+            cred,
+            || async {
+                calls.list.fetch_add(1, Ordering::SeqCst);
+                list_result
+            },
+            || async {
+                calls.refresh.fetch_add(1, Ordering::SeqCst);
+                refresh_result()
+            },
+        )
+        .await
+    }
+
+    fn social_no_arn() -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.auth_method = Some("social".to_string());
+        c.refresh_token = Some("a".repeat(150));
+        c
+    }
+
+    /// 核心验收项：命中冷却时既不发 list 也不强刷
+    #[tokio::test]
+    async fn test_cooldown_skips_list_and_refresh() {
+        let cred = social_no_arn();
+        let (manager, id) = manager_with(cred.clone());
+        let calls = StageCalls::default();
+
+        // 第一次：list miss + 强刷成功但无 ARN → 写 NoArn 冷却
+        let err = resolve_with(
+            &manager,
+            id,
+            &cred,
+            &calls,
+            Err(anyhow!("empty profile list")),
+            || Ok(()),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.downcast_ref::<ProfileArnUnavailable>().is_some());
+        assert_eq!((calls.list(), calls.refresh()), (1, 1));
+
+        // 第二次：命中冷却，两个边界都不得被调用
+        let err = resolve_with(
+            &manager,
+            id,
+            &cred,
+            &calls,
+            Err(anyhow!("empty profile list")),
+            || Ok(()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.downcast_ref::<ProfileArnUnavailable>().is_some(),
+            "冷却命中必须软放行"
+        );
+        assert_eq!(
+            (calls.list(), calls.refresh()),
+            (1, 1),
+            "冷却期内 ListAvailableProfiles 与强刷都不得再被调用"
+        );
+    }
+
+    /// 最易写错处：强刷轮换了 refreshToken（版本号 +1）后，紧随的请求仍须命中冷却
+    #[tokio::test]
+    async fn test_cooldown_survives_refresh_token_rotation() {
+        let cred = social_no_arn();
+        let (manager, id) = manager_with(cred.clone());
+        let calls = StageCalls::default();
+        let m = Arc::clone(&manager);
+
+        let _ = resolve_with(
+            &manager,
+            id,
+            &cred,
+            &calls,
+            Err(anyhow!("empty profile list")),
+            move || {
+                // 真实强刷会赋值 entry.credentials 并递增版本号
+                m.test_bump_credentials_version(id);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(
+            manager.profile_arn_cooldown_state(id).is_some(),
+            "冷却必须记录强刷之后的版本号，否则下次请求即因版本不符而放行"
+        );
+
+        let _ = resolve_with(
+            &manager,
+            id,
+            &cred,
+            &calls,
+            Err(anyhow!("empty profile list")),
+            || Ok(()),
+        )
+        .await;
+        assert_eq!((calls.list(), calls.refresh()), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn test_cooldown_expiry_allows_new_attempt() {
+        let cred = social_no_arn();
+        let (manager, id) = manager_with(cred.clone());
+        let calls = StageCalls::default();
+
+        let _ = resolve_with(&manager, id, &cred, &calls, Err(anyhow!("boom")), || Ok(())).await;
+        manager.test_age_profile_arn_cooldown(id, StdDuration::from_secs(16 * 60));
+
+        let _ = resolve_with(&manager, id, &cred, &calls, Err(anyhow!("boom")), || Ok(())).await;
+        assert_eq!(
+            (calls.list(), calls.refresh()),
+            (2, 2),
+            "窗口到期后必须允许完整解析"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_credentials_change_invalidates_cooldown_in_resolve() {
+        let cred = social_no_arn();
+        let (manager, id) = manager_with(cred.clone());
+        let calls = StageCalls::default();
+
+        let _ = resolve_with(&manager, id, &cred, &calls, Err(anyhow!("boom")), || Ok(())).await;
+        // 模拟重新导入 / upsert / Admin 手动强刷
+        manager.test_bump_credentials_version(id);
+
+        let _ = resolve_with(&manager, id, &cred, &calls, Err(anyhow!("boom")), || Ok(())).await;
+        assert_eq!((calls.list(), calls.refresh()), (2, 2));
+    }
+
+    /// trusted ARN 命中必须先于冷却检查：既不查冷却也不发 list
+    #[tokio::test]
+    async fn test_trusted_arn_short_circuits_before_cooldown() {
+        let mut cred = social_no_arn();
+        let (manager, id) = manager_with(cred.clone());
+        manager.set_profile_arn_cooldown(id, CooldownKind::NoArn);
+
+        cred.profile_arn = Some(REAL_ARN.to_string());
+        let calls = StageCalls::default();
+        let arn = resolve_with(&manager, id, &cred, &calls, Ok(REAL_ARN.into()), || Ok(()))
+            .await
+            .unwrap();
+
+        assert_eq!(arn, REAL_ARN);
+        assert_eq!((calls.list(), calls.refresh()), (0, 0));
+        assert!(
+            manager.profile_arn_cooldown_state(id).is_some(),
+            "trusted 命中不经过冷却分支，记录保持原样"
+        );
+    }
+
+    /// list 得到可信 ARN → 清除冷却
+    #[tokio::test]
+    async fn test_list_resolved_clears_cooldown() {
+        let cred = social_no_arn();
+        let (manager, id) = manager_with(cred.clone());
+        manager.set_profile_arn_cooldown(id, CooldownKind::NoArn);
+        // 冷却在 list 之前生效，需先让它失效才能走到 list
+        manager.test_bump_credentials_version(id);
+
+        let calls = StageCalls::default();
+        let arn = resolve_with(&manager, id, &cred, &calls, Ok(REAL_ARN.into()), || Ok(()))
+            .await
+            .unwrap();
+
+        assert_eq!(arn, REAL_ARN);
+        assert_eq!(calls.refresh(), 0, "list 命中不得强刷");
+        assert!(
+            manager.profile_arn_cooldown_state(id).is_none(),
+            "取得可信 ARN 后必须清除冷却"
+        );
+    }
+
+    /// 强刷后拿到可信 ARN → 清除冷却
+    #[tokio::test]
+    async fn test_refresh_yielding_arn_clears_cooldown() {
+        let cred = social_no_arn();
+        let (manager, id) = manager_with(cred.clone());
+        manager.set_profile_arn_cooldown(id, CooldownKind::TransientFailure);
+        manager.test_bump_credentials_version(id);
+
+        let calls = StageCalls::default();
+        let m = Arc::clone(&manager);
+        let arn = resolve_with(
+            &manager,
+            id,
+            &cred,
+            &calls,
+            Err(anyhow!("empty profile list")),
+            move || {
+                // 强刷响应带回 profileArn
+                m.set_profile_arn(id, Some(REAL_ARN.to_string()), None)
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(arn, REAL_ARN);
+        assert!(manager.profile_arn_cooldown_state(id).is_none());
+    }
+
+    /// 强刷瞬时失败 → 写 TransientFailure，且**仍上抛**含两处原因的硬错误
+    #[tokio::test]
+    async fn test_transient_refresh_failure_writes_short_cooldown_and_still_bails() {
+        let cred = social_no_arn();
+        let (manager, id) = manager_with(cred.clone());
+        let calls = StageCalls::default();
+
+        let err = resolve_with(
+            &manager,
+            id,
+            &cred,
+            &calls,
+            Err(anyhow!("HTTP 503 upstream")),
+            || Err(anyhow!("connection reset")),
+        )
+        .await
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("no available Kiro profile (list: ")
+                && msg.contains("; refresh: ")
+                && msg.ends_with(')'),
+            "错误文本必须逐字保留 list + refresh 两处原因，实际: {}",
+            msg
+        );
+        assert!(
+            err.downcast_ref::<ProfileArnUnavailable>().is_none(),
+            "瞬时失败不得被软化为 ProfileArnUnavailable"
+        );
+
+        let (kind, _) = manager
+            .profile_arn_cooldown_state(id)
+            .expect("瞬时失败必须写短窗口冷却");
+        assert_eq!(kind, CooldownKind::TransientFailure);
+    }
+
+    /// 非永久失效的 400（Social 判据是两个条件的合取）必须落 TransientFailure
+    #[tokio::test]
+    async fn test_non_permanent_400_is_transient_not_permanent() {
+        let cred = social_no_arn();
+        let (manager, id) = manager_with(cred.clone());
+        let calls = StageCalls::default();
+
+        let _ = resolve_with(
+            &manager,
+            id,
+            &cred,
+            &calls,
+            Err(anyhow!("empty profile list")),
+            // 400 + invalid_grant 但不含 "Invalid refresh token provided"：
+            // 落 token_manager 的通用 bail!，不是 RefreshTokenInvalidError
+            || Err(anyhow!("Social Token 刷新失败: 400 Bad Request invalid_grant")),
+        )
+        .await
+        .unwrap_err();
+
+        let (kind, _) = manager
+            .profile_arn_cooldown_state(id)
+            .expect("非永久失效必须写冷却");
+        assert_eq!(
+            kind,
+            CooldownKind::TransientFailure,
+            "分类必须依据错误类型而非文本匹配"
+        );
+    }
+
+    /// invalid_grant → 不写任何冷却（凭据会被立即禁用，冷却无意义）
+    #[tokio::test]
+    async fn test_invalid_grant_writes_no_cooldown() {
+        let cred = social_no_arn();
+        let (manager, id) = manager_with(cred.clone());
+        let calls = StageCalls::default();
+
+        let err = resolve_with(
+            &manager,
+            id,
+            &cred,
+            &calls,
+            Err(anyhow!("empty profile list")),
+            || {
+                Err(RefreshTokenInvalidError {
+                    message: "refreshToken 已失效 (invalid_grant)".to_string(),
+                }
+                .into())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.downcast_ref::<RefreshTokenInvalidError>().is_some()
+                || err.to_string().contains("invalid_grant"),
+            "错误必须原样上抛以走既有禁用策略，实际: {}",
+            err
+        );
+        assert!(
+            manager.profile_arn_cooldown_state(id).is_none(),
+            "invalid_grant 不得写冷却"
+        );
+    }
+
+    /// IdC：软放行且不写冷却
+    #[tokio::test]
+    async fn test_idc_soft_unavailable_writes_no_cooldown() {
+        let cred = idc_cred();
+        let (manager, id) = manager_with(cred.clone());
+        let calls = StageCalls::default();
+
+        let err = resolve_with(
+            &manager,
+            id,
+            &cred,
+            &calls,
+            Err(anyhow!("empty profile list")),
+            || Ok(()),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.downcast_ref::<ProfileArnUnavailable>().is_some());
+        assert_eq!(calls.refresh(), 0, "IdC 不得为取 ARN 而强刷");
+        assert!(
+            manager.profile_arn_cooldown_state(id).is_none(),
+            "IdC 不走强刷，冷却对其无意义"
+        );
+    }
+
+    /// API Key：Unsupported 且不写冷却、不发 list
+    #[tokio::test]
+    async fn test_api_key_unsupported_writes_no_cooldown() {
+        let mut cred = KiroCredentials::default();
+        cred.kiro_api_key = Some("ksk_x".to_string());
+        cred.auth_method = Some("api_key".to_string());
+        let (manager, id) = manager_with(cred.clone());
+        let calls = StageCalls::default();
+
+        let err = resolve_with(&manager, id, &cred, &calls, Ok(REAL_ARN.into()), || Ok(()))
+            .await
+            .unwrap_err();
+
+        assert!(err.downcast_ref::<ProfileArnUnsupported>().is_some());
+        assert_eq!((calls.list(), calls.refresh()), (0, 0));
+        assert!(manager.profile_arn_cooldown_state(id).is_none());
+    }
+
+    /// 并发解析同一凭据：只有一个发起往返，另一个立即软放行
+    #[tokio::test]
+    async fn test_concurrent_resolve_deduplicates() {
+        let cred = social_no_arn();
+        let (manager, id) = manager_with(cred.clone());
+        let calls = Arc::new(StageCalls::default());
+        let gate = Arc::new(tokio::sync::Notify::new());
+
+        let first = {
+            let manager = Arc::clone(&manager);
+            let calls = Arc::clone(&calls);
+            let gate = Arc::clone(&gate);
+            let cred = cred.clone();
+            tokio::spawn(async move {
+                resolve_profile_arn_inner(
+                    &manager,
+                    id,
+                    &cred,
+                    || async move {
+                        calls.list.fetch_add(1, Ordering::SeqCst);
+                        // 让第二个任务在 list 进行中时进入解析
+                        gate.notified().await;
+                        Err::<String, _>(anyhow!("empty profile list"))
+                    },
+                    || async { Ok(()) },
+                )
+                .await
+                .map_err(|e| e.to_string())
+            })
+        };
+
+        // 等第一个任务进入 list 阶段
+        while calls.list() == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        let second_calls = StageCalls::default();
+        let second = resolve_with(
+            &manager,
+            id,
+            &cred,
+            &second_calls,
+            Err(anyhow!("empty profile list")),
+            || Ok(()),
+        )
+        .await;
+
+        assert!(
+            second
+                .as_ref()
+                .unwrap_err()
+                .downcast_ref::<ProfileArnUnavailable>()
+                .is_some(),
+            "未抢到标记者必须立即软放行"
+        );
+        assert_eq!(
+            (second_calls.list(), second_calls.refresh()),
+            (0, 0),
+            "未抢到标记者不得发起任何上游往返"
+        );
+
+        gate.notify_one();
+        let _ = first.await.unwrap();
+        assert!(
+            !manager.test_profile_arn_resolving(id),
+            "解析结束后进行中标记必须已清除"
+        );
+    }
+
+    /// 解析以硬错误退出后，标记不泄漏，后续请求仍能取得资格
+    #[tokio::test]
+    async fn test_marker_cleared_after_hard_error() {
+        let cred = social_no_arn();
+        let (manager, id) = manager_with(cred.clone());
+        let calls = StageCalls::default();
+
+        let _ = resolve_with(
+            &manager,
+            id,
+            &cred,
+            &calls,
+            Err(anyhow!("HTTP 503")),
+            || Err(anyhow!("connection reset")),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(!manager.test_profile_arn_resolving(id));
+        // 让短窗口冷却失效后应能重新解析
+        manager.test_age_profile_arn_cooldown(id, StdDuration::from_secs(31));
+        let _ = resolve_with(&manager, id, &cred, &calls, Err(anyhow!("HTTP 503")), || {
+            Err(anyhow!("connection reset"))
+        })
+        .await;
+        assert_eq!(calls.list(), 2, "标记未泄漏，后续请求可正常解析");
     }
 }

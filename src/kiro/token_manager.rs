@@ -520,6 +520,119 @@ pub(crate) async fn get_usage_limits(
 // 多凭据 Token 管理器
 // ============================================================================
 
+// ============================================================================
+// profileArn 解析冷却（进程内，不落盘）
+// ============================================================================
+
+/// profileArn 解析冷却的原因，决定窗口时长
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CooldownKind {
+    /// 解析走完但上游确实没有可用 ARN（list 未命中 + 刷新成功却无 ARN）
+    NoArn,
+    /// 瞬时故障（网络错误 / 429 / 5xx）导致解析未能完成
+    TransientFailure,
+}
+
+impl CooldownKind {
+    /// 日志用的原因描述
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::NoArn => "上游确认无可用 ARN",
+            Self::TransientFailure => "上次解析遇瞬时故障",
+        }
+    }
+}
+
+/// 一条 profileArn 解析冷却记录
+///
+/// 只存在于内存：它是运行时优化而非凭据的属性，落盘会引入「持久化的负缓存如何失效」
+/// 整类问题，而重启后每凭据重试一次是可接受的。
+#[derive(Debug, Clone, Copy)]
+struct ProfileArnCooldown {
+    /// 冷却起点：本次解析**完成**的时刻。用 `Instant` 只关心相对时长，
+    /// 不受系统时钟调整影响，也不需要序列化
+    since: Instant,
+    /// 冷却原因
+    kind: CooldownKind,
+    /// 写入时的凭据版本号；与当前版本不符即视为失效
+    version: u64,
+}
+
+/// 「上游确认无可用 ARN」的抑制窗口
+///
+/// 依据是 ARN 可用性本身的变化量级（订阅变更、profile 首次创建属人工操作量级），
+/// 不是 token 有效期。
+pub(crate) const NO_ARN_COOLDOWN: StdDuration = StdDuration::from_secs(15 * 60);
+
+/// 瞬时故障的抑制窗口：一次网络抖动不应压制 15 分钟
+const TRANSIENT_FAILURE_COOLDOWN: StdDuration = StdDuration::from_secs(30);
+
+fn cooldown_window(kind: CooldownKind) -> StdDuration {
+    match kind {
+        CooldownKind::NoArn => NO_ARN_COOLDOWN,
+        CooldownKind::TransientFailure => TRANSIENT_FAILURE_COOLDOWN,
+    }
+}
+
+/// 是否仍在抑制窗口内
+///
+/// 由调用方算 `elapsed`：`Instant` 无法构造任意过去时刻，把时间维度留在参数上
+/// 才能对两个窗口的边界做单测，也不必引入可注入时钟。
+fn is_cooling(kind: CooldownKind, elapsed: StdDuration) -> bool {
+    elapsed < cooldown_window(kind)
+}
+
+/// 冷却记录是否应抑制本次解析；命中时返回原因与剩余时长
+///
+/// 版本号不符时无论 `elapsed` 都不抑制——凭据已变，值得再试一次。
+fn cooldown_block(
+    record: &ProfileArnCooldown,
+    current_version: u64,
+    elapsed: StdDuration,
+) -> Option<(CooldownKind, StdDuration)> {
+    if record.version != current_version {
+        return None;
+    }
+    if !is_cooling(record.kind, elapsed) {
+        return None;
+    }
+    Some((
+        record.kind,
+        cooldown_window(record.kind).saturating_sub(elapsed),
+    ))
+}
+
+/// 解析资格 guard：drop 时清除进行中标记，覆盖正常返回、错误返回与 unwind
+///
+/// 标记泄漏会使该凭据在本进程内**永久**不再解析 profileArn，比被修的缺陷更糟。
+pub(crate) struct ProfileArnResolveGuard<'a> {
+    manager: &'a MultiTokenManager,
+    id: u64,
+}
+
+impl Drop for ProfileArnResolveGuard<'_> {
+    fn drop(&mut self) {
+        let mut entries = self.manager.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == self.id) {
+            entry.profile_arn_resolving = false;
+        }
+    }
+}
+
+/// `try_begin_profile_arn_resolve` 的结果
+pub(crate) enum ProfileArnResolveAttempt<'a> {
+    /// 取得解析资格。`None` 表示凭据已不在管理器中（无冷却状态可维护），
+    /// 此时按引入冷却前的行为照常解析
+    Granted(Option<ProfileArnResolveGuard<'a>>),
+    /// 命中冷却：原因 + 剩余时长
+    Cooling {
+        kind: CooldownKind,
+        remaining: StdDuration,
+    },
+    /// 已有请求正在为该凭据解析 profileArn
+    AlreadyResolving,
+}
+
 /// 单个凭据条目的状态
 struct CredentialEntry {
     /// 凭据唯一 ID
@@ -538,6 +651,28 @@ struct CredentialEntry {
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
+    /// 凭据内容版本号（进程内自增，不落盘、不进快照）
+    ///
+    /// 每次 `entry.credentials =` 整体赋值后递增。它让「凭据是否变了」成为由写入方
+    /// 声明的事实，而不是从 refreshToken 值反推——后者无法区分「别人改了凭据」与
+    /// 「我自己刚刚刷新过」，而 Social 强刷本身就会轮换 refreshToken，
+    /// 用 token 哈希做指纹会使冷却在最常见路径上永不生效。
+    /// 初始值 0：新建条目尚未发生任何变更。
+    credentials_version: u64,
+    /// profileArn 解析冷却记录（内存，不落盘）
+    profile_arn_cooldown: Option<ProfileArnCooldown>,
+    /// true 表示已有请求正在为该凭据解析 profileArn
+    profile_arn_resolving: bool,
+}
+
+impl CredentialEntry {
+    /// 声明「凭据内容已变更」
+    ///
+    /// 必须在每一处 `entry.credentials` 写入之后调用：漏调一处的后果是该路径的
+    /// 凭据变更不会让 profileArn 解析冷却失效（冷却比预期多持续一个窗口）。
+    fn bump_credentials_version(&mut self) {
+        self.credentials_version = self.credentials_version.wrapping_add(1);
+    }
 }
 
 /// 禁用原因
@@ -824,6 +959,9 @@ impl MultiTokenManager {
                     },
                     success_count: 0,
                     last_used_at: None,
+                    credentials_version: 0,
+                    profile_arn_cooldown: None,
+                    profile_arn_resolving: false,
                 }
             })
             .collect();
@@ -968,6 +1106,133 @@ impl MultiTokenManager {
         }
         let _ = self.persist_credentials()?;
         Ok(())
+    }
+
+    // ========================================================================
+    // profileArn 解析冷却与并发去重
+    //
+    // 全部读写都在保护 `entries` 的同步 `Mutex` 的极短临界区内完成，**不跨 await**。
+    // 它与 `refresh_lock`（TokioMutex）是两把不同的锁。
+    // ========================================================================
+
+    /// 读取凭据当前内容版本号；凭据不存在时返回 `None`
+    ///
+    /// 写冷却时的版本号由 `set_profile_arn_cooldown` 在同一次锁内自取（避免「读版本 →
+    /// 写记录」之间被其他写入插入），因此本方法只用于测试断言。
+    #[cfg(test)]
+    pub(crate) fn credentials_version_of(&self, id: u64) -> Option<u64> {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.credentials_version)
+    }
+
+    /// 查询该凭据当前是否被冷却抑制（只读，不抢占资格）
+    ///
+    /// 解析路径用的是 `try_begin_profile_arn_resolve`（检查与抢占同锁），
+    /// 本方法只用于测试断言冷却记录的写入与失效。
+    #[cfg(test)]
+    pub(crate) fn profile_arn_cooldown_state(
+        &self,
+        id: u64,
+    ) -> Option<(CooldownKind, StdDuration)> {
+        let entries = self.entries.lock();
+        let entry = entries.iter().find(|e| e.id == id)?;
+        let record = entry.profile_arn_cooldown.as_ref()?;
+        cooldown_block(record, entry.credentials_version, record.since.elapsed())
+    }
+
+    /// 测试用：把已有冷却记录的起点回拨 `elapsed`，以覆盖窗口边界
+    ///
+    /// `Instant` 无法构造任意过去时刻，只能从当前时刻回减。
+    #[cfg(test)]
+    pub(crate) fn test_age_profile_arn_cooldown(&self, id: u64, elapsed: StdDuration) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            if let Some(record) = entry.profile_arn_cooldown.as_mut() {
+                record.since = Instant::now()
+                    .checked_sub(elapsed)
+                    .expect("测试环境应支持回拨 Instant");
+            }
+        }
+    }
+
+    /// 测试用：模拟一次凭据写入（如强刷轮换了 refreshToken）
+    #[cfg(test)]
+    pub(crate) fn test_bump_credentials_version(&self, id: u64) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.bump_credentials_version();
+        }
+    }
+
+    /// 测试用：读取进行中标记，断言 guard 不泄漏
+    #[cfg(test)]
+    pub(crate) fn test_profile_arn_resolving(&self, id: u64) -> bool {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.profile_arn_resolving)
+            .unwrap_or(false)
+    }
+
+    /// 尝试取得 profileArn 解析资格
+    ///
+    /// 检查冷却与抢占进行中标记在**同一次**锁内完成，避免「检查通过 → 抢占」之间的窗口：
+    /// 否则 N 个并发请求会同时读到「未冷却」并各自发起完整解析，使改动后的最坏情况
+    /// 与改动前无异。
+    pub(crate) fn try_begin_profile_arn_resolve(&self, id: u64) -> ProfileArnResolveAttempt<'_> {
+        let mut entries = self.entries.lock();
+        let entry = match entries.iter_mut().find(|e| e.id == id) {
+            Some(e) => e,
+            // 凭据已不在管理器中：无冷却状态可维护，按引入冷却前的行为照常解析
+            None => return ProfileArnResolveAttempt::Granted(None),
+        };
+
+        if let Some(record) = entry.profile_arn_cooldown.as_ref() {
+            if let Some((kind, remaining)) =
+                cooldown_block(record, entry.credentials_version, record.since.elapsed())
+            {
+                return ProfileArnResolveAttempt::Cooling { kind, remaining };
+            }
+        }
+
+        if entry.profile_arn_resolving {
+            return ProfileArnResolveAttempt::AlreadyResolving;
+        }
+        entry.profile_arn_resolving = true;
+        drop(entries);
+
+        ProfileArnResolveAttempt::Granted(Some(ProfileArnResolveGuard {
+            manager: self,
+            id,
+        }))
+    }
+
+    /// 写入 profileArn 解析冷却记录
+    ///
+    /// 记录的版本号取**调用时刻**的当前值。调用点必须在强刷**之后**：强刷会递增版本号，
+    /// 若记录刷新前的版本，下次请求即因版本不符而放行，冷却在最常见路径上永不生效。
+    /// 凭据在解析期间被删除时静默跳过。
+    pub(crate) fn set_profile_arn_cooldown(&self, id: u64, kind: CooldownKind) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.profile_arn_cooldown = Some(ProfileArnCooldown {
+                since: Instant::now(),
+                kind,
+                version: entry.credentials_version,
+            });
+        }
+    }
+
+    /// 清除 profileArn 解析冷却记录（已取得可信 ARN 时）
+    pub(crate) fn clear_profile_arn_cooldown(&self, id: u64) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.profile_arn_cooldown = None;
+        }
     }
 
     /// 清除 profile_arn（例如已知固定占位 ARN 触发上游 403 后）。
@@ -1251,6 +1516,7 @@ impl MultiTokenManager {
                     let mut entries = self.entries.lock();
                     if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                         entry.credentials = new_creds.clone();
+                        entry.bump_credentials_version();
                     }
                 }
 
@@ -1897,6 +2163,7 @@ impl MultiTokenManager {
                         let mut entries = self.entries.lock();
                         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                             entry.credentials = new_creds.clone();
+                            entry.bump_credentials_version();
                         }
                     }
                     // 持久化失败只记录警告，不影响本次请求
@@ -2189,6 +2456,7 @@ impl MultiTokenManager {
                         } else {
                             entry.credentials = validated_cred;
                         }
+                        entry.bump_credentials_version();
                         entry.disabled = false;
                         entry.disabled_reason = None;
                         entry.failure_count = 0;
@@ -2249,6 +2517,9 @@ impl MultiTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 last_used_at: None,
+                credentials_version: 0,
+                profile_arn_cooldown: None,
+                profile_arn_resolving: false,
             });
         }
 
@@ -2341,6 +2612,12 @@ impl MultiTokenManager {
     /// 无条件调用上游 API 重新获取 access token，不检查是否过期。
     /// 适用于排查问题、Token 异常但未过期、主动更新凭据状态等场景。
     pub async fn force_refresh_token_for(&self, id: u64) -> anyhow::Result<()> {
+        // 既有缺陷（本 change 的 Non-Goal，仅留痕）：这里在取 refresh_lock **之前**
+        // 克隆凭据，因此在锁上排队的后续任务持有的是已被前一次刷新轮换掉的旧
+        // refreshToken，仍会拿它去请求上游。影响面是所有刷新路径（Admin 批量强刷等），
+        // 独立于 profileArn 问题，应作为单独 change 修正（正解是取锁后再读凭据）。
+        // `social-profile-arn-cooldown` 的并发去重只使其在 profileArn 解析路径上
+        // 不再被触发，未修这里本身。
         let credentials = {
             let entries = self.entries.lock();
             entries
@@ -2363,6 +2640,7 @@ impl MultiTokenManager {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                 entry.credentials = new_creds;
+                entry.bump_credentials_version();
                 entry.refresh_failure_count = 0;
             }
         }
@@ -2495,6 +2773,7 @@ impl MultiTokenManager {
                     let mut entries = self.entries.lock();
                     if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                         entry.credentials = new_creds.clone();
+                        entry.bump_credentials_version();
                     }
                 }
                 let _ = self.persist_credentials();
@@ -2571,6 +2850,7 @@ impl MultiTokenManager {
                         let mut entries = self.entries.lock();
                         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                             entry.credentials = new_creds.clone();
+                            entry.bump_credentials_version();
                         }
                     }
                     let _ = self.persist_credentials();
@@ -3879,4 +4159,323 @@ mod tests {
         assert_eq!(selected.0, 1);
     }
 
+    // ================================================================
+    // profileArn 解析冷却状态机（纯函数层）
+    // ================================================================
+
+    #[test]
+    fn test_is_cooling_no_arn_window() {
+        assert!(is_cooling(CooldownKind::NoArn, StdDuration::from_secs(0)));
+        assert!(is_cooling(
+            CooldownKind::NoArn,
+            StdDuration::from_secs(15 * 60 - 1)
+        ));
+        assert!(
+            !is_cooling(CooldownKind::NoArn, StdDuration::from_secs(901)),
+            "NoArn 超过 15 分钟应允许重新解析"
+        );
+    }
+
+    #[test]
+    fn test_is_cooling_transient_window() {
+        assert!(is_cooling(
+            CooldownKind::TransientFailure,
+            StdDuration::from_secs(29)
+        ));
+        assert!(
+            !is_cooling(
+                CooldownKind::TransientFailure,
+                StdDuration::from_secs(31)
+            ),
+            "瞬时故障超过 30 秒应允许重新解析"
+        );
+    }
+
+    #[test]
+    fn test_transient_window_is_much_shorter_than_no_arn() {
+        // spec：瞬时故障 MUST 使用明显短于「确认无可用 ARN」的窗口
+        assert!(TRANSIENT_FAILURE_COOLDOWN * 4 < NO_ARN_COOLDOWN);
+    }
+
+    #[test]
+    fn test_cooldown_block_version_mismatch_always_allows() {
+        let record = ProfileArnCooldown {
+            since: Instant::now(),
+            kind: CooldownKind::NoArn,
+            version: 7,
+        };
+        // 版本号不符时无论 elapsed 都不抑制
+        assert!(cooldown_block(&record, 8, StdDuration::from_secs(0)).is_none());
+        assert!(cooldown_block(&record, 8, StdDuration::from_secs(1)).is_none());
+        // 版本号相符且在窗口内才抑制
+        let (kind, remaining) = cooldown_block(&record, 7, StdDuration::from_secs(60))
+            .expect("同版本且在窗口内应命中冷却");
+        assert_eq!(kind, CooldownKind::NoArn);
+        assert_eq!(remaining, NO_ARN_COOLDOWN - StdDuration::from_secs(60));
+    }
+
+    #[test]
+    fn test_cooldown_block_no_record_equivalent_allows() {
+        // 无记录由调用方以 Option 表达；此处覆盖「有记录但已过期」
+        let record = ProfileArnCooldown {
+            since: Instant::now(),
+            kind: CooldownKind::TransientFailure,
+            version: 1,
+        };
+        assert!(cooldown_block(&record, 1, StdDuration::from_secs(31)).is_none());
+    }
+
+    // ================================================================
+    // 凭据版本号
+    // ================================================================
+
+    /// 逐处断言 6 个 `entry.credentials =` 赋值点都递增了版本号。
+    ///
+    /// 其中 5 处位于 `refresh_token` 的网络调用之后，无法在离线单测中触发；
+    /// 而漏改一处的后果（该路径的凭据变更不失效冷却）恰恰是目测最容易放过的。
+    /// 因此这里做源码级断言：数量必须恰好 6，且每处紧随其后 2 行内必须递增。
+    #[test]
+    fn test_every_credentials_assignment_bumps_version() {
+        // 拼接构造以免本测试的源码自身被扫描命中
+        let needle = concat!("entry.credentials", " = ");
+        let src = include_str!("token_manager.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let mut sites = 0usize;
+        for (idx, line) in lines.iter().enumerate() {
+            // 只认赋值语句本身（注释与文档不以其开头）
+            if !line.trim_start().starts_with(needle) {
+                continue;
+            }
+            sites += 1;
+            let followed = lines[idx + 1..]
+                .iter()
+                .take(2)
+                .any(|l| l.contains("bump_credentials_version()"));
+            assert!(
+                followed,
+                "第 {} 行的 entry.credentials 赋值未递增版本号: {}",
+                idx + 1,
+                line.trim()
+            );
+        }
+        assert_eq!(
+            sites, 6,
+            "赋值点数量与设计记录不符，需重新核对每一处是否递增版本号"
+        );
+    }
+
+    #[test]
+    fn test_new_entry_version_starts_at_zero() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(config, vec![sample_cred(1)], None, None, false)
+            .unwrap();
+        let id = manager.snapshot().entries[0].id;
+        assert_eq!(manager.credentials_version_of(id), Some(0));
+        assert_eq!(manager.credentials_version_of(9999), None);
+    }
+
+    /// 6 个赋值点共用的递增语义。
+    ///
+    /// 赋值点本身无法在离线单测中逐一触发：5 处紧随 `refresh_token` 的网络调用，
+    /// 第 6 处（upsert）也要求 OAuth 凭据先经网络刷新。因此「每处都递增」由上面的
+    /// 源码级断言保证，这里只锁定递增本身的行为。
+    #[test]
+    fn test_bump_credentials_version_increments() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(config, vec![sample_cred(1)], None, None, false)
+            .unwrap();
+        let id = manager.snapshot().entries[0].id;
+        for expected in 1..=3u64 {
+            {
+                let mut entries = manager.entries.lock();
+                entries
+                    .iter_mut()
+                    .find(|e| e.id == id)
+                    .unwrap()
+                    .bump_credentials_version();
+            }
+            assert_eq!(manager.credentials_version_of(id), Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_cooldown_state_not_persisted() {
+        // 冷却状态与版本号都不进 KiroCredentials，因此不会出现在持久化文件中
+        let config = Config::default();
+        let manager = MultiTokenManager::new(config, vec![sample_cred(1)], None, None, false)
+            .unwrap();
+        let id = manager.snapshot().entries[0].id;
+        manager.set_profile_arn_cooldown(id, CooldownKind::NoArn);
+
+        let cred = manager.credentials_clone(id).unwrap();
+        let json = serde_json::to_string(&cred).unwrap();
+        for field in [
+            "credentialsVersion",
+            "credentials_version",
+            "profileArnCooldown",
+            "profile_arn_cooldown",
+            "profileArnResolving",
+            "cooldown",
+        ] {
+            assert!(
+                !json.contains(field),
+                "持久化 JSON 不得包含冷却相关字段 {}，实际: {}",
+                field,
+                json
+            );
+        }
+
+        // 快照（Admin API）同样不暴露
+        let snapshot_json = serde_json::to_string(&manager.snapshot()).unwrap();
+        assert!(!snapshot_json.to_lowercase().contains("cooldown"));
+        assert!(!snapshot_json.to_lowercase().contains("version"));
+    }
+
+    // ================================================================
+    // 冷却与并发标记的存取
+    // ================================================================
+
+    fn cooldown_manager() -> (MultiTokenManager, u64) {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(config, vec![sample_cred(1)], None, None, false)
+            .unwrap();
+        let id = manager.snapshot().entries[0].id;
+        (manager, id)
+    }
+
+    #[test]
+    fn test_cooldown_write_read_clear() {
+        let (manager, id) = cooldown_manager();
+        assert!(manager.profile_arn_cooldown_state(id).is_none());
+
+        manager.set_profile_arn_cooldown(id, CooldownKind::NoArn);
+        let (kind, remaining) = manager.profile_arn_cooldown_state(id).expect("应有冷却记录");
+        assert_eq!(kind, CooldownKind::NoArn);
+        assert!(remaining <= NO_ARN_COOLDOWN);
+
+        manager.clear_profile_arn_cooldown(id);
+        assert!(manager.profile_arn_cooldown_state(id).is_none());
+    }
+
+    #[test]
+    fn test_cooldown_expires_after_window() {
+        let (manager, id) = cooldown_manager();
+        manager.set_profile_arn_cooldown(id, CooldownKind::TransientFailure);
+        manager.test_age_profile_arn_cooldown(id, StdDuration::from_secs(31));
+        assert!(
+            manager.profile_arn_cooldown_state(id).is_none(),
+            "瞬时故障窗口到期后应允许重新解析"
+        );
+        assert!(matches!(
+            manager.try_begin_profile_arn_resolve(id),
+            ProfileArnResolveAttempt::Granted(_)
+        ));
+    }
+
+    #[test]
+    fn test_cooldown_missing_entry_is_silent() {
+        let (manager, _id) = cooldown_manager();
+        // 凭据在解析期间被删除：写/清冷却都不得 panic
+        manager.set_profile_arn_cooldown(4242, CooldownKind::NoArn);
+        manager.clear_profile_arn_cooldown(4242);
+        assert!(manager.profile_arn_cooldown_state(4242).is_none());
+        // 无 entry 时仍授予资格（按引入冷却前的行为解析）
+        assert!(matches!(
+            manager.try_begin_profile_arn_resolve(4242),
+            ProfileArnResolveAttempt::Granted(None)
+        ));
+    }
+
+    #[test]
+    fn test_try_begin_resolve_is_exclusive() {
+        let (manager, id) = cooldown_manager();
+        let first = manager.try_begin_profile_arn_resolve(id);
+        assert!(matches!(first, ProfileArnResolveAttempt::Granted(Some(_))));
+        assert!(manager.test_profile_arn_resolving(id));
+
+        assert!(
+            matches!(
+                manager.try_begin_profile_arn_resolve(id),
+                ProfileArnResolveAttempt::AlreadyResolving
+            ),
+            "第二次调用不得取得解析资格"
+        );
+
+        drop(first);
+        assert!(!manager.test_profile_arn_resolving(id));
+        assert!(matches!(
+            manager.try_begin_profile_arn_resolve(id),
+            ProfileArnResolveAttempt::Granted(Some(_))
+        ));
+    }
+
+    #[test]
+    fn test_try_begin_resolve_reports_cooling() {
+        let (manager, id) = cooldown_manager();
+        manager.set_profile_arn_cooldown(id, CooldownKind::NoArn);
+        match manager.try_begin_profile_arn_resolve(id) {
+            ProfileArnResolveAttempt::Cooling { kind, remaining } => {
+                assert_eq!(kind, CooldownKind::NoArn);
+                assert!(remaining > StdDuration::from_secs(0));
+            }
+            _ => panic!("命中冷却时不得取得解析资格"),
+        }
+        assert!(
+            !manager.test_profile_arn_resolving(id),
+            "冷却命中不得抢占进行中标记"
+        );
+    }
+
+    #[test]
+    fn test_resolve_guard_cleared_on_error_return() {
+        let (manager, id) = cooldown_manager();
+        fn failing(manager: &MultiTokenManager, id: u64) -> anyhow::Result<()> {
+            let _guard = match manager.try_begin_profile_arn_resolve(id) {
+                ProfileArnResolveAttempt::Granted(g) => g,
+                _ => panic!("应取得资格"),
+            };
+            anyhow::bail!("模拟解析失败");
+        }
+        assert!(failing(&manager, id).is_err());
+        assert!(
+            !manager.test_profile_arn_resolving(id),
+            "错误返回后进行中标记必须已清除"
+        );
+    }
+
+    #[test]
+    fn test_resolve_guard_cleared_on_panic() {
+        let (manager, id) = cooldown_manager();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = match manager.try_begin_profile_arn_resolve(id) {
+                ProfileArnResolveAttempt::Granted(g) => g,
+                _ => panic!("应取得资格"),
+            };
+            panic!("模拟解析 panic");
+        }));
+        assert!(result.is_err());
+        assert!(
+            !manager.test_profile_arn_resolving(id),
+            "unwind 后进行中标记必须已清除，否则该凭据永久不再解析 ARN"
+        );
+    }
+
+    #[test]
+    fn test_credentials_change_invalidates_cooldown() {
+        let (manager, id) = cooldown_manager();
+        manager.set_profile_arn_cooldown(id, CooldownKind::NoArn);
+        assert!(manager.profile_arn_cooldown_state(id).is_some());
+
+        // 模拟任一凭据写入路径（重新导入 / upsert / 过期刷新 / Admin 手动强刷）
+        {
+            let mut entries = manager.entries.lock();
+            let entry = entries.iter_mut().find(|e| e.id == id).unwrap();
+            entry.bump_credentials_version();
+        }
+
+        assert!(
+            manager.profile_arn_cooldown_state(id).is_none(),
+            "凭据变更后冷却必须自动失效，无需显式清除逻辑"
+        );
+    }
 }

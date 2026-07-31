@@ -1,10 +1,4 @@
-# Capability: profile-arn-resolution
-
-## Purpose
-
-Resolve and cache Kiro `profileArn` before upstream generateAssistantResponse / MCP / usage-limits requests when a **trusted** ARN is available, so credentials without a pre-stored ARN can still chat. Known IDE/short-circuit **placeholder** ARNs MUST NOT be treated as successful resolution or unconditionally persisted, because upstream often rejects them with `User is not authorized` while the same token succeeds without profileArn.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: 请求前必须解析 profileArn
 
@@ -73,27 +67,7 @@ Suppression MUST NOT alter what the current request returns when resolution fail
 - AND 刷新成功但仍无可信 ARN 时返回 soft-unavailable
 - AND 刷新失败时 MUST 保留同时包含 list 与 refresh 两处失败原因的错误信息
 
-### Requirement: profileArn 解析决策必须可在离线条件下验证
-
-The profile ARN resolution decision — which of cache hit, list result, account-type soft-unavailable, refresh fallback, or hard failure applies — MUST be expressible and testable without performing network I/O.
-
-Embedding the ListAvailableProfiles HTTP call inline in the resolution function makes the decision order unassertable in tests: a change that reorders or removes a branch cannot be caught by any offline test. The decision MUST therefore be separable from its side effects, with the list stage's outcome supplied as data.
-
-Public resolution entry points MUST keep their existing signatures so that call sites are unaffected.
-
-#### Scenario: 决策与副作用分离
-
-- WHEN 实现 profileArn 解析
-- THEN list 阶段的结果 MUST 可作为数据（成功并带 ARN / 空列表 / 占位 / 失败）传入决策逻辑
-- AND 决策逻辑 MUST 可在无网络访问、无真实凭据的条件下被单元测试直接断言
-- AND `resolve_profile_arn` 与 `ensure_profile_arn_for_request` 的公开签名 MUST 保持不变
-
-#### Scenario: 账号类型与 list 结果的组合可断言
-
-- GIVEN 一组凭据形态（api_key / 不支持 profile / IdC / BuilderId / Social）与一组 list 结果（带可信 ARN / 空 / 占位 / 失败）
-- WHEN 对其组合执行决策逻辑
-- THEN 每个组合 MUST 产出确定且可断言的动作（使用该 ARN / 不支持 / soft-unavailable / 强刷 / 失败）
-- AND 「IdC × list 未得可信 ARN」的全部组合 MUST 断言为 soft-unavailable 而非强刷
+## ADDED Requirements
 
 ### Requirement: profileArn 解析失败必须在冷却窗口内被抑制
 
@@ -248,49 +222,3 @@ Today the resolution module emits no log lines at all, so an operator sees only 
 
 - WHEN ListAvailableProfiles 失败、返回空列表或仅返回占位 ARN
 - THEN MUST 记录一条包含凭据 id 与该阶段结果的日志，使冷却不掩盖持续失败
-
-### Requirement: usage limits 与对话共享解析语义
-
-getUsageLimits MUST attempt the same resolve path before attaching profileArn query when the credential supports profiles.
-
-#### Scenario: 导入后查余额
-
-- GIVEN 新导入支持型凭据尚无 profileArn 缓存
-- WHEN 查询 usage/balance
-- THEN 系统先 resolve；成功则 query 带 profileArn；Unsupported 类型或仅有占位/无可信 ARN 时允许不带 profileArn 继续
-
-### Requirement: 错误分类不得误杀 refreshToken
-
-When upstream returns bearer-token-invalid and the request lacked a resolved profileArn, the system MUST attempt profile resolution and retry before treating the refresh token as permanently invalid.
-
-#### Scenario: 缺 profile 导致 403
-
-- GIVEN 当前 access token 有效但请求未带 profileArn 且上游返回 bearer invalid
-- WHEN provider 处理错误
-- THEN 先 resolve profileArn 并重试；仅在已有可信 profile 或 resolve 后仍失败时按既有 auth 失败策略处理，且不得仅因该 403 标记 InvalidRefreshToken
-
-### Requirement: 坏 profileArn 导致未授权时必须可恢复
-
-When ListAvailableModels or generate returns 403 / `User is not authorized` for a request that included a profileArn (including known placeholders), the system MUST clear or skip that ARN and retry without it at least once before treating the credential as permanently unauthorized solely for that reason.
-
-#### Scenario: ListAvailableModels 去 ARN 重试
-
-- GIVEN 请求带 profileArn 且上游对该 ARN 返回 403 unauthorized，但对无 ARN 返回 200
-- WHEN 模型目录刷新执行
-- THEN 系统无 ARN 重试成功；SHOULD 清除本地坏/占位 profileArn
-
-#### Scenario: generate/test 去 ARN 重试
-
-- GIVEN 请求体注入了 profileArn 且上游返回 User is not authorized
-- WHEN provider 或 Admin test generate 处理错误
-- THEN 清除该 profileArn 后重试；在账号健康时 test /v1/messages 可成功
-
-### Requirement: provider 元数据可持久化
-
-Credentials MUST support an optional provider field used by supports_profiles and related decisions, persisted in multi-credential JSON.
-
-#### Scenario: 序列化 roundtrip
-
-- GIVEN 凭据含 provider=BuilderId
-- WHEN 写入再加载 credentials 文件
-- THEN provider 保持不变；若 profileArn 为已知占位值则不得再被当作可信缓存强制注入
