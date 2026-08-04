@@ -2251,6 +2251,7 @@ impl MultiTokenManager {
 
 
     /// 添加凭据（Admin API）— 默认 onConflict=reject，兼容现网
+    #[cfg(test)]
     pub async fn add_credential(&self, new_cred: KiroCredentials) -> anyhow::Result<u64> {
         Ok(self
             .ingest_credential(new_cred, IngestOptions::default())

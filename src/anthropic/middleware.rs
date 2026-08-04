@@ -56,17 +56,12 @@ impl AppState {
         self
     }
 
-    /// 设置 KiroProvider
-    pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
-        self.kiro_provider = Some(Arc::new(provider));
-        self
-    }
-
     pub fn with_kiro_provider_arc(mut self, provider: Arc<KiroProvider>) -> Self {
         self.kiro_provider = Some(provider);
         self
     }
 
+    #[cfg(test)]
     pub fn set_auth(&self, require_api_key: bool, api_key: Option<String>) {
         let mut auth = self.auth.write();
         auth.require_api_key = require_api_key;
@@ -75,6 +70,7 @@ impl AppState {
         }
     }
 
+    #[cfg(test)]
     pub fn auth_snapshot(&self) -> AuthRuntime {
         self.auth.read().clone()
     }

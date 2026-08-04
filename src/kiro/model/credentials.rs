@@ -268,15 +268,6 @@ pub struct LoadedCredentials {
 }
 
 impl CredentialsConfig {
-    /// 从文件加载凭据配置
-    ///
-    /// - 如果文件不存在，返回空数组
-    /// - 如果文件内容为空，返回空数组
-    /// - 支持单对象或数组格式
-    pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
-        Ok(Self::load_detailed(path)?.config)
-    }
-
     /// 从文件加载，并区分原生格式与导入工具容器格式
     ///
     /// 判别用 `serde_json::Value` 结构化进行，不依赖 `#[serde(untagged)]`：

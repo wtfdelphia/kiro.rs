@@ -10,6 +10,9 @@ pub enum EndpointStatus {
     /// 已挂载可用
     Live,
     /// 已挂载但契约可能变化
+    // 保留原因：openspec/specs/public-api-catalog/spec.md:39 要求条目 status 必须可声明为 `beta`；
+    // `as_str` 的 `"beta"` 分支用于 DTO 序列化（public_api/dto.rs），删除该 variant 会收窄已发布契约。
+    #[allow(dead_code)]
     Beta,
     /// 已登记但未挂载，请求返回 404
     Planned,

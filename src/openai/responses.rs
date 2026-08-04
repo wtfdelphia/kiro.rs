@@ -390,11 +390,6 @@ mod tests {
         to_chat_request_json(&req(body)).expect("归一失败").0
     }
 
-    /// 归一结果 + 响应侧还原映射
-    fn chat_with_rewrite(body: &str) -> (Value, ToolRewriteMap) {
-        to_chat_request_json(&req(body)).expect("归一失败")
-    }
-
     fn tools_of(body: &str) -> Vec<Value> {
         chat(body)["tools"].as_array().cloned().unwrap_or_default()
     }

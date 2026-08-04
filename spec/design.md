@@ -37,6 +37,7 @@
 ## 构建与测试策略
 
 - 后端：`cargo test` / `cargo build --release`（release 前需 admin-ui build 以嵌入静态资源，见 README）
+- 告警门禁：`cargo check --release --all-targets` 必须无新增告警。项目只有 binary target（无 `src/lib.rs`），`pub` 不构成对外 API 豁免理由，所有 `pub` 项都需 crate 内实际调用点
 - 前端：`cd admin-ui && pnpm install && pnpm build`
 - Docker：docker-compose / Dockerfile / CI workflows
 - AI 变更：OpenSpec validate + 对应高风险验证矩阵（见 `AGENTS.md`）

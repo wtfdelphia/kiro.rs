@@ -24,6 +24,18 @@
 
 一句话：不确定就先澄清；能简单就不抽象；非本任务不改；没有证据不说完成。
 
+## 零新增编译告警（硬性）
+
+任何代码实现都不得引入新的编译告警，**与是否走 OpenSpec 流程无关**——包括下方「可豁免」的拼写/注释/单行修复。
+
+- 判定命令：`cargo check --release --all-targets`（本项目唯一准绳；`cargo build --release` 漏测试目标告警，门槛更松）
+- 消除手段限于修正真实问题：移动导入、删除死代码、把测试专用符号收敛到 `#[cfg(test)]`
+- 禁止 crate/module 级 `#![allow(dead_code)]`；禁止为消除告警构造假数据
+- 确有正当保留理由时，用最小范围 `#[allow(...)]` 并在紧邻位置注明理由
+- 提交前若告警数高于变更基线，视为未完成
+
+背景与首轮清零方案见 `docs/release-build-warnings-cleanup-design.md`。
+
 ## OpenSpec 条件
 
 以下必须先建立 OpenSpec change：
@@ -76,11 +88,13 @@ OpenSpec 官方 init 已提供：`openspec-propose`、`openspec-apply-change`、
 | Docker / 发布 | Dockerfile、compose、workflows 审查 |
 | admin-ui | `pnpm build`（及已有测试） |
 | OpenSpec | `openspec validate --all` |
+| 任意代码改动 | `cargo check --release --all-targets` 无新增告警 |
 
 ## 验证纪律
 
 - 只报告本会话真实运行过的命令与结果
 - 未运行必须写原因与剩余风险
+- 代码改动必须报告 `cargo check --release --all-targets` 的告警数，并确认无新增
 - 不隐藏失败
 - 不粘贴真实 token、账号、Cookie
 - 完成前 `git status --short`，防止密钥与 `.codegraph/` 误入

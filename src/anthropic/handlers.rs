@@ -22,7 +22,7 @@ use tokio::time::interval;
 use uuid::Uuid;
 
 use super::converter::{
-    ConversionError, THINKING_SUFFIX, convert_request_with_policy, map_model, resolve_model,
+    ConversionError, THINKING_SUFFIX, convert_request_with_policy, resolve_model,
 };
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
@@ -1162,6 +1162,7 @@ fn create_buffered_sse_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::converter::map_model;
     use crate::kiro::model::available_models::{TokenLimits, UpstreamModelInfo};
 
     #[test]

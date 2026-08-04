@@ -108,11 +108,6 @@ pub struct AdaptedDocument {
 }
 
 impl AdaptedDocument {
-    /// 仅取成功的凭据
-    pub fn credentials(&self) -> Vec<KiroCredentials> {
-        self.records.iter().filter_map(|r| r.as_ref().ok()).cloned().collect()
-    }
-
     /// 是否存在失败记录
     pub fn has_failures(&self) -> bool {
         self.records.iter().any(|r| r.is_err())

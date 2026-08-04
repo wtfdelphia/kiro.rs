@@ -19,21 +19,6 @@ use super::{
 /// 请求体最大大小限制 (50MB)
 pub(crate) const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 
-/// 创建带有 KiroProvider 的 Anthropic API 路由
-pub fn create_router_with_provider(
-    api_key: impl Into<String>,
-    kiro_provider: Option<KiroProvider>,
-    extract_thinking: bool,
-) -> Router {
-    create_router_with_provider_and_auth(
-        api_key,
-        kiro_provider.map(Arc::new),
-        extract_thinking,
-        true,
-    )
-    .0
-}
-
 /// 创建路由并返回 AppState（供 Admin 热更新鉴权）
 pub fn create_router_with_provider_and_auth(
     api_key: impl Into<String>,

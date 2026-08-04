@@ -130,10 +130,6 @@ impl KiroProvider {
         v
     }
 
-    pub fn default_endpoint(&self) -> String {
-        self.default_endpoint.lock().clone()
-    }
-
     /// 共享 TokenManager（供 get_models 等读 catalog）
     pub fn token_manager(&self) -> &Arc<MultiTokenManager> {
         &self.token_manager

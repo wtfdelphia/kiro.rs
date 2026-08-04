@@ -36,3 +36,4 @@ kiro-rs 是用 Rust 编写的 Anthropic Claude API 兼容代理服务，将 Anth
 
 - 高风险变更（协议、凭据、认证、Admin、模型映射、Docker/发布）必须可规格化、可验证、可审计
 - AI 辅助开发必须遵循 `AGENTS.md` 与 OpenSpec 门禁
+- 任何代码实现不得引入新的编译告警，与是否走 OpenSpec 流程无关；判定命令为 `cargo check --release --all-targets`（细则见 `AGENTS.md`「零新增编译告警」）

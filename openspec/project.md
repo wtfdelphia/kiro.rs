@@ -23,11 +23,13 @@ kiro-rs：Rust/Axum 实现的 Anthropic Claude API 兼容代理，转发并转�
 - 不提交真实凭据与本地 config
 - 高风险变更必须走 OpenSpec change
 - 实现前输出 Bridge Plan；完成前真实验证
+- 任何代码实现不得引入新的编译告警，与是否走 OpenSpec 流程无关
 - 详情见仓库根目录 `AGENTS.md`
 
 ## 常用验证
 
 - `openspec validate --all`
 - `cargo test`
+- `cargo check --release --all-targets`（告警门禁，须无新增）
 - `codegraph status` / `codegraph impact "<symbol>"`
 - `rg` 补盲配置/Docker/脚本

@@ -49,6 +49,7 @@ pub struct AdminService {
 }
 
 impl AdminService {
+    #[cfg(test)]
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
         known_endpoints: impl IntoIterator<Item = String>,

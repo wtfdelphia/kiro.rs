@@ -1204,7 +1204,7 @@ async fn handle_responses_stream(
 
 fn create_responses_sse_stream(
     response: reqwest::Response,
-    mut ctx: ResponsesStreamContext,
+    ctx: ResponsesStreamContext,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发 created + in_progress
     let initial: Vec<Result<Bytes, Infallible>> = ctx

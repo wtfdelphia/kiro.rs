@@ -224,6 +224,7 @@ pub fn map_model(model: &str) -> Option<String> {
 }
 
 /// 默认解析策略（缺省 config 时）
+#[cfg(test)]
 pub fn default_resolution_policy() -> ModelResolutionConfig {
     ModelResolutionConfig::default()
 }
@@ -463,6 +464,7 @@ fn create_placeholder_tool(name: &str) -> Tool {
 }
 
 /// 将 Anthropic 请求转换为 Kiro 请求
+#[cfg(test)]
 pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
     convert_request_with_policy(req, &default_resolution_policy(), None)
 }
