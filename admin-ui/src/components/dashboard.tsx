@@ -1,25 +1,37 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, KeyRound, Boxes, Settings, Plug, Wallet, Timer } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { Switch } from '@/components/ui/switch'
+import { Select } from '@/components/ui/select'
+import { Input } from '@/components/ui/input'
 import { CredentialCard } from '@/components/credential-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
+import { OnlineAuthDialog } from '@/components/online-auth-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
-import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
+import { getCredentialBalance, forceRefreshToken, refreshAllModels } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
-import type { BalanceResponse } from '@/types/api'
+import type { BalanceResponse, ModelsRefreshAllResponse } from '@/types/api'
+import { ModelsRefreshResultDialog } from '@/components/models-refresh-result-dialog'
+import { SettingsPanel } from '@/components/settings-panel'
+import { PublicApiPanel } from '@/components/public-api-panel'
 
 interface DashboardProps {
   onLogout: () => void
 }
+
+// 定时刷新间隔（秒）。后端余额缓存 TTL 固定 300s，故每轮必须带 force 才能取到新数据
+const AUTO_REFRESH_DEFAULT_SECS = 120
+const AUTO_REFRESH_MIN_SECS = 10
+const AUTO_REFRESH_PRESETS = [30, 60, 120, 180, 300]
 
 export function Dashboard({ onLogout }: DashboardProps) {
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
@@ -27,6 +39,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
+  const [onlineAuthDialogOpen, setOnlineAuthDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
@@ -36,8 +49,18 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [loadingBalanceIds, setLoadingBalanceIds] = useState<Set<number>>(new Set())
   const [queryingInfo, setQueryingInfo] = useState(false)
   const [queryInfoProgress, setQueryInfoProgress] = useState({ current: 0, total: 0 })
+  // 定时批量余额刷新：默认关闭（每轮对当前页每个启用凭据打一次上游）
+  const [autoRefreshEnabled, setAutoRefreshEnabled] = useState(false)
+  const [autoRefreshInterval, setAutoRefreshInterval] = useState(AUTO_REFRESH_DEFAULT_SECS)
+  const [autoRefreshInput, setAutoRefreshInput] = useState(String(AUTO_REFRESH_DEFAULT_SECS))
+  const autoRefreshRunningRef = useRef(false)
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
+  const [refreshingAllModels, setRefreshingAllModels] = useState(false)
+  const [modelsRefreshResultOpen, setModelsRefreshResultOpen] = useState(false)
+  const [modelsRefreshResult, setModelsRefreshResult] = useState<ModelsRefreshAllResponse | null>(null)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [publicApiOpen, setPublicApiOpen] = useState(false)
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
@@ -113,6 +136,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const handleViewBalance = (id: number) => {
     setSelectedCredentialId(id)
     setBalanceDialogOpen(true)
+  }
+
+  // 余额数据的唯一写入口：单卡刷新、批量查询、定时刷新都汇聚到这里
+  const applyBalance = (id: number, balance: BalanceResponse) => {
+    setBalanceMap(prev => {
+      const next = new Map(prev)
+      next.set(id, balance)
+      return next
+    })
   }
 
   const handleRefresh = () => {
@@ -374,12 +406,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       try {
         const balance = await getCredentialBalance(id)
         successCount++
-
-        setBalanceMap(prev => {
-          const next = new Map(prev)
-          next.set(id, balance)
-          return next
-        })
+        applyBalance(id, balance)
       } catch (error) {
         failCount++
       } finally {
@@ -400,6 +427,77 @@ export function Dashboard({ onLogout }: DashboardProps) {
     } else {
       toast.warning(`查询完成：成功 ${successCount} 个，失败 ${failCount} 个`)
     }
+  }
+
+  // 定时刷新一轮：当前页启用凭据逐个 force 刷新，静默成功、失败轮末汇总
+  const runAutoRefresh = async () => {
+    // 防重入：上一轮未跑完就跳过本轮，不排队堆叠
+    if (autoRefreshRunningRef.current) return
+    // 手动批量操作优先，避免与其争抢上游
+    if (queryingInfo || verifying || batchRefreshing) return
+
+    const ids = currentCredentials
+      .filter(credential => !credential.disabled)
+      .map(credential => credential.id)
+
+    // 无启用凭据时静默跳过（周期性错误提示无操作价值）
+    if (ids.length === 0) return
+
+    autoRefreshRunningRef.current = true
+    let failCount = 0
+
+    try {
+      for (const id of ids) {
+        setLoadingBalanceIds(prev => {
+          const next = new Set(prev)
+          next.add(id)
+          return next
+        })
+
+        try {
+          const balance = await getCredentialBalance(id, true)
+          applyBalance(id, balance)
+        } catch {
+          failCount++
+        } finally {
+          setLoadingBalanceIds(prev => {
+            const next = new Set(prev)
+            next.delete(id)
+            return next
+          })
+        }
+      }
+    } finally {
+      autoRefreshRunningRef.current = false
+    }
+
+    if (failCount > 0) {
+      toast.warning(`定时刷新：${failCount}/${ids.length} 个凭据失败`)
+    }
+  }
+
+  // 执行体经 ref 持有最新闭包，使 timer 的依赖只有开关与间隔，
+  // 避免把 currentCredentials 放进依赖导致每次 render 重建 interval
+  const autoRefreshTaskRef = useRef(runAutoRefresh)
+  autoRefreshTaskRef.current = runAutoRefresh
+
+  useEffect(() => {
+    if (!autoRefreshEnabled) return
+    const timer = setInterval(() => {
+      void autoRefreshTaskRef.current()
+    }, autoRefreshInterval * 1000)
+    return () => clearInterval(timer)
+  }, [autoRefreshEnabled, autoRefreshInterval])
+
+  // 手动输入间隔：正整数且不低于下界，非法值保留原值
+  const commitAutoRefreshInput = () => {
+    const parsed = Number(autoRefreshInput)
+    if (!Number.isInteger(parsed) || parsed < AUTO_REFRESH_MIN_SECS) {
+      toast.error(`间隔需为不小于 ${AUTO_REFRESH_MIN_SECS} 的整数秒`)
+      setAutoRefreshInput(String(autoRefreshInterval))
+      return
+    }
+    setAutoRefreshInterval(parsed)
   }
 
   // 批量验活
@@ -443,7 +541,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
       })
 
       try {
-        const balance = await getCredentialBalance(id)
+        // 验活必须跳过 TTL 缓存：命中缓存会把窗口内已失效的凭据报成 success
+        const balance = await getCredentialBalance(id, true)
         successCount++
 
         // 更新为成功状态
@@ -489,6 +588,27 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const handleCancelVerify = () => {
     cancelVerifyRef.current = true
     setVerifying(false)
+  }
+
+  // 刷新全部模型目录
+  const handleRefreshAllModels = async () => {
+    if (refreshingAllModels) return
+    setRefreshingAllModels(true)
+    try {
+      const result = await refreshAllModels()
+      setModelsRefreshResult(result)
+      const summary = `刷新完成：成功 ${result.refreshed}，失败 ${result.failed}，全局 ${result.globalCount} 个模型`
+      if (result.failed > 0) {
+        toast.warning(summary)
+        setModelsRefreshResultOpen(true)
+      } else {
+        toast.success(summary)
+      }
+    } catch (error) {
+      toast.error(`刷新全部模型失败: ${extractErrorMessage(error)}`)
+    } finally {
+      setRefreshingAllModels(false)
+    }
   }
 
   // 切换负载均衡模式
@@ -559,6 +679,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </Button>
             <Button variant="ghost" size="icon" onClick={handleRefresh}>
               <RefreshCw className="h-5 w-5" />
+            </Button>
+            <Button variant="ghost" size="icon" onClick={() => setPublicApiOpen(true)} title="对外 API 端点">
+              <Plug className="h-5 w-5" />
+            </Button>
+            <Button variant="ghost" size="icon" onClick={() => setSettingsOpen(true)} title="运行时设置">
+              <Settings className="h-5 w-5" />
             </Button>
             <Button variant="ghost" size="icon" onClick={handleLogout}>
               <LogOut className="h-5 w-5" />
@@ -664,10 +790,47 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   size="sm"
                   variant="outline"
                   disabled={queryingInfo}
+                  title="查询当前页启用凭据的余额/订阅，可能返回最近 5 分钟内的缓存结果；需要最新数据请用单卡「刷新余额」或开启定时刷新"
                 >
-                  <RefreshCw className={`h-4 w-4 mr-2 ${queryingInfo ? 'animate-spin' : ''}`} />
-                  {queryingInfo ? `查询中... ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询信息'}
+                  <Wallet className={`h-4 w-4 mr-2 ${queryingInfo ? 'animate-spin' : ''}`} />
+                  {queryingInfo ? `查询中... ${queryInfoProgress.current}/${queryInfoProgress.total}` : '批量余额/订阅'}
                 </Button>
+              )}
+              {data?.credentials && data.credentials.length > 0 && (
+                <div
+                  className="flex items-center gap-1.5 rounded-md border px-2 py-1"
+                  title="每隔指定秒数强制刷新当前页启用凭据的余额（跳过缓存）。每轮对每个凭据发起一次上游请求，默认关闭"
+                >
+                  <Timer className="h-4 w-4 text-muted-foreground shrink-0" />
+                  <span className="text-sm whitespace-nowrap">定时刷新</span>
+                  <Switch
+                    checked={autoRefreshEnabled}
+                    onCheckedChange={setAutoRefreshEnabled}
+                  />
+                  <Select
+                    value={String(autoRefreshInterval)}
+                    onValueChange={(value) => {
+                      setAutoRefreshInterval(Number(value))
+                      setAutoRefreshInput(value)
+                    }}
+                    options={AUTO_REFRESH_PRESETS.map(secs => ({
+                      value: String(secs),
+                      label: `${secs}s`,
+                    }))}
+                    triggerClassName="h-7 w-20 px-2 text-sm"
+                  />
+                  <Input
+                    className="h-7 w-16 text-sm"
+                    value={autoRefreshInput}
+                    onChange={(e) => setAutoRefreshInput(e.target.value)}
+                    onBlur={commitAutoRefreshInput}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') commitAutoRefreshInput()
+                    }}
+                    aria-label="自定义刷新间隔（秒）"
+                    title={`自定义间隔，单位秒，不小于 ${AUTO_REFRESH_MIN_SECS}`}
+                  />
+                </div>
               )}
               {data?.credentials && data.credentials.length > 0 && (
                 <Button
@@ -682,6 +845,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   清除已禁用
                 </Button>
               )}
+              <Button
+                onClick={handleRefreshAllModels}
+                size="sm"
+                variant="outline"
+                disabled={refreshingAllModels || !data?.credentials?.length}
+                title="刷新全部启用凭据的上游模型目录"
+              >
+                <Boxes className={`h-4 w-4 mr-2 ${refreshingAllModels ? 'animate-spin' : ''}`} />
+                {refreshingAllModels ? '刷新模型中...' : '刷新全部模型'}
+              </Button>
               <Button onClick={() => setKamImportDialogOpen(true)} size="sm" variant="outline">
                 <FileUp className="h-4 w-4 mr-2" />
                 Kiro Account Manager 导入
@@ -689,6 +862,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
               <Button onClick={() => setBatchImportDialogOpen(true)} size="sm" variant="outline">
                 <Upload className="h-4 w-4 mr-2" />
                 批量导入
+              </Button>
+              <Button onClick={() => setOnlineAuthDialogOpen(true)} size="sm" variant="outline">
+                <KeyRound className="h-4 w-4 mr-2" />
+                在线授权
               </Button>
               <Button onClick={() => setAddDialogOpen(true)} size="sm">
                 <Plus className="h-4 w-4 mr-2" />
@@ -704,7 +881,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </Card>
           ) : (
             <>
-              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 [&>*]:min-w-0">
                 {currentCredentials.map((credential) => (
                   <CredentialCard
                     key={credential.id}
@@ -714,6 +891,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     onToggleSelect={() => toggleSelect(credential.id)}
                     balance={balanceMap.get(credential.id) || null}
                     loadingBalance={loadingBalanceIds.has(credential.id)}
+                    onBalanceRefreshed={applyBalance}
                   />
                 ))}
               </div>
@@ -772,6 +950,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
         onOpenChange={setKamImportDialogOpen}
       />
 
+      <OnlineAuthDialog
+        open={onlineAuthDialogOpen}
+        onOpenChange={setOnlineAuthDialogOpen}
+      />
+
       {/* 批量验活对话框 */}
       <BatchVerifyDialog
         open={verifyDialogOpen}
@@ -781,6 +964,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
         results={verifyResults}
         onCancel={handleCancelVerify}
       />
+
+      <ModelsRefreshResultDialog
+        open={modelsRefreshResultOpen}
+        onOpenChange={setModelsRefreshResultOpen}
+        result={modelsRefreshResult}
+      />
+
+      <SettingsPanel open={settingsOpen} onOpenChange={setSettingsOpen} />
+      <PublicApiPanel open={publicApiOpen} onOpenChange={setPublicApiOpen} />
     </div>
   )
 }

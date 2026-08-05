@@ -15,6 +15,7 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::profile;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
@@ -32,17 +33,17 @@ const MAX_TOTAL_RETRIES: usize = 9;
 /// 按凭据 `endpoint` 字段选择 [`KiroEndpoint`] 实现
 pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
-    /// 全局代理配置（用于凭据无自定义代理时的回退）
-    global_proxy: Option<ProxyConfig>,
-    /// Client 缓存：key = effective proxy config, value = reqwest::Client
+    /// 全局代理配置（用于凭据无自定义代理时的回退，可热更新）
+    global_proxy: Mutex<Option<ProxyConfig>>,
+    /// Client 缓存：key = effective proxy config: &config, value = reqwest::Client
     /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client
     client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
     /// 端点实现注册表（key: endpoint 名称）
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
-    /// 默认端点名称（凭据未指定 endpoint 时使用）
-    default_endpoint: String,
+    /// 默认端点名称（凭据未指定 endpoint 时使用，可热更新）
+    default_endpoint: Mutex<String>,
 }
 
 impl KiroProvider {
@@ -73,17 +74,17 @@ impl KiroProvider {
 
         Self {
             token_manager,
-            global_proxy: proxy,
+            global_proxy: Mutex::new(proxy),
             client_cache: Mutex::new(cache),
             tls_backend,
             endpoints,
-            default_endpoint,
+            default_endpoint: Mutex::new(default_endpoint),
         }
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
-        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+        let effective = credentials.effective_proxy(self.global_proxy.lock().as_ref());
         let mut cache = self.client_cache.lock();
         if let Some(client) = cache.get(&effective) {
             return Ok(client.clone());
@@ -98,14 +99,40 @@ impl KiroProvider {
         &self,
         credentials: &KiroCredentials,
     ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
+        let default_name = self.default_endpoint.lock().clone();
         let name = credentials
             .endpoint
             .as_deref()
-            .unwrap_or(&self.default_endpoint);
+            .unwrap_or(default_name.as_str());
         self.endpoints
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
+    }
+
+    /// 热更新全局代理（后续新 client 生效）
+    pub fn set_global_proxy(&self, proxy: Option<ProxyConfig>) {
+        *self.global_proxy.lock() = proxy;
+    }
+
+    /// 热更新默认端点（必须已在注册表中）
+    pub fn set_default_endpoint(&self, name: String) -> anyhow::Result<()> {
+        if !self.endpoints.contains_key(&name) {
+            anyhow::bail!("未知端点: {}", name);
+        }
+        *self.default_endpoint.lock() = name;
+        Ok(())
+    }
+
+    pub fn registered_endpoints(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.endpoints.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// 共享 TokenManager（供 get_models 等读 catalog）
+    pub fn token_manager(&self) -> &Arc<MultiTokenManager> {
+        &self.token_manager
     }
 
     /// 发送非流式 API 请求
@@ -131,10 +158,11 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut profile_arn_stripped: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
+            let mut ctx = match self.token_manager.acquire_context(None).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -142,8 +170,20 @@ impl KiroProvider {
                 }
             };
 
+            // Resolve profileArn before MCP (best-effort; unsupported is ok)
+            if let Err(e) = profile::ensure_profile_arn_for_request(
+                &self.token_manager,
+                ctx.id,
+                &mut ctx.credentials,
+                &ctx.token,
+            )
+            .await
+            {
+                tracing::warn!("凭据 #{} profileArn 解析失败（MCP 继续）: {}", ctx.id, e);
+            }
+
             let config = self.token_manager.config();
-            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
+            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
 
             let endpoint = match self.endpoint_for(&ctx.credentials) {
                 Ok(e) => e,
@@ -159,7 +199,7 @@ impl KiroProvider {
                 credentials: &ctx.credentials,
                 token: &ctx.token,
                 machine_id: &machine_id,
-                config,
+                config: &config,
             };
 
             let url = endpoint.mcp_url(&rctx);
@@ -218,9 +258,53 @@ impl KiroProvider {
 
             // 401/403 凭据问题
             if matches!(status.as_u16(), 401 | 403) {
-                // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
+                let has_profile = ctx
+                    .credentials
+                    .profile_arn
+                    .as_ref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                if has_profile
+                    && crate::kiro::models_api::is_user_not_authorized_body(&body)
+                    && !profile_arn_stripped.contains(&ctx.id)
+                {
+                    profile_arn_stripped.insert(ctx.id);
+                    tracing::warn!(
+                        "凭据 #{} MCP 因 profileArn 未授权，清除 profileArn 后重试",
+                        ctx.id
+                    );
+                    let _ = self.token_manager.clear_profile_arn(ctx.id);
+                    continue;
+                }
+
+                // bearer invalid: if request lacked profileArn, try resolve first; else force-refresh once.
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
+                    let has_profile = ctx
+                        .credentials
+                        .profile_arn
+                        .as_ref()
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false);
+                    if !has_profile {
+                        tracing::info!(
+                            "凭据 #{} bearer invalid 且无 profileArn，尝试 resolve 后重试",
+                            ctx.id
+                        );
+                        if profile::ensure_profile_arn_for_request(
+                            &self.token_manager,
+                            ctx.id,
+                            &mut ctx.credentials,
+                            &ctx.token,
+                        )
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some()
+                        {
+                            continue;
+                        }
+                    }
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
                     if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
@@ -285,6 +369,7 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut profile_arn_stripped: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 尝试从请求体中提取模型信息
@@ -292,7 +377,7 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let mut ctx = match self.token_manager.acquire_context(model.as_deref()).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -300,8 +385,33 @@ impl KiroProvider {
                 }
             };
 
+            // Resolve profileArn before generateAssistantResponse
+            match profile::ensure_profile_arn_for_request(
+                &self.token_manager,
+                ctx.id,
+                &mut ctx.credentials,
+                &ctx.token,
+            )
+            .await
+            {
+                Ok(Some(_)) | Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!("凭据 #{} profileArn 解析失败: {}", ctx.id, e);
+                    // soft failure: count failure without permanent refresh invalidation
+                    let has_available = self.token_manager.report_failure(ctx.id);
+                    last_error = Some(e);
+                    if !has_available {
+                        anyhow::bail!(
+                            "{} API 请求失败（所有凭据已用尽）: profileArn 无法解析",
+                            api_type
+                        );
+                    }
+                    continue;
+                }
+            }
+
             let config = self.token_manager.config();
-            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
+            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
 
             let endpoint = match self.endpoint_for(&ctx.credentials) {
                 Ok(e) => e,
@@ -316,7 +426,7 @@ impl KiroProvider {
                 credentials: &ctx.credentials,
                 token: &ctx.token,
                 machine_id: &machine_id,
-                config,
+                config: &config,
             };
 
             let url = endpoint.api_url(&rctx);
@@ -404,9 +514,55 @@ impl KiroProvider {
                     body
                 );
 
-                // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
+                // Bad / placeholder profileArn often yields "User is not authorized".
+                // Strip once and retry without counting failure.
+                let has_profile = ctx
+                    .credentials
+                    .profile_arn
+                    .as_ref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                if has_profile
+                    && crate::kiro::models_api::is_user_not_authorized_body(&body)
+                    && !profile_arn_stripped.contains(&ctx.id)
+                {
+                    profile_arn_stripped.insert(ctx.id);
+                    tracing::warn!(
+                        "凭据 #{} generate 因 profileArn 未授权，清除 profileArn 后重试",
+                        ctx.id
+                    );
+                    let _ = self.token_manager.clear_profile_arn(ctx.id);
+                    continue;
+                }
+
+                // bearer invalid: if request lacked profileArn, try resolve first; else force-refresh once.
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
+                    let has_profile = ctx
+                        .credentials
+                        .profile_arn
+                        .as_ref()
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false);
+                    if !has_profile {
+                        tracing::info!(
+                            "凭据 #{} bearer invalid 且无 profileArn，尝试 resolve 后重试",
+                            ctx.id
+                        );
+                        if profile::ensure_profile_arn_for_request(
+                            &self.token_manager,
+                            ctx.id,
+                            &mut ctx.credentials,
+                            &ctx.token,
+                        )
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some()
+                        {
+                            continue;
+                        }
+                    }
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
                     if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);

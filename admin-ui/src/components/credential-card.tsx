@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, Boxes, FlaskConical, RotateCcw } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -23,6 +23,11 @@ import {
   useDeleteCredential,
   useForceRefreshToken,
 } from '@/hooks/use-credentials'
+import { getCredentialBalance, refreshCredentialModels } from '@/api/credentials'
+import { useQueryClient } from '@tanstack/react-query'
+import { extractErrorMessage } from '@/lib/utils'
+import { CredentialModelsDialog } from '@/components/credential-models-dialog'
+import { CredentialTestDialog } from '@/components/credential-test-dialog'
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
@@ -31,6 +36,7 @@ interface CredentialCardProps {
   onToggleSelect: () => void
   balance: BalanceResponse | null
   loadingBalance: boolean
+  onBalanceRefreshed?: (id: number, balance: BalanceResponse) => void
 }
 
 function formatLastUsed(lastUsedAt: string | null): string {
@@ -56,10 +62,17 @@ export function CredentialCard({
   onToggleSelect,
   balance,
   loadingBalance,
+  onBalanceRefreshed,
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const [modelsDialogOpen, setModelsDialogOpen] = useState(false)
+  const [testDialogOpen, setTestDialogOpen] = useState(false)
+  const [testInitialModel, setTestInitialModel] = useState('')
+  const [refreshingModels, setRefreshingModels] = useState(false)
+  const [refreshingBalance, setRefreshingBalance] = useState(false)
+  const queryClient = useQueryClient()
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
@@ -123,6 +136,42 @@ export function CredentialCard({
     })
   }
 
+  const handleRefreshModels = async () => {
+    if (refreshingModels) return
+    setRefreshingModels(true)
+    try {
+      const resp = await refreshCredentialModels(credential.id)
+      const sample = resp.models.slice(0, 3).join(', ')
+      const more = resp.count > 3 ? '…' : ''
+      toast.success(
+        `凭据 #${credential.id} 模型已刷新：${resp.count} 个` +
+          (sample ? `（${sample}${more}）` : '')
+      )
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    } catch (err) {
+      toast.error('刷新模型失败: ' + extractErrorMessage(err))
+    } finally {
+      setRefreshingModels(false)
+    }
+  }
+
+  const handleRefreshBalance = async () => {
+    if (refreshingBalance) return
+    setRefreshingBalance(true)
+    try {
+      const resp = await getCredentialBalance(credential.id, true)
+      // 结果回流父级共享数据源，卡片自身不留副本（否则会遮蔽后续批量查询结果）
+      onBalanceRefreshed?.(credential.id, resp)
+      toast.success(
+        `余额已刷新：剩余 ${resp.remaining}${resp.subscriptionTitle ? `（${resp.subscriptionTitle}）` : ''}`
+      )
+    } catch (err) {
+      toast.error('刷新余额失败: ' + extractErrorMessage(err))
+    } finally {
+      setRefreshingBalance(false)
+    }
+  }
+
   const handleDelete = () => {
     if (!credential.disabled) {
       toast.error('请先禁用凭据再删除')
@@ -143,45 +192,83 @@ export function CredentialCard({
 
   return (
     <>
-      <Card className={credential.isCurrent ? 'ring-2 ring-primary' : ''}>
-        <CardHeader className="pb-2">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <Checkbox
-                checked={selected}
-                onCheckedChange={onToggleSelect}
-              />
-              <CardTitle className="text-lg flex items-center gap-2">
-                {credential.email || `凭据 #${credential.id}`}
+      <Card
+        className={
+          credential.isCurrent
+            ? 'min-w-0 overflow-hidden ring-2 ring-primary'
+            : 'min-w-0 overflow-hidden'
+        }
+      >
+        <CardHeader className="min-w-0 overflow-hidden pb-2 space-y-2">
+          <div className="flex items-start gap-2 min-w-0">
+            <Checkbox
+              className="mt-1 shrink-0"
+              checked={selected}
+              onCheckedChange={onToggleSelect}
+            />
+            <div className="min-w-0 flex-1 overflow-hidden space-y-1.5">
+              <div className="flex items-start gap-2 min-w-0">
+                <CardTitle
+                  className="text-base sm:text-lg font-semibold leading-snug tracking-normal break-all min-w-0 flex-1 overflow-hidden"
+                  title={credential.email || `凭据 #${credential.id}`}
+                >
+                  {credential.email || `凭据 #${credential.id}`}
+                </CardTitle>
+                <div className="flex items-center gap-1.5 shrink-0 pt-0.5">
+                  <span className="text-sm text-muted-foreground whitespace-nowrap">启用</span>
+                  <Switch
+                    checked={!credential.disabled}
+                    onCheckedChange={handleToggleDisabled}
+                    disabled={setDisabled.isPending}
+                  />
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-1.5 min-w-0">
                 {credential.isCurrent && (
-                  <Badge variant="success">当前</Badge>
+                  <Badge variant="success" className="shrink-0">
+                    当前
+                  </Badge>
                 )}
                 {credential.disabled && (
-                  <Badge variant="destructive">已禁用</Badge>
-                )}
-                {credential.disabled && credential.disabledReason && (
-                  <Badge variant="outline">{credential.disabledReason}</Badge>
+                  <Badge variant="destructive" className="shrink-0">
+                    已禁用
+                  </Badge>
                 )}
                 {credential.authMethod && (
-                  <Badge variant="secondary">
+                  <Badge variant="secondary" className="shrink-0">
                     {credential.authMethod === 'api_key' ? 'API Key' :
                      credential.authMethod === 'idc' ? 'IdC' :
                      credential.authMethod === 'social' ? 'Social' :
                      credential.authMethod}
                   </Badge>
                 )}
-                {credential.endpoint && (
-                  <Badge variant="outline">{credential.endpoint}</Badge>
+                {credential.provider && (
+                  <Badge
+                    variant="outline"
+                    className="max-w-full min-w-0 truncate"
+                    title={credential.provider}
+                  >
+                    {credential.provider}
+                  </Badge>
                 )}
-              </CardTitle>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-sm text-muted-foreground">启用</span>
-              <Switch
-                checked={!credential.disabled}
-                onCheckedChange={handleToggleDisabled}
-                disabled={setDisabled.isPending}
-              />
+                {credential.endpoint && (
+                  <Badge
+                    variant="outline"
+                    className="max-w-full min-w-0 truncate"
+                    title={credential.endpoint}
+                  >
+                    {credential.endpoint}
+                  </Badge>
+                )}
+              </div>
+              {credential.disabled && credential.disabledReason && (
+                <div
+                  className="min-w-0 max-w-full truncate text-xs text-muted-foreground"
+                  title={credential.disabledReason}
+                >
+                  原因：{credential.disabledReason}
+                </div>
+              )}
             </div>
           </div>
         </CardHeader>
@@ -287,24 +374,62 @@ export function CredentialCard({
                 <span className="font-medium">{credential.proxyUrl}</span>
               </div>
             )}
-            {credential.hasProfileArn && (
-              <div className="col-span-2">
-                <Badge variant="secondary">有 Profile ARN</Badge>
-              </div>
-            )}
+            <div className="col-span-2 flex items-center gap-2">
+              <span className="text-muted-foreground">Profile：</span>
+              {credential.hasProfileArn ? (
+                <Badge variant="secondary">已就绪</Badge>
+              ) : credential.authMethod === 'api_key' ? (
+                <span className="text-sm text-muted-foreground">不适用</span>
+              ) : (
+                <Badge variant="outline" className="text-amber-700 border-amber-500/50">
+                  未解析
+                </Badge>
+              )}
+              {credential.provider && !credential.hasProfileArn && (
+                <span className="text-xs text-muted-foreground">provider={credential.provider}</span>
+              )}
+            </div>
+            <div className="col-span-2 flex items-center gap-2">
+              <span className="text-muted-foreground">模型缓存：</span>
+              {(credential.modelCount ?? 0) > 0 ? (
+                <Badge variant="secondary">{credential.modelCount} 个</Badge>
+              ) : (
+                <span className="text-sm text-muted-foreground">未缓存</span>
+              )}
+              {credential.modelsLastError && (
+                <span className="text-xs text-amber-600 truncate max-w-[12rem]" title={credential.modelsLastError}>
+                  有错误
+                </span>
+              )}
+            </div>
           </div>
 
           {/* 操作按钮 */}
           <div className="flex flex-wrap gap-2 pt-2 border-t">
             <Button
               size="sm"
-              variant="outline"
-              onClick={handleReset}
-              disabled={resetFailure.isPending || (credential.failureCount === 0 && credential.refreshFailureCount === 0)}
+              variant="default"
+              onClick={handleRefreshBalance}
+              disabled={refreshingBalance || credential.disabled}
+              title="强制刷新该凭据余额/订阅（跳过缓存）"
             >
-              <RefreshCw className="h-4 w-4 mr-1" />
-              重置失败
+              <Wallet className={`h-4 w-4 mr-1 ${refreshingBalance ? 'animate-spin' : ''}`} />
+              {refreshingBalance ? '刷新中…' : '刷新余额'}
             </Button>
+            {(credential.failureCount > 0 ||
+              credential.refreshFailureCount > 0 ||
+              credential.disabled) && (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={handleReset}
+                disabled={resetFailure.isPending}
+                title="重置失败计数并尝试恢复"
+              >
+                <RotateCcw className="h-4 w-4 mr-1" />
+                重置失败
+              </Button>
+            )}
             <Button
               size="sm"
               variant="outline"
@@ -350,6 +475,42 @@ export function CredentialCard({
             >
               <ChevronDown className="h-4 w-4 mr-1" />
               降低优先级
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setModelsDialogOpen(true)}
+            >
+              <Boxes className="h-4 w-4 mr-1" />
+              查看模型
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleRefreshModels}
+              disabled={refreshingModels || credential.disabled}
+              title={
+                credential.disabled
+                  ? '已禁用的凭据无法刷新模型目录'
+                  : '从上游刷新该凭据可用模型'
+              }
+            >
+              <RefreshCw className={`h-4 w-4 mr-1 ${refreshingModels ? 'animate-spin' : ''}`} />
+              刷新模型
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setTestDialogOpen(true)}
+              disabled={credential.disabled}
+              title={
+                credential.disabled
+                  ? '已禁用的凭据无法发起推理测试'
+                  : '对上游做最小真实推理探测'
+              }
+            >
+              <FlaskConical className="h-4 w-4 mr-1" />
+              测试
             </Button>
             <Button
               size="sm"
@@ -400,6 +561,31 @@ export function CredentialCard({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <CredentialModelsDialog
+        credentialId={credential.id}
+        open={modelsDialogOpen}
+        onOpenChange={setModelsDialogOpen}
+        onTestModel={(modelId) => {
+          setTestInitialModel(modelId)
+          setModelsDialogOpen(false)
+          setTestDialogOpen(true)
+        }}
+        onModelsChanged={() => {
+          queryClient.invalidateQueries({ queryKey: ['credentials'] })
+        }}
+      />
+
+      <CredentialTestDialog
+        credentialId={credential.id}
+        open={testDialogOpen}
+        onOpenChange={(open) => {
+          setTestDialogOpen(open)
+          if (!open) setTestInitialModel('')
+        }}
+        disabled={credential.disabled}
+        initialModel={testInitialModel}
+      />
     </>
   )
 }

@@ -8,6 +8,10 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  ModelsRefreshResponse,
+  ModelsRefreshAllResponse,
+  CredentialModelsResponse,
+  TestCredentialResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -73,9 +77,14 @@ export async function forceRefreshToken(
   return data
 }
 
-// 获取凭据余额
-export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
-  const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`)
+// 获取凭据余额（force=true 跳过 TTL 缓存）
+export async function getCredentialBalance(
+  id: number,
+  force = false
+): Promise<BalanceResponse> {
+  const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`, {
+    params: force ? { force: true } : undefined,
+  })
   return data
 }
 
@@ -84,6 +93,14 @@ export async function addCredential(
   req: AddCredentialRequest
 ): Promise<AddCredentialResponse> {
   const { data } = await api.post<AddCredentialResponse>('/credentials', req)
+  return data
+}
+
+// 导入凭据（默认 upsert）
+export async function importCredential(
+  req: AddCredentialRequest
+): Promise<AddCredentialResponse> {
+  const { data } = await api.post<AddCredentialResponse>('/credentials/import', req)
   return data
 }
 
@@ -104,3 +121,213 @@ export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promi
   const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
   return data
 }
+
+
+export interface BatchImportOptions {
+  onConflict?: 'reject' | 'upsert' | 'replace_token_only'
+  stopOnError?: boolean
+  fetchBalance?: boolean
+  concurrency?: number
+}
+
+export interface BatchImportRequest {
+  items: AddCredentialRequest[]
+  options?: BatchImportOptions
+}
+
+export interface BatchImportItemResult {
+  index: number
+  status: string
+  credentialId?: number
+  email?: string
+  userId?: string
+  error?: string
+  balance?: BalanceResponse
+  warning?: string
+}
+
+export interface BatchImportResponse {
+  success: boolean
+  summary: { created: number; updated: number; duplicate: number; failed: number }
+  results: BatchImportItemResult[]
+}
+
+export async function importCredentialsBatch(
+  req: BatchImportRequest
+): Promise<BatchImportResponse> {
+  const { data } = await api.post<BatchImportResponse>('/credentials/import/batch', req)
+  return data
+}
+
+// ============ KAM 导入 ============
+
+export interface KamImportRequest {
+  /** 原始 KAM 文档，容器判别与认证分类均由服务端完成 */
+  document: unknown
+  options?: BatchImportOptions
+  /** 仅预检不入库 */
+  dryRun?: boolean
+}
+
+/** 逐条预检结果：只含「是否已配置」状态，不含任何字段值 */
+export interface KamPreviewItem {
+  index: number
+  path: string
+  authMethod?: string
+  provider?: string
+  email?: string
+  nickname?: string
+  hasRefreshToken: boolean
+  hasClientId: boolean
+  hasClientSecret: boolean
+  hasTokenEndpoint: boolean
+  hasIssuerUrl: boolean
+  hasScopes: boolean
+  hasProfileArn: boolean
+  disabled: boolean
+  valid: boolean
+  error?: string
+}
+
+export interface KamImportResponse {
+  success: boolean
+  /** 识别出的容器形态：FlatArray | FlatObject | Wrapper | LegacyNested */
+  container: string
+  preview: KamPreviewItem[]
+  summary?: { created: number; updated: number; duplicate: number; failed: number }
+  results: BatchImportItemResult[]
+}
+
+export async function importKamDocument(req: KamImportRequest): Promise<KamImportResponse> {
+  const { data } = await api.post<KamImportResponse>('/credentials/import/kam', req)
+  return data
+}
+
+// ============ 在线授权 ============
+
+export interface BuilderIdStartResponse {
+  sessionId: string
+  userCode: string
+  verificationUri: string
+  interval: number
+  expiresIn: number
+}
+
+export type BuilderIdPollResponse =
+  | {
+      success: boolean
+      completed: false
+      status: string
+      interval: number
+    }
+  | {
+      success: boolean
+      completed: true
+      credentialId: number
+      email?: string
+      userId?: string
+      action?: string
+    }
+
+export interface IamSsoStartResponse {
+  sessionId: string
+  authorizeUrl: string
+  expiresIn: number
+}
+
+export interface SsoTokenImportResponse {
+  success: boolean
+  accounts: Array<{ credentialId: number; email?: string; userId?: string }>
+  errors?: string[]
+}
+
+export async function startBuilderIdLogin(region?: string): Promise<BuilderIdStartResponse> {
+  const { data } = await api.post<BuilderIdStartResponse>('/auth/builderid/start', {
+    region: region || undefined,
+  })
+  return data
+}
+
+export async function pollBuilderIdLogin(sessionId: string): Promise<BuilderIdPollResponse> {
+  const { data } = await api.post<BuilderIdPollResponse>('/auth/builderid/poll', { sessionId })
+  return data
+}
+
+export async function startIamSsoLogin(
+  startUrl: string,
+  region?: string
+): Promise<IamSsoStartResponse> {
+  const { data } = await api.post<IamSsoStartResponse>('/auth/iam-sso/start', {
+    startUrl,
+    region: region || undefined,
+  })
+  return data
+}
+
+export async function completeIamSsoLogin(
+  sessionId: string,
+  callbackUrl: string
+): Promise<AddCredentialResponse> {
+  const { data } = await api.post<AddCredentialResponse>('/auth/iam-sso/complete', {
+    sessionId,
+    callbackUrl,
+  })
+  return data
+}
+
+export async function importSsoToken(
+  bearerToken: string,
+  region?: string
+): Promise<SsoTokenImportResponse> {
+  const { data } = await api.post<SsoTokenImportResponse>('/auth/sso-token', {
+    bearerToken,
+    region: region || undefined,
+  })
+  return data
+}
+
+// ============ 模型目录 / 凭据测试 ============
+
+/** 刷新单凭据模型目录 */
+export async function refreshCredentialModels(
+  id: number
+): Promise<ModelsRefreshResponse> {
+  const { data } = await api.post<ModelsRefreshResponse>(
+    `/credentials/${id}/models/refresh`
+  )
+  return data
+}
+
+/** 刷新全部启用凭据的模型目录 */
+export async function refreshAllModels(): Promise<ModelsRefreshAllResponse> {
+  const { data } = await api.post<ModelsRefreshAllResponse>(
+    '/credentials/models/refresh'
+  )
+  return data
+}
+
+/** 查看凭据模型缓存；live=true 时先刷新再返回 */
+export async function getCredentialModels(
+  id: number,
+  live = false
+): Promise<CredentialModelsResponse> {
+  const { data } = await api.get<CredentialModelsResponse>(
+    `/credentials/${id}/models`,
+    { params: live ? { live: true } : undefined }
+  )
+  return data
+}
+
+/** 对凭据做最小真实推理探测 */
+export async function testCredential(
+  id: number,
+  model?: string
+): Promise<TestCredentialResponse> {
+  const body = model && model.trim() ? { model: model.trim() } : {}
+  const { data } = await api.post<TestCredentialResponse>(
+    `/credentials/${id}/test`,
+    body
+  )
+  return data
+}
+

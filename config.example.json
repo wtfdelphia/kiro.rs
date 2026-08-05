@@ -2,8 +2,18 @@
   "host": "127.0.0.1",
   "port": 8990,
   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
+  "requireApiKey": true,
   "tlsBackend": "rustls",
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
-  "defaultEndpoint": "ide"
+  "defaultEndpoint": "ide",
+  "kiroVersion": "0.11.107",
+  "systemVersion": "win32#10.0.22631",
+  "nodeVersion": "22.22.0",
+  "webSearchEmulation": true,
+  "modelResolution": {
+    "defaultChatModel": "claude-sonnet-4.6",
+    "allowCatalogPassthrough": true,
+    "exposeCompatAliasesInModels": false
+  }
 }

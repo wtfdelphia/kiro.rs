@@ -1,0 +1,224 @@
+name: Build Dev Release
+
+# Dedicated dev-branch pipeline:
+# 1) build multi-platform binaries
+# 2) publish/update a rolling GitHub prerelease on fixed tag `dev-latest`
+#
+# Separate from build.yaml (master/tag + artifact path).
+
+on:
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Optional tag override. Leave empty to use rolling tag dev-latest.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      short_sha: ${{ steps.version.outputs.short_sha }}
+    steps:
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+          INPUT_VERSION="${{ github.event.inputs.version }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${INPUT_VERSION}" ]; then
+            # Manual override still allowed for one-off tags
+            RELEASE_TAG="${INPUT_VERSION// /-}"
+          else
+            # Rolling tag: always the same, assets/home-page entry stay stable
+            RELEASE_TAG="dev-latest"
+          fi
+
+          # Asset/file label uses the same stable id for fixed download URLs
+          VERSION="${RELEASE_TAG}"
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Dev rolling release tag: ${RELEASE_TAG} (commit ${SHORT_SHA})"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            name: macOS-arm64
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+            name: macOS-x64
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: Windows-x64
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            name: Linux-x64
+          - platform: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            name: Linux-arm64
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            name: Linux-musl-x64
+          - platform: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            name: Linux-musl-arm64
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 11
+
+      - name: Install admin-ui dependencies
+        working-directory: admin-ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Build admin-ui
+        working-directory: admin-ui
+        run: pnpm build
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "rust-cache-dev-${{ matrix.target }}"
+          cache-on-failure: true
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build app
+        run: cargo build --release --target ${{ matrix.target }} ${{ contains(matrix.target, 'musl') && '--no-default-features' || '' }}
+
+      - name: Stage binary for release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p staged
+          VERSION="${{ needs.prepare.outputs.version }}"
+          NAME="${{ matrix.name }}"
+          EXE="target/${{ matrix.target }}/release/kiro-rs.exe"
+          BIN="target/${{ matrix.target }}/release/kiro-rs"
+
+          if [ -f "${EXE}" ]; then
+            cp "${EXE}" "staged/kiro-rs-${VERSION}-${NAME}.exe"
+          elif [ -f "${BIN}" ]; then
+            cp "${BIN}" "staged/kiro-rs-${VERSION}-${NAME}"
+          else
+            echo "No binary found for target ${{ matrix.target }}"
+            ls -la "target/${{ matrix.target }}/release" || true
+            exit 1
+          fi
+
+          ls -la staged
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: kiro-rs-${{ needs.prepare.outputs.version }}-${{ matrix.name }}
+          if-no-files-found: error
+          compression-level: 6
+          path: staged/*
+
+  release:
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: release-assets
+          pattern: kiro-rs-${{ needs.prepare.outputs.version }}-*
+          merge-multiple: true
+
+      - name: List release assets
+        run: |
+          set -euo pipefail
+          echo "Release assets:"
+          find release-assets -type f -print
+          test -n "$(find release-assets -type f | head -n 1)"
+
+      - name: Move rolling tag to current commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.prepare.outputs.release_tag }}"
+          git tag -f "${TAG}" "${{ github.sha }}"
+          git push origin "refs/tags/${TAG}" --force
+
+      - name: Recreate prerelease shell for clean asset replace
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.prepare.outputs.release_tag }}"
+          # Delete existing release (keep tag) so asset names can be re-uploaded cleanly
+          gh release delete "${TAG}" --yes 2>/dev/null || true
+
+      - name: Create or update GitHub prerelease
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          name: Dev rolling build (${{ needs.prepare.outputs.short_sha }})
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          make_latest: false
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            Automated **dev** rolling prerelease.
+
+            - Rolling tag: `${{ needs.prepare.outputs.release_tag }}`
+            - Branch: `${{ github.ref_name }}`
+            - Commit: ${{ github.sha }}
+            - Short SHA: ${{ needs.prepare.outputs.short_sha }}
+            - Workflow: Build Dev Release
+            - Trigger: ${{ github.event_name }}
+
+            Fixed download tag stays at **${{ needs.prepare.outputs.release_tag }}**.
+            Each successful dev build force-moves this tag and replaces Assets.
+            This prerelease does **not** replace the repository "Latest" stable release.
+          files: |
+            release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

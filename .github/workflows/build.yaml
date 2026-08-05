@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - dev
     tags:
       - 'v*'
   workflow_dispatch:
@@ -14,7 +15,7 @@ on:
         default: '2026.1.1'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   pre-check:
@@ -22,7 +23,7 @@ jobs:
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
         with:
           fetch-depth: 0
@@ -31,7 +32,7 @@ jobs:
         run: |
           if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/heads/* ]] && git tag --points-at HEAD | grep -q '^v'; then
             echo "should_build=false" >> $GITHUB_OUTPUT
-            echo "::notice::Skipping beta build: commit already has a release tag"
+            echo "::notice::Skipping beta/dev artifact build: commit already has a release tag"
           else
             echo "should_build=true" >> $GITHUB_OUTPUT
           fi
@@ -66,10 +67,12 @@ jobs:
             name: Linux-musl-arm64
 
     runs-on: ${{ matrix.platform }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Determine version
         id: version
@@ -81,16 +84,21 @@ jobs:
             echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
           else
             SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-6)
-            echo "version=beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
+            BRANCH="${{ github.ref_name }}"
+            if [ "${BRANCH}" = "dev" ]; then
+              echo "version=dev-${SHORT_SHA}" >> $GITHUB_OUTPUT
+            else
+              echo "version=beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
+            fi
           fi
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '22'
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v5
         with:
           version: 11
 
@@ -122,12 +130,97 @@ jobs:
       - name: Build app
         run: cargo build --release --target ${{ matrix.target }} ${{ contains(matrix.target, 'musl') && '--no-default-features' || '' }}
 
+      - name: Stage binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p staged
+          VERSION="${{ steps.version.outputs.version }}"
+          NAME="${{ matrix.name }}"
+          EXE="target/${{ matrix.target }}/release/kiro-rs.exe"
+          BIN="target/${{ matrix.target }}/release/kiro-rs"
+
+          if [ -f "${EXE}" ]; then
+            cp "${EXE}" "staged/kiro-rs-${VERSION}-${NAME}.exe"
+          elif [ -f "${BIN}" ]; then
+            cp "${BIN}" "staged/kiro-rs-${VERSION}-${NAME}"
+          else
+            echo "No binary found for target ${{ matrix.target }}"
+            ls -la "target/${{ matrix.target }}/release" || true
+            exit 1
+          fi
+
+          ls -la staged
+
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: kiro-rs-${{ steps.version.outputs.version }}-${{ matrix.name }}
           if-no-files-found: error
           compression-level: 6
-          path: |
-            target/${{ matrix.target }}/release/kiro-rs
-            target/${{ matrix.target }}/release/kiro-rs.exe
+          path: staged/*
+
+  release:
+    needs:
+      - pre-check
+      - build
+    if: needs.pre-check.outputs.should_build == 'true' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          echo "version=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: release-assets
+          pattern: kiro-rs-${{ steps.version.outputs.version }}-*
+          merge-multiple: true
+
+      - name: List release assets
+        run: |
+          set -euo pipefail
+          echo "Release assets:"
+          find release-assets -type f -print
+          test -n "$(find release-assets -type f | head -n 1)"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          draft: false
+          prerelease: false
+          make_latest: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            Release **${{ steps.version.outputs.version }}**
+
+            - Commit: ${{ github.sha }}
+            - Workflow: Build Artifacts
+
+            ### Downloads
+            Multi-platform binaries are attached below.
+
+            ### Docker
+            ```bash
+            docker pull ghcr.io/${{ github.repository_owner }}/kiro-rs:${{ steps.version.outputs.version }}
+            # or
+            docker pull ghcr.io/${{ github.repository_owner }}/kiro-rs:latest
+            ```
+
+            Package: https://github.com/${{ github.repository_owner }}/kiro.rs/pkgs/container/kiro-rs
+          files: |
+            release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

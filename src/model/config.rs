@@ -87,6 +87,10 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
+    /// 是否要求客户端 API Key（默认 true，兼容现网）
+    #[serde(default = "default_require_api_key")]
+    pub require_api_key: bool,
+
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
@@ -109,9 +113,61 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// 模型解析策略（别名 / auto / catalog 透传）
+    #[serde(default)]
+    pub model_resolution: ModelResolutionConfig,
+
+    /// 是否启用 web_search 代执行（仅 `/v1/responses` 端点，默认 true）
+    ///
+    /// 该端点的 web_search 工具判定较宽（含 `web_search_20250305` 等形状），
+    /// 关闭后此类工具走正常 tools 路径交给模型自行决定。
+    #[serde(default = "default_web_search_emulation")]
+    pub web_search_emulation: bool,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
+}
+
+/// 模型解析配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelResolutionConfig {
+    /// auto 映射到的默认聊天模型
+    #[serde(default = "default_chat_model")]
+    pub default_chat_model: String,
+
+    /// 是否允许 catalog 命中的上游 id 透传
+    #[serde(default = "default_allow_catalog_passthrough")]
+    pub allow_catalog_passthrough: bool,
+
+    /// 是否在 /v1/models 额外暴露兼容别名（gpt-4o 等）
+    #[serde(default)]
+    pub expose_compat_aliases_in_models: bool,
+
+    /// 可选自定义兼容别名（覆盖内置表同名项）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub compat_aliases: HashMap<String, String>,
+}
+
+impl Default for ModelResolutionConfig {
+    fn default() -> Self {
+        Self {
+            default_chat_model: default_chat_model(),
+            allow_catalog_passthrough: default_allow_catalog_passthrough(),
+            expose_compat_aliases_in_models: false,
+            compat_aliases: HashMap::new(),
+        }
+    }
+}
+
+fn default_chat_model() -> String {
+    "claude-sonnet-4.6".to_string()
+}
+
+fn default_allow_catalog_passthrough() -> bool {
+    true
 }
 
 fn default_host() -> String {
@@ -155,6 +211,14 @@ fn default_extract_thinking() -> bool {
     true
 }
 
+fn default_web_search_emulation() -> bool {
+    true
+}
+
+fn default_require_api_key() -> bool {
+    true
+}
+
 fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
@@ -180,10 +244,13 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
+            require_api_key: default_require_api_key(),
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
+            model_resolution: ModelResolutionConfig::default(),
+            web_search_emulation: default_web_search_emulation(),
             config_path: None,
         }
     }
@@ -236,7 +303,8 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content).with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        fs::write(path, content)
+            .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
     }
 }

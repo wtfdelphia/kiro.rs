@@ -9,6 +9,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Select } from '@/components/ui/select'
 import { useAddCredential } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
 
@@ -93,7 +94,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       },
       {
         onSuccess: (data) => {
-          toast.success(data.message)
+          const act = data.action === 'updated' ? '已更新' : '已添加'
+          toast.success(data.message || act)
           onOpenChange(false)
           resetForm()
         },
@@ -118,17 +120,16 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               <label htmlFor="authMethod" className="text-sm font-medium">
                 认证方式
               </label>
-              <select
-                id="authMethod"
+              <Select
                 value={authMethod}
-                onChange={(e) => setAuthMethod(e.target.value as AuthMethod)}
+                onValueChange={(value) => setAuthMethod(value as AuthMethod)}
                 disabled={isPending}
-                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <option value="social">Social</option>
-                <option value="idc">IdC/Builder-ID/IAM</option>
-                <option value="api_key">API Key</option>
-              </select>
+                options={[
+                  { value: 'social', label: 'Social' },
+                  { value: 'idc', label: 'IdC/Builder-ID/IAM' },
+                  { value: 'api_key', label: 'API Key' },
+                ]}
+              />
             </div>
 
             {/* Kiro API Key (API Key 模式) */}

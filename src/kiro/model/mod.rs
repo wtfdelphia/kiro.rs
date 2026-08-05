@@ -10,6 +10,7 @@
 
 pub mod common;
 pub mod credentials;
+pub mod available_models;
 pub mod events;
 pub mod requests;
 pub mod token_refresh;

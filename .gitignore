@@ -1,6 +1,4 @@
-/target
-/CLAUDE.md
-/AGENTS.md
+/target*
 /config.json
 /credentials.json
 /.idea
@@ -9,5 +7,13 @@
 /admin-ui/dist/
 /admin-ui/tsconfig.tsbuildinfo
 /credentials.*
+# 示例文件必须可跟踪：/credentials.* 会连带忽略它们
+!/credentials.example.*.json
 /kiro_balance_cache.json
 /kiro_stats.json
+
+# AI engineering local caches / isolation
+.codegraph/
+.worktrees/
+.claude/settings.local.json
+*.log

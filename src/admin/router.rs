@@ -7,46 +7,77 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, delete_credential, force_refresh_token, get_all_credentials,
-        get_credential_balance, get_load_balancing_mode, reset_failure_count,
-        set_credential_disabled, set_credential_priority, set_load_balancing_mode,
+        add_credential, complete_iam_sso, delete_credential, force_refresh_token,
+        get_all_credentials, get_auth_settings, get_client_identity_settings,
+        get_credential_balance, get_credential_models, get_endpoint_settings,
+        get_global_models_catalog, get_load_balancing_mode, get_proxy_settings, get_public_api,
+        import_credential,
+        import_credentials_batch, import_kam_document, import_sso_token, poll_builder_id,
+        refresh_all_models,
+        refresh_credential_models, reset_failure_count, set_credential_disabled,
+        set_credential_priority, set_load_balancing_mode, start_builder_id, start_iam_sso,
+        test_credential, update_auth_settings, update_client_identity_settings,
+        get_websearch_settings, update_websearch_settings,
+        update_endpoint_settings, update_proxy_settings,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
 
 /// 创建 Admin API 路由
-///
-/// # 端点
-/// - `GET /credentials` - 获取所有凭据状态
-/// - `POST /credentials` - 添加新凭据
-/// - `DELETE /credentials/:id` - 删除凭据
-/// - `POST /credentials/:id/disabled` - 设置凭据禁用状态
-/// - `POST /credentials/:id/priority` - 设置凭据优先级
-/// - `POST /credentials/:id/reset` - 重置失败计数
-/// - `POST /credentials/:id/refresh` - 强制刷新 Token
-/// - `GET /credentials/:id/balance` - 获取凭据余额
-/// - `GET /config/load-balancing` - 获取负载均衡模式
-/// - `PUT /config/load-balancing` - 设置负载均衡模式
-///
-/// # 认证
-/// 需要 Admin API Key 认证，支持：
-/// - `x-api-key` header
-/// - `Authorization: Bearer <token>` header
 pub fn create_admin_router(state: AdminState) -> Router {
     Router::new()
         .route(
             "/credentials",
             get(get_all_credentials).post(add_credential),
         )
+        .route("/credentials/import", post(import_credential))
+        .route("/credentials/import/batch", post(import_credentials_batch))
+        .route("/credentials/import/kam", post(import_kam_document))
         .route("/credentials/{id}", delete(delete_credential))
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))
         .route("/credentials/{id}/reset", post(reset_failure_count))
         .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))
+        // models/refresh 全量必须在 /{id}/... 之前或使用更具体路径，避免冲突
+        .route("/credentials/models/refresh", post(refresh_all_models))
+        .route(
+            "/credentials/{id}/models/refresh",
+            post(refresh_credential_models),
+        )
+        .route("/credentials/{id}/models", get(get_credential_models))
+        .route("/credentials/{id}/test", post(test_credential))
+        .route("/models/catalog", get(get_global_models_catalog))
+        // 对外 Public API 目录（只读）；勿与 /settings/endpoint（上游 Kiro 端点）混淆
+        .route("/public-api", get(get_public_api))
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),
+        )
+        .route("/auth/builderid/start", post(start_builder_id))
+        .route("/auth/builderid/poll", post(poll_builder_id))
+        .route("/auth/iam-sso/start", post(start_iam_sso))
+        .route("/auth/iam-sso/complete", post(complete_iam_sso))
+        .route("/auth/sso-token", post(import_sso_token))
+        .route(
+            "/settings/proxy",
+            get(get_proxy_settings).put(update_proxy_settings),
+        )
+        .route(
+            "/settings/endpoint",
+            get(get_endpoint_settings).put(update_endpoint_settings),
+        )
+        .route(
+            "/settings/auth",
+            get(get_auth_settings).put(update_auth_settings),
+        )
+        .route(
+            "/settings/websearch",
+            get(get_websearch_settings).put(update_websearch_settings),
+        )
+        .route(
+            "/settings/client-identity",
+            get(get_client_identity_settings).put(update_client_identity_settings),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),

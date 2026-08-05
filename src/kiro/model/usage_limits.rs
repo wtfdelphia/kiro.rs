@@ -19,6 +19,20 @@ pub struct UsageLimitsResponse {
     /// 使用量明细列表
     #[serde(default)]
     pub usage_breakdown_list: Vec<UsageBreakdown>,
+
+    /// 用户信息（isEmailRequired=true 时可能返回）
+    #[serde(default)]
+    pub user_info: Option<UserInfo>,
+}
+
+/// 用户信息（GetUserInfo / getUsageLimits）
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInfo {
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
 }
 
 /// 订阅信息

@@ -1,0 +1,134 @@
+# Capability: model-catalog
+
+## Purpose
+
+Fetch available models from Kiro CodeWhisperer ListAvailableModels, maintain dual-layer caches (per-credential model set + global catalog), expose Admin refresh/view APIs, and drive GET /v1/models from the global cache with static fallback when empty.
+
+## Requirements
+
+### Requirement: 系统能从上游拉取可用模型目录
+
+The system MUST call Kiro CodeWhisperer ListAvailableModels for a credential with a valid access token, attaching optional profileArn and using the credential effective proxy and standard Kiro REST headers.
+
+#### Scenario: 成功拉取
+
+- **WHEN** 凭据 token 有效且上游返回 200 与 models 数组
+- **THEN** 解析出每个 model 的 modelId（及可用元数据），供缓存写入
+
+#### Scenario: 上游失败保留旧缓存
+
+- **WHEN** ListAvailableModels 返回非 200 或网络失败
+- **THEN** 返回可诊断错误，且 MUST NOT 用空列表静默覆盖该凭据已有 model 缓存
+
+#### Scenario: 坏 profileArn 时无 ARN 重试
+
+- **WHEN** 带 profileArn 的 ListAvailableModels 返回 403 unauthorized，且不带 profileArn 可成功
+- **THEN** 系统 MUST 无 ARN 重试成功并 SHOULD 清除本地坏/占位 profileArn
+
+### Requirement: 双层模型缓存
+
+The system MUST maintain a per-credential model id set and a global aggregated model catalog derived from successful refreshes.
+
+#### Scenario: 单凭据刷新写入
+
+- **WHEN** 管理员对凭据 id 执行 models refresh 且上游成功
+- **THEN** 该凭据 model set 更新为本次结果，且全局 catalog 合并去重后包含这些 modelId
+
+#### Scenario: 删除凭据清理
+
+- **WHEN** 凭据被删除
+- **THEN** 其 per-credential 模型缓存被移除，且全局 catalog 不再仅依赖已删除凭据的独有条目（或在下次聚合刷新时收敛）
+
+### Requirement: Admin 可刷新与查看模型缓存
+
+Admin API MUST provide endpoints to refresh one credential, refresh all enabled credentials, and read a credential model list (cached; optional live fetch).
+
+#### Scenario: 单凭据刷新
+
+- **WHEN** POST /api/admin/credentials/{id}/models/refresh 且凭据存在
+- **THEN** 返回 success 与 count/models（或等价字段），并更新缓存
+
+#### Scenario: 全量刷新统计失败
+
+- **WHEN** POST /api/admin/credentials/models/refresh 且部分凭据失败
+- **THEN** 响应包含 refreshed 与 failed 计数及失败明细，成功凭据缓存仍被更新
+
+#### Scenario: 凭据不存在
+
+- **WHEN** 对不存在的 id 刷新或查看模型
+- **THEN** 返回 404 且不修改全局缓存
+
+### Requirement: GET /v1/models 优先使用全局缓存
+
+GET /v1/models MUST prefer the global model catalog when non-empty, generating thinking variants per project rules for models that support them, and MUST fall back to the existing static model list when the catalog is empty. When building the response from the catalog, the system MUST expose only model ids that the model-resolution pipeline accepts for client requests under current configuration (mapped Claude ids and, when enabled, catalog-passthrough ids). Static fallback model ids MUST each be resolvable by the same pipeline. Compatibility alias ids (such as auto or gpt-4o) MAY be included when configured to expose them, and SHOULD be distinguishable from upstream Anthropic ids when exposed.
+
+#### Scenario: 缓存非空
+
+- **WHEN** 全局 catalog 含至少一个上游 modelId 且该 id 可被 resolve 接受
+- **THEN** 响应 data 包含该 modelId 及对应 thinking 变体（若适用），且字段结构仍为 models 列表对象
+
+#### Scenario: 缓存为空兼容
+
+- **WHEN** 全局 catalog 为空
+- **THEN** 响应回退到现有静态模型列表行为，关键兼容模型 id 仍可被客户端发现
+
+#### Scenario: catalog 路径不暴露永远不可请求的 id
+
+- **WHEN** 全局 catalog 含某 modelId，且在当前配置下 resolve_model 拒绝该 id
+- **THEN** 该 modelId 不得出现在 GET /v1/models 的 data 中（thinking 变体亦不得单独暴露）
+
+#### Scenario: 透传开启时暴露 catalog 上游 id
+
+- **WHEN** allowCatalogPassthrough 为 true 且 catalog 含可透传上游 id 且 resolve 接受
+- **THEN** GET /v1/models 可包含该上游 id 作为可请求模型
+
+#### Scenario: 静态 fallback 均可解析
+
+- **WHEN** 全局 catalog 为空并返回静态 fallback 列表
+- **THEN** 列表中每个 model id（含 thinking 变体中的基座 id 经既有规则解析后）均可被 resolve_model 接受
+
+### Requirement: 空缓存时可后台预热模型目录
+
+When the global model catalog is empty at process start or when serving GET /v1/models fallback, the system MUST attempt a limited-concurrency asynchronous refresh of enabled credentials when practical, or document why skipped, and MUST ensure client GET /v1/models is never blocked on full refresh of models for enabled credentials without failing client requests if refresh fails.
+
+#### Scenario: 启动预热不阻塞
+
+- **WHEN** 进程启动且存在至少一个启用凭据
+- **THEN** 系统可后台尝试 ListAvailableModels 预热；失败仅记录日志，不影响监听与处理 HTTP
+
+#### Scenario: /v1/models 不因预热阻塞
+
+- **WHEN** 客户端请求 GET /v1/models 且 catalog 仍为空
+- **THEN** 立即返回 fallback（或当前缓存），MUST NOT 同步等待全量上游刷新完成
+
+### Requirement: Admin 可查看全局模型 catalog 摘要
+
+Admin API MUST provide a read of the aggregated global model catalog (model ids, count, and optional updatedAt) for operators, without requiring a specific credential id.
+
+#### Scenario: 读取全局 catalog
+
+- **WHEN** 已认证 Admin 调用 GET /api/admin/models/catalog（或等价路径）
+- **THEN** 返回 success、count 与 models 列表（可为空），且响应不含 accessToken/refreshToken 明文
+
+#### Scenario: 未认证拒绝
+
+- **WHEN** 无有效 adminApiKey 访问该路径
+- **THEN** 返回 401/403 且不泄露 catalog 细节给未授权方（行为与其他 Admin API 一致）
+
+### Requirement: 生命周期触发异步刷新
+
+After a credential is successfully added while enabled, or transitions from disabled to enabled, the system MUST attempt an asynchronous models refresh for that credential without failing the original admin operation if refresh fails.
+
+#### Scenario: 添加后异步刷新
+
+- **WHEN** 新凭据添加成功且处于启用状态
+- **THEN** 后台尝试 ListAvailableModels；失败仅记录日志，添加 API 仍返回成功
+
+### Requirement: Admin catalog 可附带解析元数据
+
+Admin global catalog and per-credential model list responses MUST include per-id resolution metadata (at least whether the id is resolvable/testable and the resolved target id/kind when known), so operators can distinguish raw upstream ids from client-callable ids without guessing.
+
+#### Scenario: 查看 raw 与 testable
+
+- **WHEN** 已认证 Admin 读取 credentials/{id}/models 且缓存含 auto 与 claude-sonnet-4.6
+- **THEN** 响应仍能展示 raw 列表，并可通过元数据或并列字段判断哪些 id 对 test/chat 可解析

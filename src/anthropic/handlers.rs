@@ -2,11 +2,11 @@
 
 use std::convert::Infallible;
 
-use anyhow::Error;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
+use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
@@ -21,11 +21,19 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request};
+use super::converter::{
+    ConversionError, THINKING_SUFFIX, convert_request_with_policy, resolve_model,
+};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
-use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
+use super::types::{
+    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
+    OutputConfig, Thinking,
+};
 use super::websearch;
+use crate::kiro::model::available_models::model_id_set;
+use crate::model::config::ModelResolutionConfig;
+use std::collections::HashSet;
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
@@ -70,10 +78,149 @@ fn map_provider_error(err: Error) -> Response {
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
-pub async fn get_models() -> impl IntoResponse {
+pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
-    let models = vec![
+    let (policy, catalog) = resolution_context_from_state(&state);
+
+    // 优先全局模型缓存；空则静态 fallback（兼容现状）
+    if let Some(provider) = &state.kiro_provider {
+        let catalog_models = provider.token_manager().global_model_catalog();
+        if !catalog_models.is_empty() {
+            let models = models_from_catalog(&catalog_models, &policy);
+            return Json(ModelsResponse {
+                object: "list".to_string(),
+                data: models,
+            });
+        }
+    }
+
+    let models = static_fallback_models();
+    let _ = catalog; // catalog empty path uses static fallback
+    Json(ModelsResponse {
+        object: "list".to_string(),
+        data: models,
+    })
+}
+
+pub(crate) fn resolution_context_from_state(
+    state: &AppState,
+) -> (ModelResolutionConfig, Option<HashSet<String>>) {
+    if let Some(provider) = &state.kiro_provider {
+        let tm = provider.token_manager();
+        let policy = tm.config().model_resolution.clone();
+        let catalog = tm.global_model_catalog();
+        let set = model_id_set(&catalog);
+        let set = if set.is_empty() { None } else { Some(set) };
+        (policy, set)
+    } else {
+        (ModelResolutionConfig::default(), None)
+    }
+}
+
+fn models_from_catalog(
+    catalog: &[crate::kiro::model::available_models::UpstreamModelInfo],
+    policy: &ModelResolutionConfig,
+) -> Vec<Model> {
+    let now = chrono::Utc::now().timestamp();
+    let set = model_id_set(catalog);
+    let catalog_ref = if set.is_empty() { None } else { Some(&set) };
+    let mut out = Vec::with_capacity(catalog.len() * 2 + 8);
+    let mut seen = HashSet::new();
+
+    for m in catalog {
+        match resolve_model(&m.model_id, policy, catalog_ref) {
+            Ok(resolved) => {
+                // public id: catalog 原始 id（透传）或归一后 Claude id
+                let public_id = if resolved.kind == super::converter::ResolveKind::Passthrough {
+                    m.model_id.clone()
+                } else {
+                    // 对 Claude 归一，优先展示上游 catalog id（若本身已是上游 id）
+                    m.model_id.clone()
+                };
+                if !seen.insert(public_id.to_lowercase()) {
+                    continue;
+                }
+                let max_tokens = m
+                    .token_limits
+                    .as_ref()
+                    .and_then(|t| t.max_output_tokens)
+                    .unwrap_or(64_000);
+                let display = m.model_name.clone().unwrap_or_else(|| public_id.clone());
+                let owned_by = if public_id.to_lowercase().starts_with("claude") {
+                    "anthropic"
+                } else {
+                    "kiro-proxy"
+                };
+                out.push(Model {
+                    id: public_id.clone(),
+                    object: "model".to_string(),
+                    created: now,
+                    owned_by: owned_by.to_string(),
+                    display_name: display.clone(),
+                    model_type: "chat".to_string(),
+                    max_tokens,
+                });
+                // thinking 变体：仅对 Claude 归一/别名有意义；透传也提供可选 thinking id
+                let thinking_id = format!("{}{}", public_id, THINKING_SUFFIX);
+                if seen.insert(thinking_id.to_lowercase()) {
+                    out.push(Model {
+                        id: thinking_id,
+                        object: "model".to_string(),
+                        created: now,
+                        owned_by: owned_by.to_string(),
+                        display_name: format!("{} (Thinking)", display),
+                        model_type: "chat".to_string(),
+                        max_tokens,
+                    });
+                }
+                let _ = resolved;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    model_id = %m.model_id,
+                    "skip unmapped catalog model id"
+                );
+            }
+        }
+    }
+
+    if policy.expose_compat_aliases_in_models {
+        for (alias, _) in super::converter::builtin_compat_aliases() {
+            if !seen.insert(alias.to_lowercase()) {
+                continue;
+            }
+            if resolve_model(alias, policy, catalog_ref).is_ok() {
+                out.push(Model {
+                    id: (*alias).to_string(),
+                    object: "model".to_string(),
+                    created: now,
+                    owned_by: "kiro-proxy".to_string(),
+                    display_name: format!("{} (compat)", alias),
+                    model_type: "chat".to_string(),
+                    max_tokens: 64_000,
+                });
+            }
+        }
+        // auto
+        if seen.insert("auto".to_string()) && resolve_model("auto", policy, catalog_ref).is_ok() {
+            out.push(Model {
+                id: "auto".to_string(),
+                object: "model".to_string(),
+                created: now,
+                owned_by: "kiro-proxy".to_string(),
+                display_name: "Auto (default chat model)".to_string(),
+                model_type: "chat".to_string(),
+                max_tokens: 64_000,
+            });
+        }
+    }
+
+    out
+}
+
+fn static_fallback_models() -> Vec<Model> {
+    vec![
         Model {
             id: "claude-sonnet-5".to_string(),
             object: "model".to_string(),
@@ -218,12 +365,7 @@ pub async fn get_models() -> impl IntoResponse {
             model_type: "chat".to_string(),
             max_tokens: 64000,
         },
-    ];
-
-    Json(ModelsResponse {
-        object: "list".to_string(),
-        data: models,
-    })
+    ]
 }
 
 /// POST /v1/messages
@@ -274,26 +416,28 @@ pub async fn post_messages(
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
-    // 转换请求
-    let conversion_result = match convert_request(&payload) {
-        Ok(result) => result,
-        Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-            };
-            tracing::warn!("请求转换失败: {}", e);
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response();
-        }
-    };
+    // 转换请求（使用运行时 modelResolution + catalog）
+    let (policy, catalog_set) = resolution_context_from_state(&state);
+    let conversion_result =
+        match convert_request_with_policy(&payload, &policy, catalog_set.as_ref()) {
+            Ok(result) => result,
+            Err(e) => {
+                let (error_type, message) = match &e {
+                    ConversionError::UnsupportedModel(model) => {
+                        ("invalid_request_error", format!("模型不支持: {}", model))
+                    }
+                    ConversionError::EmptyMessages => {
+                        ("invalid_request_error", "消息列表为空".to_string())
+                    }
+                };
+                tracing::warn!("请求转换失败: {}", e);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new(error_type, message)),
+                )
+                    .into_response();
+            }
+        };
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
@@ -349,7 +493,15 @@ pub async fn post_messages(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+        )
+        .await
     }
 }
 
@@ -369,7 +521,8 @@ async fn handle_stream_request(
     };
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx =
+        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -559,14 +712,14 @@ async fn handle_non_stream_request(
                                 let input: serde_json::Value = if buffer.is_empty() {
                                     serde_json::json!({})
                                 } else {
-                                    serde_json::from_str(buffer)
-                                        .unwrap_or_else(|e| {
-                                            tracing::warn!(
-                                                "工具输入 JSON 解析失败: {}, tool_use_id: {}",
-                                                e, tool_use.tool_use_id
-                                            );
-                                            serde_json::json!({})
-                                        })
+                                    serde_json::from_str(buffer).unwrap_or_else(|e| {
+                                        tracing::warn!(
+                                            "工具输入 JSON 解析失败: {}, tool_use_id: {}",
+                                            e,
+                                            tool_use.tool_use_id
+                                        );
+                                        serde_json::json!({})
+                                    })
                                 };
 
                                 let original_name = tool_name_map
@@ -585,10 +738,9 @@ async fn handle_non_stream_request(
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
                             let window_size = get_context_window_size(model);
-                            let actual_input_tokens = (context_usage.context_usage_percentage
-                                * (window_size as f64)
-                                / 100.0)
-                                as i32;
+                            let actual_input_tokens =
+                                (context_usage.context_usage_percentage * (window_size as f64)
+                                    / 100.0) as i32;
                             context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
@@ -679,7 +831,7 @@ async fn handle_non_stream_request(
 /// - Opus 4.6：覆写为 adaptive 类型
 /// - 其他模型：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
-fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
+pub(crate) fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let model_lower = payload.model.to_lowercase();
     if !model_lower.contains("thinking") {
         return;
@@ -705,7 +857,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
     });
-    
+
     if is_adaptive_thinking {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
@@ -788,26 +940,28 @@ pub async fn post_messages_cc(
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
-    // 转换请求
-    let conversion_result = match convert_request(&payload) {
-        Ok(result) => result,
-        Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-            };
-            tracing::warn!("请求转换失败: {}", e);
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response();
-        }
-    };
+    // 转换请求（使用运行时 modelResolution + catalog）
+    let (policy, catalog_set) = resolution_context_from_state(&state);
+    let conversion_result =
+        match convert_request_with_policy(&payload, &policy, catalog_set.as_ref()) {
+            Ok(result) => result,
+            Err(e) => {
+                let (error_type, message) = match &e {
+                    ConversionError::UnsupportedModel(model) => {
+                        ("invalid_request_error", format!("模型不支持: {}", model))
+                    }
+                    ConversionError::EmptyMessages => {
+                        ("invalid_request_error", "消息列表为空".to_string())
+                    }
+                };
+                tracing::warn!("请求转换失败: {}", e);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new(error_type, message)),
+                )
+                    .into_response();
+            }
+        };
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
@@ -863,7 +1017,15 @@ pub async fn post_messages_cc(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+        )
+        .await
     }
 }
 
@@ -886,7 +1048,12 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let ctx = BufferedStreamContext::new(
+        model,
+        estimated_input_tokens,
+        thinking_enabled,
+        tool_name_map,
+    );
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);
@@ -990,4 +1157,121 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::converter::map_model;
+    use crate::kiro::model::available_models::{TokenLimits, UpstreamModelInfo};
+
+    #[test]
+    fn static_fallback_models_has_core_ids() {
+        let models = static_fallback_models();
+        let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"claude-sonnet-5"));
+        assert!(ids.contains(&"claude-sonnet-5-thinking"));
+        assert!(ids.contains(&"claude-sonnet-4-6"));
+        assert!(ids.contains(&"claude-haiku-4-5-20251001"));
+        assert!(models.iter().all(|m| m.object == "model"));
+    }
+
+    #[test]
+    fn static_fallback_models_all_mappable() {
+        let models = static_fallback_models();
+        for m in &models {
+            assert!(
+                map_model(&m.id).is_some(),
+                "static fallback id must be mappable: {}",
+                m.id
+            );
+        }
+    }
+
+    #[test]
+    fn models_from_catalog_adds_thinking_variants() {
+        let catalog = vec![UpstreamModelInfo {
+            model_id: "claude-sonnet-4.6".into(),
+            model_name: Some("Claude Sonnet 4.6".into()),
+            description: None,
+            input_types: vec![],
+            rate_multiplier: None,
+            token_limits: Some(TokenLimits {
+                max_input_tokens: Some(1_000_000),
+                max_output_tokens: Some(64_000),
+            }),
+        }];
+        let policy = ModelResolutionConfig::default();
+        let models = models_from_catalog(&catalog, &policy);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "claude-sonnet-4.6");
+        assert_eq!(models[1].id, "claude-sonnet-4.6-thinking");
+        assert_eq!(models[0].max_tokens, 64_000);
+        assert!(models[1].display_name.contains("Thinking"));
+        assert!(map_model(&models[0].id).is_some());
+        assert!(map_model(&models[1].id).is_some());
+    }
+
+    #[test]
+    fn models_from_catalog_skips_unmapped() {
+        let catalog = vec![
+            UpstreamModelInfo {
+                model_id: "claude-sonnet-4.6".into(),
+                model_name: Some("Claude Sonnet 4.6".into()),
+                description: None,
+                input_types: vec![],
+                rate_multiplier: None,
+                token_limits: None,
+            },
+            UpstreamModelInfo {
+                model_id: "totally-unknown-model".into(),
+                model_name: Some("Unknown".into()),
+                description: None,
+                input_types: vec![],
+                rate_multiplier: None,
+                token_limits: None,
+            },
+        ];
+        let mut policy = ModelResolutionConfig::default();
+        policy.allow_catalog_passthrough = false;
+        let models = models_from_catalog(&catalog, &policy);
+        let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"claude-sonnet-4.6"));
+        assert!(ids.contains(&"claude-sonnet-4.6-thinking"));
+        assert!(!ids.iter().any(|id| id.contains("totally-unknown")));
+        assert_eq!(models.len(), 2);
+    }
+
+    #[test]
+    fn models_from_catalog_passthrough_when_enabled() {
+        let catalog = vec![
+            UpstreamModelInfo {
+                model_id: "claude-sonnet-4.6".into(),
+                model_name: Some("Claude Sonnet 4.6".into()),
+                description: None,
+                input_types: vec![],
+                rate_multiplier: None,
+                token_limits: None,
+            },
+            UpstreamModelInfo {
+                model_id: "gpt-5.6-sol".into(),
+                model_name: Some("GPT Sol".into()),
+                description: None,
+                input_types: vec![],
+                rate_multiplier: None,
+                token_limits: None,
+            },
+        ];
+        let policy = ModelResolutionConfig::default();
+        let models = models_from_catalog(&catalog, &policy);
+        let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"gpt-5.6-sol"));
+        assert!(ids.contains(&"gpt-5.6-sol-thinking"));
+    }
+
+    #[test]
+    fn models_from_catalog_empty() {
+        let policy = ModelResolutionConfig::default();
+        assert!(models_from_catalog(&[], &policy).is_empty());
+    }
 }
