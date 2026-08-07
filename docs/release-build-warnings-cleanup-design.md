@@ -163,7 +163,7 @@ openspec validate --all
 >
 > 另有一道非强制的本地防线：`scripts/git-hooks/pre-push`，装法 `git config core.hooksPath scripts/git-hooks`。
 >
-> 归档位置：`openspec/changes/archive/` 下的 `add-ci-warning-gate` 目录（归档动作执行时确定日期前缀）。
+> 归档位置：`openspec/changes/archive/2026-08-07-add-ci-warning-gate/`。
 
 当前 CI（`.github/workflows/build.yaml:131`、`build-dev-release.yaml:123`）只跑 `cargo build --release`，无 `-D warnings`，也无 clippy 步骤。清零之后没有任何机制防止回归。
 

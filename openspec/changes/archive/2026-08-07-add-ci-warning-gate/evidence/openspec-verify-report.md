@@ -164,7 +164,9 @@ CI 侧五行判定全部有证据。**7 个被引用的 run ID 逐个经 `gh api
 | validate 失败 | **不触发** —— 21 passed, 0 failed |
 | 工件之间存在冲突且无法判断有效事实源 | **不触发** —— 3 处行号漂移已修正，无语义冲突 |
 
-**结论：具备归档条件。** 归档时需补一处：`docs/release-build-warnings-cleanup-design.md` 状态横幅中的归档目录路径，将「归档动作执行时确定日期前缀」替换为实际日期前缀（预期 `openspec/changes/archive/2026-08-07-add-ci-warning-gate`）。
+**结论：具备归档条件。** 归档时需补一处：`docs/release-build-warnings-cleanup-design.md` 状态横幅中的归档目录路径，将「归档动作执行时确定日期前缀」替换为实际日期前缀。
+
+> **归档后补记（2026-08-07）**：上述占位已填为 `openspec/changes/archive/2026-08-07-add-ci-warning-gate/`。delta spec 已由 `openspec-sync-specs` 同步至 `openspec/specs/build-warning-hygiene/spec.md`（3 个 Requirement 纯追加，逐字比对 IDENTICAL），归档前复核待应用变更数为 0。
 
 ## 六、本次验证实跑命令
 

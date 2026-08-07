@@ -162,7 +162,7 @@ error: could not compile `kiro-rs` (bin "kiro-rs" test) due to 1 previous error
 - [x] 6.7c 真实发布效果核对：GHCR `version_count` 18 → 21（新增 amd64/arm64/manifest 三个 digest），`beta` alias 从 `sha256:f960b53f3ebe`（`beta-dcd935`）移至 `sha256:78ef98d46858`（`beta-693ea2`）。**`latest` 仍钉在 `sha256:dcd5c510f9ed` 未被触碰** —— master push 走 `is_beta=true` 只动 `beta` alias，符合 design.md「Context」小节对既有行为的描述，本 change 未改变该语义
 - [x] 6.8 更新 `docs/release-build-warnings-cleanup-design.md`「后续项：CI 缺少告警门禁」小节（:158）：加状态横幅标注已落地、merge commit `693ea21`、PR #3，并说明**最终形态与该节当初设想的差异** —— 该节建议「在 CI 增加一步并对告警失败」，落地方案没有把 `-D warnings` 加到发布产物线，只放在钉版门禁 job 内，理由指向 `docs/warning-gate-two-line-defense-design.md`。原「建议」段落保留作决策留档。
 
-  **口径调整**：任务原文写「归档后」更新，实际在归档前完成。理由：待记录的事实（落地形态、merge commit、设计差异）此刻均已确定，而归档目录的日期前缀取决于归档执行时间，故该处按「`openspec/changes/archive/` 下的 `add-ci-warning-gate` 目录（归档动作执行时确定日期前缀）」表述，不预填未发生的日期。归档时如需补精确路径，属一行文本更新
+  **口径调整**：任务原文写「归档后」更新，实际主体在归档前完成。理由：待记录的事实（落地形态、merge commit、设计差异）此刻均已确定，而归档目录的日期前缀取决于归档执行时间，故先按占位表述，不预填未发生的日期。**归档动作执行时（2026-08-07）该占位已填为 `openspec/changes/archive/2026-08-07-add-ci-warning-gate/`**，本任务全部内容落地完成
 
 ## 7. 后续项登记（本 change 不做）
 
