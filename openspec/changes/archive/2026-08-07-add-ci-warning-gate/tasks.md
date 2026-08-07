@@ -127,9 +127,9 @@ error: could not compile `kiro-rs` (bin "kiro-rs" test) due to 1 previous error
 - [x] 5.2 `AGENTS.md` 高风险矩阵新增「CI / 告警门禁」行，明确要求红路径证据
 - [x] 5.3 「任意代码改动」行措辞对齐：注明 CI 门禁在准绳基础上附加 `-D warnings` 与 `--locked`，准绳本身不变
 - [x] 5.4 三个 ADDED Requirement 逐条比对实现（rg 取证）：
-  - R1「发布路径机器强制点」→ `warning-gate.yaml:35` 钉版、`:59/:66` 判定命令两遍、`:58/:65` `RUSTFLAGS: -D warnings`、`:32` dist 供给；产物线未设 `RUSTFLAGS`（`build.yaml`/`build-dev-release.yaml`/`Dockerfile` rg 零命中，符合「产物构建不得升级告警」）
+  - R1「发布路径机器强制点」→ `warning-gate.yaml:45` 钉版、`:69/:76` 判定命令两遍、`:68/:75` `RUSTFLAGS: -D warnings`、`:42` dist 供给、`:50` 版本断言；产物线未设 `RUSTFLAGS`（`build.yaml`/`build-dev-release.yaml`/`Dockerfile` rg 零命中，符合「产物构建不得升级告警」）。**行号已按 4c.1 加入 `permissions` 块后的实际位置校正**（原记 `:35/:59/:66/:58/:65/:32` 为加块之前的位置，整体下移 10 行）
   - R2「人工触发默认 dry-run」→ `docker-build.yaml:15` `publish` 输入、`:30` 非矩阵 `pre-check` 输出、`:51-58` 三路径计算、`:110/:124/:135` 约束登录/push/manifest、`:123` dry-run 关 `cache-to`
-  - R3「本地防线为机器动作」→ `pre-push:10` 装法、`:13/:57/:94` 非强制性与绕过方式、`:92` 去重计数拒绝；`AGENTS.md:39` 与 `README.md:108-111` 同步记录非强制性
+  - R3「本地防线为机器动作」→ `pre-push:16` 装法、`:18-19` 非强制性三条、`:86/:123` 绕过方式提示、`:112` `sort -u` 去重、`:121` 计数拒绝；`AGENTS.md:39` 与 `README.md:103-111` 同步记录非强制性。**行号已按 4c.3 加入判定面差异注释后的实际位置校正**（原记 `:10/:13/:57/:94/:92` 为加注释之前的位置）
 - [x] 5.5 `openspec validate --all` 实跑：21 passed, 0 failed
 
 ## 6. 完成验证与合入
@@ -152,8 +152,17 @@ error: could not compile `kiro-rs` (bin "kiro-rs" test) due to 1 previous error
   **成功标准对照**：proposal.md「CI 侧」五行判定全部取得证据；对照基线 master run `30985624336`（5m59s）与 `30985624269`（7m22s），本次 gate 引入的额外前置耗时为 2m03s，7 腿本身耗时未见劣化
 - [x] 6.5a 临时分支清理：`git push --delete` 远端两条分支（输出 `- [deleted] codex/warning-gate-red-test`、`- [deleted] codex/warning-gate-verify`），`git branch -D` 删本地（`900914f`/`9366872`）。验证：`git ls-remote --heads "refs/heads/codex/*"` 返回空；本地 `git branch --list "codex/*"` 仅剩无关的 `codex/ai-engineering-baseline`（先前存在，按 surgical changes 纪律不动）。dev 的 `src/main.rs` 无探针残留
 - [x] 6.6 合入前判据实测（2026-08-07）：`merge-base(origin/master, dev)` = `dcd9351`，`git diff --quiet dcd9351 origin/master` **退出码 0** —— master 相对 merge-base 无内容变化，全部内容来自已验证的 dev 树。`git rev-list --left-right --count origin/master...dev` = `0 1`（master 无独有提交，dev 领先 1 个即门禁实现提交 `9366872`）。合入窗口期无新 PR 先落 master 的风险
-- [ ] 6.7 PR + Create a merge commit 合入 master —— **待用户决定，未自行执行**。实现提交 `9366872` 当前只在本地 dev，`origin/dev` 仍停在 `d85cfb6`。理由：推 dev 会触发 `build-dev-release.yaml` 的滚动 prerelease 重建（release job `git tag -f dev-latest` force-push + `gh release delete` 后重建），合并 master 更会触发正式发布路径，二者均属需用户确认时机的发布副作用。CI 证据已由 `codex/` 临时分支取得，不依赖推 dev
-- [ ] 6.8 归档后更新 `docs/release-build-warnings-cleanup-design.md` 的「后续项」小节，标注已落地与归档位置 —— 依赖归档动作，归档前无法完成
+- [x] 6.7 合入完成（2026-08-07，用户授权后执行）：
+  - 推 dev（`d85cfb6..f77582a`）。hook 在真实推送前跑准绳命令并放行（`0 warnings. OK.`）
+  - 该 push 触发两条流水线，**首次验证 push 事件下的门禁挂载**（此前证据均来自 `workflow_dispatch`）：`Build Dev Release` [31149901171](https://github.com/wtfdelphia/kiro.rs/actions/runs/31149901171) **全绿含 release job**（补齐 `build-dev-release.yaml` 的 `needs: [prepare, warning-gate]` 无条件接线证据）；`Build Artifacts` [31149901178](https://github.com/wtfdelphia/kiro.rs/actions/runs/31149901178) 全绿，`release` 按 tag 条件 skipped
+  - 滚动 prerelease 按设计重建：`dev-latest` tag 移至 `f77582a`，release 标题更新为 `Dev rolling build (f77582a)`，7 个 asset 齐。这是 `build-dev-release.yaml` 的既有滚动行为，非本 change 引入
+  - PR [#3](https://github.com/wtfdelphia/kiro.rs/pull/3) `dev -> master`，`mergeable: MERGEABLE`，以 **Create a merge commit** 合入，merge commit `693ea21`
+- [x] 6.7a 门禁热缓存耗时补测：`Build Dev Release` 的 gate job **2m02s**，与冷缓存首跑 2m03s 几乎相同。说明该 job 耗时主要由依赖编译构成而非缓存下载，`Swatinem/rust-cache` 的复用对总时长影响有限。7.9 的收紧判据据此可用单一值而非区间
+- [x] 6.7b 合入后 master 流水线验证（**门禁首次在真实发布路径上把关**）：merge commit `693ea21` 触发两条流水线，均 success —— `Build Artifacts` [31150605819](https://github.com/wtfdelphia/kiro.rs/actions/runs/31150605819)；`Build and Push Docker Images` [31150605792](https://github.com/wtfdelphia/kiro.rs/actions/runs/31150605792)，其 `manifest` job **真实执行**（与 1.10 dry-run 的 skipped 形成对照，证明 `should_publish` 两个分支都正确）
+- [x] 6.7c 真实发布效果核对：GHCR `version_count` 18 → 21（新增 amd64/arm64/manifest 三个 digest），`beta` alias 从 `sha256:f960b53f3ebe`（`beta-dcd935`）移至 `sha256:78ef98d46858`（`beta-693ea2`）。**`latest` 仍钉在 `sha256:dcd5c510f9ed` 未被触碰** —— master push 走 `is_beta=true` 只动 `beta` alias，符合 design.md「Context」小节对既有行为的描述，本 change 未改变该语义
+- [x] 6.8 更新 `docs/release-build-warnings-cleanup-design.md`「后续项：CI 缺少告警门禁」小节（:158）：加状态横幅标注已落地、merge commit `693ea21`、PR #3，并说明**最终形态与该节当初设想的差异** —— 该节建议「在 CI 增加一步并对告警失败」，落地方案没有把 `-D warnings` 加到发布产物线，只放在钉版门禁 job 内，理由指向 `docs/warning-gate-two-line-defense-design.md`。原「建议」段落保留作决策留档。
+
+  **口径调整**：任务原文写「归档后」更新，实际主体在归档前完成。理由：待记录的事实（落地形态、merge commit、设计差异）此刻均已确定，而归档目录的日期前缀取决于归档执行时间，故先按占位表述，不预填未发生的日期。**归档动作执行时（2026-08-07）该占位已填为 `openspec/changes/archive/2026-08-07-add-ci-warning-gate/`**，本任务全部内容落地完成
 
 ## 7. 后续项登记（本 change 不做）
 
