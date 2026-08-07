@@ -50,8 +50,13 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "::notice::Dev rolling release tag: ${RELEASE_TAG} (commit ${SHORT_SHA})"
 
+  warning-gate:
+    uses: ./.github/workflows/warning-gate.yaml
+
   build:
-    needs: prepare
+    needs:
+      - prepare
+      - warning-gate
     strategy:
       fail-fast: false
       matrix:
@@ -120,7 +125,7 @@ jobs:
           sudo apt-get install -y musl-tools
 
       - name: Build app
-        run: cargo build --release --target ${{ matrix.target }} ${{ contains(matrix.target, 'musl') && '--no-default-features' || '' }}
+        run: cargo build --release --locked --target ${{ matrix.target }} ${{ contains(matrix.target, 'musl') && '--no-default-features' || '' }}
 
       - name: Stage binary for release
         shell: bash

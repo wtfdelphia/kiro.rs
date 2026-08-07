@@ -1,0 +1,76 @@
+name: Warning Gate
+
+# Reusable warning gate. Called by build.yaml, build-dev-release.yaml and
+# docker-build.yaml before any artifact is produced.
+#
+# Design note: this job pins the toolchain on purpose while the release
+# matrices float on stable. Rust's stability promise covers "code that
+# compiles today still compiles tomorrow", not "produces no new warnings":
+# every stable cycle may add lints. Escalating warnings to errors on a
+# floating toolchain would turn an external release schedule into a
+# release-blocking trigger. So the measuring instrument is pinned and the
+# production line is not. See docs/warning-gate-two-line-defense-design.md.
+
+on:
+  workflow_call:
+
+# A reusable workflow inherits the caller's permissions block when it does not
+# declare its own: contents: write from build.yaml / build-dev-release.yaml,
+# packages: write from docker-build.yaml. This job only runs cargo check, yet
+# doing so executes every dependency's build script (the default feature set
+# builds vendored OpenSSL). Narrowing to read-only keeps that third-party code
+# away from a write token. A reusable workflow may only equal or narrow the
+# caller's permissions, so this does not affect the callers.
+permissions:
+  contents: read
+
+jobs:
+  warning-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # src/admin_ui/router.rs embeds admin-ui/dist at compile time via
+      # rust-embed. That directory is gitignored, and the derive macro fails
+      # compilation outright when it is missing. Warnings are determined by
+      # Rust sources alone, so an empty placeholder is enough here; no need
+      # to run the full frontend build.
+      - name: Provide admin-ui/dist placeholder
+        run: mkdir -p admin-ui/dist
+
+      - name: Setup pinned Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+
+      - name: Assert pinned toolchain
+        run: |
+          set -euo pipefail
+          EXPECTED="1.97.1"
+          ACTUAL="$(rustc --version)"
+          echo "rustc: ${ACTUAL}"
+          if [[ "${ACTUAL}" != *"${EXPECTED}"* ]]; then
+            echo "::error::Warning gate expects rustc ${EXPECTED} but found: ${ACTUAL}"
+            exit 1
+          fi
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "warning-gate"
+          cache-on-failure: true
+
+      # Same judgment surface as the local authoritative command
+      # (cargo check --release --all-targets), plus -D warnings and --locked.
+      - name: Check default features
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo check --release --all-targets --locked
+
+      # musl release artifacts ship with --no-default-features, so that
+      # feature combination needs its own pass.
+      - name: Check without default features
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo check --release --all-targets --locked --no-default-features

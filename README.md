@@ -100,6 +100,16 @@
 cargo build --release
 ```
 
+> **可选：启用本地告警检查**
+>
+> 本项目要求编译告警保持为零（详见 `AGENTS.md`「零新增编译告警」）。仓库内置了一个 `pre-push` 钩子，会在推送前运行判定命令，有告警时拒绝推送：
+>
+> ```bash
+> git config core.hooksPath scripts/git-hooks
+> ```
+>
+> 该命令幂等，执行一次即可。注意这道检查**不是强制的**：它需要上面这次配置才生效，新克隆的仓库默认未启用，`git push --no-verify` 也可以绕过。强制判定点在 CI 的告警门禁（`.github/workflows/warning-gate.yaml`），门禁失败时不会产出任何发布物。
+
 ### 2. 最小配置
 
 创建 `config.json`：
