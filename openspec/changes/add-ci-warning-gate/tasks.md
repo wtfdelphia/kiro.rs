@@ -37,9 +37,9 @@ sha256:d2c98b828b92 tags=["v2026.8.4-arm64"]
 - [x] 1.7 `pre-check` job（非矩阵）新增 `should_publish` 输出。计算块置于 `should_build` 的 `if/else` 之外无条件执行，因此三条路径均有定义：`workflow_dispatch` 且 `inputs.publish == true` → true；`workflow_dispatch` 其余 → false 并发 `::notice::Dry run`；非 dispatch（master/tag push）→ true。附注释说明为何不放在矩阵 job
 - [x] 1.8 `should_publish` 约束三处：GHCR 登录步骤加 `if:`（:103）、`build-push-action` 的 `push:` 改为表达式（:117）、manifest job 加 `needs: [pre-check, build]` 与 `if:`（:125-128）
 - [x] 1.9 `cache-from: type=gha` 保留；`cache-to` 改为条件表达式（:116），dry-run 时为空串。验证：`python yamlcheck` 解析三条 workflow 全部 OK，job 依赖图为 `pre-check → build → manifest(needs pre-check+build)`
-- [ ] 1.10 验证：自 dev 建 `codex/` 临时分支，以 `publish=false` dispatch `docker-build.yaml`，确认双架构 build 绿、smoke test 绿、manifest job skipped；记录 run URL
-- [ ] 1.10a 用 0.3a 的取证命令复跑，逐行比对：`latest` 仍为 `sha256:dcd5c510f9ed`、`version_count` 仍为 18、无新 digest 进入
-- [ ] 1.11 验证后删除该临时分支
+- [x] 1.10 验证（2026-08-07 实跑）：自 dev 建 `codex/warning-gate-verify`，以 `publish=false` dispatch `docker-build.yaml` → run [31148217637](https://github.com/wtfdelphia/kiro.rs/actions/runs/31148217637) **success**。双架构 build 全绿，`manifest` job **skipped**，`Log in to GitHub Container Registry` 步骤 **skipped**（step 5，证明 dry-run 从未登录 registry）。构建日志逐项确认：`rust:1-alpine` 解析为 `sha256:3c38f3f8`、`[builder 4/7] COPY Cargo.toml Cargo.lock ./` 命中（三处锁定自洽，未因去通配失败）、`[builder 7/7] RUN cargo build --release --no-default-features --locked` 成功、`[stage-2 5/5] RUN ./kiro-rs --version` 输出 `kiro-rs 2026.3.1` 退出 0（只断言退出码，版本漂移属 version-governance 范围，符合 D7）
+- [x] 1.10a 用 0.3a 的取证命令复跑（dry-run 后）：`version_count=18`、`updated_at=2026-08-05T07:42:53Z`（**未变**）、`latest` 仍为 `sha256:dcd5c510f9ed`，六行 digest/tag 输出与 0.3a 基准**逐行一致**，无新 digest 进入。dry-run 零发布副作用成立
+- [x] 1.11 临时分支删除见 6.5a（与红路径分支同批清理，两条分支的取证均已固化到本文件）
 
 ## 2. CI reusable gate 与流水线挂载
 
@@ -56,17 +56,30 @@ sha256:d2c98b828b92 tags=["v2026.8.4-arm64"]
 - [x] 2.11 `build-dev-release.yaml:123` `Build app` 增加 `--locked`；同样未加 `RUSTFLAGS`
 - [x] 2.12 `docker-build.yaml` 新增 `warning-gate` 调用 job（`needs: pre-check` + `should_build` 条件）；`build.needs` 改为 `[pre-check, warning-gate]`
 - [x] 2.12a YAML 语法与接线验证：`python yamlcheck` 四条 workflow 全部 OK；job 图为 gate 插在 pre-check/prepare 与 build 之间，release/manifest 经 build 传递依赖；gate 的 `on` 键解析为 `workflow_call`、7 个 step、`timeout-minutes: 20`
-- [ ] 2.13 验证绿路径：推 dev，确认 gate 通过、7 腿全绿、Docker 绿；记录 run URL 与耗时（对照基线 master run `30985624336` 5m59s、`30985624269` 7m22s）
-- [ ] 2.14 记录 gate 冷缓存首跑实际耗时；若逼近 `timeout-minutes: 20` 先放宽，待缓存稳定后按 2-3 倍余量收紧
+- [x] 2.13 验证绿路径（2026-08-07 实跑）：run [31148152382](https://github.com/wtfdelphia/kiro.rs/actions/runs/31148152382) **success** —— `pre-check` 绿 → `warning-gate / warning-gate` 绿 → **7 腿全绿**（Linux-x64 3m52s、Linux-arm64 3m37s、Linux-musl-x64 2m33s、Linux-musl-arm64 2m51s、Windows-x64 5m17s、macOS-x64 3m48s、macOS-arm64 4m11s），`release` job **skipped**。Docker 绿见 1.10。
+
+  **偏离说明**：本任务原文写「推 dev」，实际改为 `codex/warning-gate-verify` 分支 + `workflow_dispatch` `build.yaml`。理由：推 dev 会触发 `build-dev-release.yaml`，其 release job 会 `git tag -f dev-latest` force-push 并 `gh release delete` 重建滚动 prerelease，属真实发布副作用；而 `build.yaml` 的 release job 条件为 `startsWith(github.ref, 'refs/tags/v')`，dispatch 到分支时不满足故 skipped，只产 Actions artifact。gate 与 7 腿的证据等价（同一 reusable workflow、相同 `needs` 接线、相同 7 腿矩阵），但零发布副作用。这与 design.md 验证策略中「禁止 dispatch build-dev-release.yaml」的同一顾虑一致，此处把该顾虑同样应用于绿路径
+- [x] 2.14 gate 冷缓存首跑实测 **2m03s**（run 31148152382，独立 `shared-key: warning-gate` 故必为冷缓存，含 vendored OpenSSL 编译）。距 `timeout-minutes: 20` 有约 10 倍余量，**无需放宽**；按 2-3 倍余量收紧的判据对应 4-6 分钟，但冷缓存首跑样本仅 1 个，暂不收紧以留波动空间，登记为后续项 7.9
 
 ## 3. 红路径实验（门禁真的会拦的直接证据）
 
 只验证绿路径不能证明门禁会拦。
 
-- [ ] 3.1 自 dev 建 `codex/warning-gate-red-test` 临时分支，植入一条产生告警的 commit（如未使用的私有函数）
-- [ ] 3.2 用 `workflow_dispatch` 对该分支手动触发 **`build.yaml`**。**禁止 dispatch `build-dev-release.yaml`**：其 dispatch 可指向任意分支，且 release job 会 `git tag -f dev-latest` force-push 并删除重建滚动 prerelease
-- [ ] 3.3 确认 gate 红、矩阵 job 未启动、无产物上传；记录 run URL
-- [ ] 3.4 删除该临时分支，确认实验 commit 未落 dev
+- [x] 3.1 自 dev 建 `codex/warning-gate-red-test`，植入 commit `7c9533b`：`src/main.rs` 末尾加 `fn gate_red_test_probe() {}`（无下划线前缀，规避 4.5b 记录的 lint 豁免陷阱），附注释说明该提交只存在于临时分支
+- [x] 3.2 用 `workflow_dispatch` 对该分支触发 **`build.yaml`**（未触碰 `build-dev-release.yaml`，理由见任务原文）
+- [x] 3.3 **红路径成立**（2026-08-07 实跑）：run [31148197200](https://github.com/wtfdelphia/kiro.rs/actions/runs/31148197200) **failure** —— `pre-check` success → `warning-gate / warning-gate` **failure** → `build` **skipped** → `release` **skipped**。矩阵 job 从未启动，无产物上传。失败日志的完整因果链：
+
+```text
+rustc: rustc 1.97.1 (8bab26f4f 2026-07-14)          <- 钉版断言通过
+error: function `gate_red_test_probe` is never used  <- dead_code 经 -D warnings 升级为 error
+268 | fn gate_red_test_probe() {}
+error: could not compile `kiro-rs` (bin "kiro-rs") due to 1 previous error
+error: could not compile `kiro-rs` (bin "kiro-rs" test) due to 1 previous error
+##[error]Process completed with exit code 101
+```
+
+  该 run 顺带实证三项此前只是推断的假设：① `dtolnay/rust-toolchain@1.97.1` 分支的钉版行为如设计所述，版本断言步骤通过；② **空 `admin-ui/dist` 占位足以通过编译** —— 编译推进到了 `src/main.rs:268` 的探针，说明 rust-embed 派生宏的目录存在性检查已被满足（proposal.md Assumptions 第 2 条由「继承的实验结论」升级为 CI 实测事实，无需升级为完整 `pnpm build`）；③ `--all-targets` 覆盖 bin 与 test 两个目标
+- [x] 3.4 分支删除见 6.5a。实验 commit 未落 dev：`7c9533b`/`900914f` 只存在于 `codex/warning-gate-red-test`
 
 ## 4. 第一防线：pre-push hook
 
@@ -79,7 +92,12 @@ sha256:d2c98b828b92 tags=["v2026.8.4-arm64"]
 - [x] 4.5a 计数过滤器修正（实施中发现的真实 bug）：初版写 `grep -vE '^warning: [0-9]+ warning'`（rustc 格式），但 cargo 的汇总行实际是 ``warning: `kiro-rs` (bin "kiro-rs") generated 1 warning``，导致 1 个告警被计成 3。改为 `grep -vE '^warning: .* generated [0-9]+ warning'` 并追加 `sort -u`（bin 与 test 目标重复告警只计一次，符合 spec「计数口径为唯一告警点」）。修正后实测计数为 1
 - [x] 4.5b 探针命名陷阱（实施中发现）：首次探针命名 `__hook_probe_unused_fn` 与 `__x`，**不产生任何告警** —— Rust 的 `dead_code`/`unused_variables` lint 对以 `_` 开头的标识符豁免。改用无下划线前缀的 `hook_probe_dead_fn` 后正常报警。曾误判为缓存问题，经 `cargo metadata` 确认 bin target 指向 `src/main.rs`、注入语法错误确认 cargo 能看到改动后定位到真因
 - [x] 4.6 验证（放行路径）：恢复 `src/main.rs`（`git diff` 确认为空）并 touch 强制重编后实跑 hook → `pre-push: 0 warnings. OK.`，退出码 0。探针备份已清理，`git status` 确认 `src/main.rs` 无改动
-- [ ] 4.7 验证：`git push --no-verify` 可绕过（需真实推送，与第 3 组红路径实验合并执行）
+- [x] 4.7 验证（2026-08-07 真实推送实跑，非手动调用）：在 `codex/warning-gate-red-test` 追加第二个探针 commit `900914f`（`fn no_verify_probe() {}`），两次真实 `git push` 对比：
+  - **拒绝路径**：`git push` → hook 触发，输出 `warning: function 'gate_red_test_probe' is never used` 与 `warning: function 'no_verify_probe' is never used`，判定 `pre-push: 2 distinct compiler warning site(s) found. Push refused.`，退出码 1，ref 未更新。计数口径再次验证：cargo 输出含 4 行 `warning:`（2 个真实告警点 + `generated 2 warnings` 与 `generated 2 warnings (2 duplicates)` 两条汇总行），过滤与 `sort -u` 后正确得 2
+  - **绕过路径**：`git push --no-verify` → 3.7s 完成、**无任何 `pre-push:` 输出**、`7c9533b..900914f` 推送成功，退出码 0
+
+  故 README.md 与 AGENTS.md 的「`--no-verify` 可绕过」表述属实，非强制性记录准确
+- [x] 4.8 附带实证（本轮真实推送顺带取得）：hook 的**放行**路径同样在真实 `git push` 中验证 —— 推送 `codex/warning-gate-verify`（内容为门禁实现提交 `9366872`，零告警）时输出 `pre-push: /d/ProgramData/rust/cargo_home/bin/cargo check --release --all-targets` 与 `pre-push: 0 warnings. OK.` 后正常推送。此前 4.5/4.6 仅以手动 `bash` 调用验证，本项补齐了「git 真实调用 hook」这一层
 
 ## 4b. 代码审查修复（2026-08-07 审查结论）
 
@@ -120,18 +138,33 @@ sha256:d2c98b828b92 tags=["v2026.8.4-arm64"]
 - [x] 6.2 `$env:RUSTFLAGS = "-D warnings"` + `cargo check --release --all-targets --locked`：退出码 0，20.02s
 - [x] 6.3 同上加 `--no-default-features`：退出码 0，6.52s；随后 `Remove-Item Env:RUSTFLAGS`，确认 unset
 - [x] 6.4 `git status --short`：7 个修改 + 1 个新增（已 `--chmod=+x` 入 index）+ 5 个未跟踪（gate workflow、3 份 docs 设计文档、change 目录）。无 `config.json`/`credentials.json`；`.codegraph` 经 `git check-ignore` 确认已忽略；探针备份已清理，`src/main.rs` 零改动
-- [ ] 6.5 汇总 CI 证据：gate 绿路径、红路径拦截、7 腿全绿、Docker dry-run 无副作用，逐条附 run URL
-- [ ] 6.6 合入前判据：`git diff --quiet $(git merge-base origin/master dev) origin/master` 退出码 0（当前实测为 0；该判据取代 `--is-ancestor`，后者在 merge commit 形态下恒为 false）
-- [ ] 6.7 PR + Create a merge commit 合入 master
-- [ ] 6.8 归档后更新 `docs/release-build-warnings-cleanup-design.md` 的「后续项」小节，标注已落地与归档位置
+- [x] 6.5 CI 证据汇总（全部 2026-08-07 实跑，基线提交 `9366872`）：
+
+| 证据 | run | 结果 |
+| --- | --- | --- |
+| gate 绿路径 + 7 腿全绿 | [31148152382](https://github.com/wtfdelphia/kiro.rs/actions/runs/31148152382) | success；gate 2m03s，7 腿 2m33s-5m17s，`release` skipped |
+| 告警红路径拦截 | [31148197200](https://github.com/wtfdelphia/kiro.rs/actions/runs/31148197200) | failure；gate 红 → `build`/`release` **skipped**，exit 101，无产物 |
+| Docker 双架构 dry-run | [31148217637](https://github.com/wtfdelphia/kiro.rs/actions/runs/31148217637) | success；双架构绿、smoke test 输出 `kiro-rs 2026.3.1`、GHCR 登录 skipped、`manifest` skipped |
+| GHCR 无副作用 | 取证命令（0.3a） | `version_count=18`、`updated_at` 未变、`latest` 仍 `sha256:dcd5c510f9ed`，六行逐行一致 |
+| gate 在全新检出下可编译 | 31148197200 日志 | 编译推进至 `src/main.rs:268`，空 dist 占位生效 |
+| hook 真实推送拒绝 / 绕过 | 本地 `git push` | 拒绝 exit 1（2 告警点）；`--no-verify` exit 0 且无 hook 输出 |
+
+  **成功标准对照**：proposal.md「CI 侧」五行判定全部取得证据；对照基线 master run `30985624336`（5m59s）与 `30985624269`（7m22s），本次 gate 引入的额外前置耗时为 2m03s，7 腿本身耗时未见劣化
+- [x] 6.5a 临时分支清理：`git push --delete` 远端两条分支（输出 `- [deleted] codex/warning-gate-red-test`、`- [deleted] codex/warning-gate-verify`），`git branch -D` 删本地（`900914f`/`9366872`）。验证：`git ls-remote --heads "refs/heads/codex/*"` 返回空；本地 `git branch --list "codex/*"` 仅剩无关的 `codex/ai-engineering-baseline`（先前存在，按 surgical changes 纪律不动）。dev 的 `src/main.rs` 无探针残留
+- [x] 6.6 合入前判据实测（2026-08-07）：`merge-base(origin/master, dev)` = `dcd9351`，`git diff --quiet dcd9351 origin/master` **退出码 0** —— master 相对 merge-base 无内容变化，全部内容来自已验证的 dev 树。`git rev-list --left-right --count origin/master...dev` = `0 1`（master 无独有提交，dev 领先 1 个即门禁实现提交 `9366872`）。合入窗口期无新 PR 先落 master 的风险
+- [ ] 6.7 PR + Create a merge commit 合入 master —— **待用户决定，未自行执行**。实现提交 `9366872` 当前只在本地 dev，`origin/dev` 仍停在 `d85cfb6`。理由：推 dev 会触发 `build-dev-release.yaml` 的滚动 prerelease 重建（release job `git tag -f dev-latest` force-push + `gh release delete` 后重建），合并 master 更会触发正式发布路径，二者均属需用户确认时机的发布副作用。CI 证据已由 `codex/` 临时分支取得，不依赖推 dev
+- [ ] 6.8 归档后更新 `docs/release-build-warnings-cleanup-design.md` 的「后续项」小节，标注已落地与归档位置 —— 依赖归档动作，归档前无法完成
 
 ## 7. 后续项登记（本 change 不做）
 
-- [ ] 7.1 在归档记录中登记：平台专属告警覆盖（引入平台条件代码时重新评估，届时需同步钉住矩阵工具链）
-- [ ] 7.2 登记：clippy 门禁（需先做一轮存量清零）
-- [ ] 7.3 登记：CI 测试门禁（`cargo test`）
-- [ ] 7.4 登记：`pull_request` 触发器与分支保护（master 与 main 当前均无保护）
-- [ ] 7.5 登记：`main` 分支治理（default branch 但无 workflow 触发，停在 `d85cfb6`）
-- [ ] 7.6 登记：`docs/tooling-sources.md:12` 仍记 Rust 1.94.1，实际为 1.97.1
-- [ ] 7.7 登记：gate 工具链定期 bump（建议每 2-3 个 Rust 周期）
-- [ ] 7.8 登记：`docker-build.yaml` 的 `manifest` job 从矩阵 `build` 取 `version`/`is_beta` 输出（:152-153）。当前两腿算出的 version 恒等故无害，但与 4b.3 注释立下的「发布开关不得由矩阵 job 输出承载」原则相邻，宜迁至非矩阵 `pre-check` 计算（见 4c.8）
+本组任务的动作是**登记**而非实现。以下条目随本 change 的 tasks.md 入库，归档时连同 change 目录进入 `openspec/changes/archive/`，即完成登记。
+
+- [x] 7.1 登记：平台专属告警覆盖（本方案已知盲区）。引入平台条件代码时重新评估，届时需同步钉住矩阵工具链，否则回到 D1 的问题。当前全仓无 `cfg(windows)`/`cfg(unix)`/`target_os`/`target_arch` 平台业务分叉，盲区未被触发
+- [x] 7.2 登记：clippy 门禁（需先做一轮存量清零；项目从未跑过 clippy，全仓仅 `src/openai/responses_stream.rs:95` 一处 `#[allow]`）
+- [x] 7.3 登记：CI 测试门禁（`cargo test`）
+- [x] 7.4 登记：`pull_request` 触发器与分支保护。2026-08-07 复核：`main` 为 default branch，master 与 main 均无分支保护，仓库为 public
+- [x] 7.5 登记：`main` 分支治理（default branch 但无 workflow 触发；2026-08-07 复核 `origin/main` 与 `origin/dev` 同为 `d85cfb6`，三条 workflow 的 push 触发器只有 `master` 与 `dev`）
+- [x] 7.6 登记：`docs/tooling-sources.md:12` 仍记 Rust 1.94.1，实际为 1.97.1（本 change 不改该文件：它记录本机工具核验快照而非发布事实源，见 design.md D4 的同类判断）
+- [x] 7.7 登记：gate 工具链定期 bump（建议每 2-3 个 Rust 周期）。bump 时须按 spec 的「门禁工具链版本 bump 必须重新确认基线」场景重跑本地准绳命令并报告告警数
+- [x] 7.8 登记：`docker-build.yaml` 的 `manifest` job 从矩阵 `build` 取 `version`/`is_beta` 输出（:152-153）。当前两腿算出的 version 恒等故无害，但与 4b.3 注释立下的「发布开关不得由矩阵 job 输出承载」原则相邻，宜迁至非矩阵 `pre-check` 计算（见 4c.8）
+- [x] 7.9 登记：gate `timeout-minutes: 20` 的收紧判据。冷缓存首跑实测 2m03s（见 2.14），按 2-3 倍余量对应 4-6 分钟，但当前冷缓存样本仅 1 个；待积累若干 run 后按实际分布收紧

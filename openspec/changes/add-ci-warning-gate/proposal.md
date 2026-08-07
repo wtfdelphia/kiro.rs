@@ -120,7 +120,7 @@ CI 与构建配置：
 ## Assumptions
 
 - ~~`rust:1-alpine` tag 存在且指向 1.x 最新~~ —— **已不是假设**。用户于 2026-08-05 实跑确认：`docker pull rust:1-alpine` 正常解析并拉取；`docker run --rm rust:1-alpine rustc --version` 输出 `rustc 1.97.1 (8bab26f4f 2026-07-14)`，与本地、官方 channel 清单、7 个 runner 镜像逐位一致。AI 侧无法复核（本机 `auth.docker.io` 与 `registry-1.docker.io` 超时不可达，且未安装 docker CLI）。
-- **空 `admin-ui/dist` 占位足以通过编译。** 继承 `docs/ci-warning-gate-design.md` 的两轮强制重编实验结论（rust-embed 8.9.0 派生宏只检查目录存在性，嵌入内容不参与告警生成）。若 CI 实跑发现不足，升级为完整 `pnpm install` + `pnpm build`，不改门禁语义。
+- ~~空 `admin-ui/dist` 占位足以通过编译~~ —— **已不是假设**（2026-08-07 CI 实测）。run [31148197200](https://github.com/wtfdelphia/kiro.rs/actions/runs/31148197200) 在全新 runner 检出上编译推进到了 `src/main.rs:268` 的探针函数，说明 rust-embed 派生宏的目录存在性检查已被 `mkdir -p admin-ui/dist` 满足。原依据（`docs/ci-warning-gate-design.md` 的两轮本机强制重编实验）由此升级为 CI 实测事实，无需升级为完整 `pnpm install` + `pnpm build`。
 - **gate 只需回答布尔问题。** 告警计数与报告职责属本地准绳，因此 `-D warnings` 的提前中止语义可接受，spec 不必为 CI 再写一套计数口径。
 - **runner 预装 Rust 当前即 stable。** 实测 Ubuntu 22.04 x64/arm64、Ubuntu 24.04、Windows 2022、macOS 15 x64/arm64 全部为 Rust 1.97.1 + Rustup 1.29.0，与官方 channel 清单一致。故 `@stable` 步骤当前实际零下载。这是巧合而非机制保证，不构成本 change 的依赖。
 - **gate 与产物线的编译器版本会随时间分离。** stable 前进后产物线可能产生 gate 看不见的新 lint 告警。这是有意接受的：那些告警不阻断发布，等 gate 版本 bump 时统一面对。
