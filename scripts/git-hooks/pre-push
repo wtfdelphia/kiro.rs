@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+#
+# First line of defense for the zero-warning rule.
+#
+# Runs the authoritative warning command and refuses the push when warnings
+# exist. Uses the plain command (no -D warnings) on purpose: the point here is
+# to show the developer *which* warnings exist, not just answer yes/no.
+#
+# This hook's judgment surface is deliberately narrower than the CI gate's. The
+# gate additionally passes --locked and runs a second pass with
+# --no-default-features, so a clean run here does NOT imply a green gate: a
+# warning that only appears without default features, or a stale Cargo.lock,
+# passes this check and still fails CI.
+#
+# Install (one-time, idempotent):
+#   git config core.hooksPath scripts/git-hooks
+#
+# This check is NOT binding. It needs the config above to take effect, a fresh
+# clone does not have it active, and `git push --no-verify` bypasses it. The
+# binding enforcement point is the CI warning gate.
+
+set -uo pipefail
+
+# git feeds the ref list on stdin, one line per ref:
+#   <local ref> <local sha1> <remote ref> <remote sha1>
+# This gate judges the whole work tree rather than individual refs, so the
+# list is not needed, but it must still be drained. The warning command below
+# takes tens of seconds, and leaving the pipe unread can block git's writer
+# once its buffer fills (e.g. `git push --all` with many refs).
+#
+# While draining, note whether every ref is a deletion: a deletion pushes no
+# new code, so running the gate for it would only add a pointless wait.
+only_deletions=1
+saw_ref=0
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+  saw_ref=1
+  if [[ "${local_sha}" != "0000000000000000000000000000000000000000" ]]; then
+    only_deletions=0
+  fi
+done
+
+if [[ "${saw_ref}" -eq 1 && "${only_deletions}" -eq 1 ]]; then
+  echo "pre-push: deletion-only push, skipping the warning gate."
+  exit 0
+fi
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [[ -z "${repo_root}" ]]; then
+  echo "pre-push: not inside a git work tree; refusing to guess." >&2
+  exit 1
+fi
+cd "${repo_root}" || exit 1
+
+# Locate cargo. On Windows the hook may run under a bash whose PATH does not
+# include the Windows toolchain (Git for Windows' MSYS bash, or WSL bash when
+# invoked manually), so fall back to CARGO_HOME / rustup's default location
+# before giving up.
+find_cargo() {
+  if command -v cargo >/dev/null 2>&1; then
+    command -v cargo
+    return 0
+  fi
+
+  local candidates=()
+  if [[ -n "${CARGO_HOME:-}" ]]; then
+    candidates+=("${CARGO_HOME}/bin/cargo" "${CARGO_HOME}/bin/cargo.exe")
+  fi
+  candidates+=("${HOME:-}/.cargo/bin/cargo" "${HOME:-}/.cargo/bin/cargo.exe")
+  if [[ -n "${USERPROFILE:-}" ]]; then
+    candidates+=("${USERPROFILE}/.cargo/bin/cargo.exe")
+  fi
+
+  local c
+  for c in "${candidates[@]}"; do
+    if [[ -x "${c}" ]]; then
+      printf '%s\n' "${c}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+if ! CARGO_BIN="$(find_cargo)"; then
+  echo "pre-push: cargo not found on PATH, in \$CARGO_HOME/bin, or in ~/.cargo/bin." >&2
+  echo "pre-push: install Rust, set CARGO_HOME, or bypass explicitly with 'git push --no-verify'." >&2
+  exit 1
+fi
+
+GATE_CMD=("${CARGO_BIN}" check --release --all-targets)
+
+echo "pre-push: ${GATE_CMD[*]}"
+output="$("${GATE_CMD[@]}" 2>&1)"
+status=$?
+
+if [[ ${status} -ne 0 ]]; then
+  echo "${output}" >&2
+  echo "" >&2
+  echo "pre-push: the warning gate command failed (exit ${status}). Push refused." >&2
+  exit 1
+fi
+
+# Count distinct warning sites, matching the counting rule in the
+# build-warning-hygiene spec: cargo's per-target summary lines
+# (warning: `crate` (bin "crate") generated N warnings) are not warning sites
+# and must not be counted, and a warning reported for both the bin and test
+# targets counts once.
+warnings="$(
+  printf '%s\n' "${output}" \
+    | grep -E '^warning: ' \
+    | grep -vE '^warning: .* generated [0-9]+ warning' \
+    | sort -u \
+    || true
+)"
+count="$(printf '%s' "${warnings}" | grep -c . || true)"
+
+if [[ "${count}" -gt 0 ]]; then
+  echo "" >&2
+  echo "${output}" >&2
+  echo "" >&2
+  echo "pre-push: ${count} distinct compiler warning site(s) found. Push refused." >&2
+  echo "pre-push: fix the underlying problems (see AGENTS.md 'zero new warnings')." >&2
+  echo "pre-push: to bypass explicitly, use 'git push --no-verify'." >&2
+  exit 1
+fi
+
+echo "pre-push: 0 warnings. OK."
+exit 0

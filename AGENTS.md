@@ -34,7 +34,14 @@
 - 确有正当保留理由时，用最小范围 `#[allow(...)]` 并在紧邻位置注明理由
 - 提交前若告警数高于变更基线，视为未完成
 
-背景与首轮清零方案见 `docs/release-build-warnings-cleanup-design.md`。
+### 两道防线
+
+- **第一防线（本地，非强制）**：`scripts/git-hooks/pre-push`，装法 `git config core.hooksPath scripts/git-hooks`。跑原始准绳命令，有告警则拒绝推送。需一次性配置才生效，新克隆默认未启用，`--no-verify` 可绕过
+- **第二防线（CI，硬失败）**：`.github/workflows/warning-gate.yaml`，挂在三条流水线的产物构建之前。判定命令与准绳逐 flag 一致，额外附加 `-D warnings` 与 `--locked`，并覆盖 default 与 `--no-default-features` 两种组合。门禁红则不产出 release、镜像与 manifest
+- 门禁工具链**钉版**（`dtolnay/rust-toolchain@1.97.1`），而 7 腿产物与 Docker **浮动 stable 且不带 `-D warnings`**：Rust 的兼容承诺不覆盖「不产生新告警」，若发布路径升级告警，编译器发版即可在零代码变更下中断发布
+- 告警**计数**始终取自原始准绳命令；门禁只回答「有无告警」，其提前中止不作为计数依据
+
+背景与首轮清零方案见 `docs/release-build-warnings-cleanup-design.md`；两道防线的完整论证见 `docs/warning-gate-two-line-defense-design.md`。
 
 ## OpenSpec 条件
 
@@ -86,9 +93,10 @@ OpenSpec 官方 init 已提供：`openspec-propose`、`openspec-apply-change`、
 | Admin / 凭据 CRUD | admin 测试；禁止真实凭据 |
 | 模型映射 | 映射/converter 相关测试 |
 | Docker / 发布 | Dockerfile、compose、workflows 审查 |
+| CI / 告警门禁 | `warning-gate.yaml` 与三条流水线接线审查；YAML 可解析；绿路径与**红路径**都要有 run 证据（只验证绿路径不能证明门禁会拦） |
 | admin-ui | `pnpm build`（及已有测试） |
 | OpenSpec | `openspec validate --all` |
-| 任意代码改动 | `cargo check --release --all-targets` 无新增告警 |
+| 任意代码改动 | `cargo check --release --all-targets` 无新增告警（CI 门禁在此基础上附加 `-D warnings` 与 `--locked`） |
 
 ## 验证纪律
 
