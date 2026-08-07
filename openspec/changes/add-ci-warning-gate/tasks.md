@@ -127,9 +127,9 @@ error: could not compile `kiro-rs` (bin "kiro-rs" test) due to 1 previous error
 - [x] 5.2 `AGENTS.md` 高风险矩阵新增「CI / 告警门禁」行，明确要求红路径证据
 - [x] 5.3 「任意代码改动」行措辞对齐：注明 CI 门禁在准绳基础上附加 `-D warnings` 与 `--locked`，准绳本身不变
 - [x] 5.4 三个 ADDED Requirement 逐条比对实现（rg 取证）：
-  - R1「发布路径机器强制点」→ `warning-gate.yaml:35` 钉版、`:59/:66` 判定命令两遍、`:58/:65` `RUSTFLAGS: -D warnings`、`:32` dist 供给；产物线未设 `RUSTFLAGS`（`build.yaml`/`build-dev-release.yaml`/`Dockerfile` rg 零命中，符合「产物构建不得升级告警」）
+  - R1「发布路径机器强制点」→ `warning-gate.yaml:45` 钉版、`:69/:76` 判定命令两遍、`:68/:75` `RUSTFLAGS: -D warnings`、`:42` dist 供给、`:50` 版本断言；产物线未设 `RUSTFLAGS`（`build.yaml`/`build-dev-release.yaml`/`Dockerfile` rg 零命中，符合「产物构建不得升级告警」）。**行号已按 4c.1 加入 `permissions` 块后的实际位置校正**（原记 `:35/:59/:66/:58/:65/:32` 为加块之前的位置，整体下移 10 行）
   - R2「人工触发默认 dry-run」→ `docker-build.yaml:15` `publish` 输入、`:30` 非矩阵 `pre-check` 输出、`:51-58` 三路径计算、`:110/:124/:135` 约束登录/push/manifest、`:123` dry-run 关 `cache-to`
-  - R3「本地防线为机器动作」→ `pre-push:10` 装法、`:13/:57/:94` 非强制性与绕过方式、`:92` 去重计数拒绝；`AGENTS.md:39` 与 `README.md:108-111` 同步记录非强制性
+  - R3「本地防线为机器动作」→ `pre-push:16` 装法、`:18-19` 非强制性三条、`:86/:123` 绕过方式提示、`:112` `sort -u` 去重、`:121` 计数拒绝；`AGENTS.md:39` 与 `README.md:103-111` 同步记录非强制性。**行号已按 4c.3 加入判定面差异注释后的实际位置校正**（原记 `:10/:13/:57/:94/:92` 为加注释之前的位置）
 - [x] 5.5 `openspec validate --all` 实跑：21 passed, 0 failed
 
 ## 6. 完成验证与合入
