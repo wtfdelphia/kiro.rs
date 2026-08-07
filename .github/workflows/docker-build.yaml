@@ -12,6 +12,11 @@ on:
         description: 'Version tag for Docker images (e.g., 2025.12.1)'
         required: true
         default: '2026.1.1'
+      publish:
+        description: 'Push images to GHCR. Leave false for a build-only dry run.'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -22,6 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
+      should_publish: ${{ steps.check.outputs.should_publish }}
     steps:
       - uses: actions/checkout@v5
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
@@ -37,8 +43,35 @@ jobs:
             echo "should_build=true" >> $GITHUB_OUTPUT
           fi
 
-  build:
+          # Publishing side effects require either an automatic trigger from
+          # master/tag, or an explicit opt-in on the manual trigger. Computed
+          # here (a non-matrix job) because a matrix job's outputs resolve to
+          # whichever leg finishes last.
+          #
+          # This block MUST NOT depend on the work tree: the checkout step
+          # above is skipped for workflow_dispatch, and that is the only path
+          # where a wrong value could cause an unintended publish. Keep the
+          # decision based on event/input context alone.
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ "${{ inputs.publish }}" == "true" ]]; then
+              echo "should_publish=true" >> $GITHUB_OUTPUT
+            else
+              echo "should_publish=false" >> $GITHUB_OUTPUT
+              echo "::notice::Dry run: images will be built but not pushed"
+            fi
+          else
+            echo "should_publish=true" >> $GITHUB_OUTPUT
+          fi
+
+  warning-gate:
     needs: pre-check
+    if: needs.pre-check.outputs.should_build == 'true'
+    uses: ./.github/workflows/warning-gate.yaml
+
+  build:
+    needs:
+      - pre-check
+      - warning-gate
     if: needs.pre-check.outputs.should_build == 'true'
     runs-on: ${{ matrix.runner }}
     outputs:
@@ -79,6 +112,7 @@ jobs:
         uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
+        if: needs.pre-check.outputs.should_publish == 'true'
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -91,8 +125,8 @@ jobs:
           context: .
           platforms: ${{ matrix.platform }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
-          push: true
+          cache-to: ${{ needs.pre-check.outputs.should_publish == 'true' && 'type=gha,mode=max' || '' }}
+          push: ${{ needs.pre-check.outputs.should_publish == 'true' }}
           provenance: false
           tags: ghcr.io/${{ github.repository_owner }}/kiro-rs:${{ steps.version.outputs.version }}-${{ matrix.arch }}
           labels: |
@@ -100,7 +134,10 @@ jobs:
             org.opencontainers.image.description=Kiro.rs Docker Image
 
   manifest:
-    needs: build
+    needs:
+      - pre-check
+      - build
+    if: needs.pre-check.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Log in to GitHub Container Registry
