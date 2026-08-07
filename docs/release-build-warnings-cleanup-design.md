@@ -157,6 +157,14 @@ openspec validate --all
 
 ## 后续项：CI 缺少告警门禁
 
+> **状态：已落地（2026-08-07）。** 由独立 change `add-ci-warning-gate` 实现，合入 master 的 merge commit 为 `693ea21`（PR #3）。下述「建议」段落保留原文作为决策留档。
+>
+> 最终形态与本节当初的设想有一处重要差异：本节建议「在 CI 增加一步 `cargo check --release --all-targets` 并对告警失败」，而落地方案**没有**把 `-D warnings` 加到发布产物线上，只放在一个**钉版**的独立门禁 job 内（`.github/workflows/warning-gate.yaml`，`dtolnay/rust-toolchain@1.97.1`），7 腿产物与 Docker 保持浮动 stable 且不升级告警。理由：Rust 的兼容承诺不覆盖「不产生新告警」，浮动工具链叠加 `-D warnings` 会让编译器发版在零代码变更下中断发布。完整论证见 `docs/warning-gate-two-line-defense-design.md`（该文档取代早期的 `docs/ci-warning-gate-design.md`）。
+>
+> 另有一道非强制的本地防线：`scripts/git-hooks/pre-push`，装法 `git config core.hooksPath scripts/git-hooks`。
+>
+> 归档位置：`openspec/changes/archive/` 下的 `add-ci-warning-gate` 目录（归档动作执行时确定日期前缀）。
+
 当前 CI（`.github/workflows/build.yaml:131`、`build-dev-release.yaml:123`）只跑 `cargo build --release`，无 `-D warnings`，也无 clippy 步骤。清零之后没有任何机制防止回归。
 
 「零新增告警」要真正落地，需要在 CI 增加一步 `cargo check --release --all-targets` 并对告警失败。但这属于 CI/发布脚本变更，命中 `AGENTS.md`「OpenSpec 条件」中的 Docker / 发布 / CI 部署脚本强制项，且超出本方案"不改变运行时行为"的范围。
@@ -205,4 +213,3 @@ openspec-new-change / openspec-propose
 未运行 `cargo test`。因此"A 类收敛后测试仍通过"未经验证，属实施阶段需承担的剩余风险。
 
 本文档为分析产物，未修改任何源码。
-
