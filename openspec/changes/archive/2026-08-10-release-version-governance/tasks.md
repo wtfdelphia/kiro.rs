@@ -53,4 +53,4 @@
 - [x] 8.1 运行 `spec-compliance-check` 并修复范围、设计、场景、项目规则、验证和文档同步问题
 - [x] 8.2 运行 `openspec-verify-change`，产出归档前验证报告
 - [x] 8.3 运行 `verification-before-completion`，记录真实命令、告警数、文档同步、`git status --short` 与剩余风险
-- [ ] 8.4 用户确认实现与证据后再运行 `openspec-archive-change`；本任务不自动推送、创建 PR、合并或删除远端分支
+- [x] 8.4 用户确认实现与证据后再运行 `openspec-archive-change`；本任务不自动推送、创建 PR、合并或删除远端分支
