@@ -32,6 +32,7 @@ async fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+    tracing::info!("kiro-rs v{}", env!("CARGO_PKG_VERSION"));
 
     // 加载配置
     let config_path = args

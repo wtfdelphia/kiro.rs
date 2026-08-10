@@ -3,15 +3,15 @@ name: Build and Push Docker Images
 on:
   push:
     branches:
-      - master
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag for Docker images (e.g., 2025.12.1)'
+        description: 'Build label used only for publish=false dry runs.'
         required: true
-        default: '2026.1.1'
+        default: 'dry-run'
       publish:
         description: 'Push images to GHCR. Leave false for a build-only dry run.'
         required: false
@@ -28,9 +28,10 @@ jobs:
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       should_publish: ${{ steps.check.outputs.should_publish }}
+      enforce_version: ${{ steps.check.outputs.enforce_version }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
     steps:
       - uses: actions/checkout@v5
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
         with:
           fetch-depth: 0
       - name: Check if commit has release tag
@@ -44,23 +45,32 @@ jobs:
           fi
 
           # Publishing side effects require either an automatic trigger from
-          # master/tag, or an explicit opt-in on the manual trigger. Computed
+          # main/tag, or an explicit opt-in on the manual trigger. Computed
           # here (a non-matrix job) because a matrix job's outputs resolve to
           # whichever leg finishes last.
           #
-          # This block MUST NOT depend on the work tree: the checkout step
-          # above is skipped for workflow_dispatch, and that is the only path
-          # where a wrong value could cause an unintended publish. Keep the
-          # decision based on event/input context alone.
+          # Manual publishing also resolves the release identity here so no
+          # matrix leg can select or override the public image version.
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             if [[ "${{ inputs.publish }}" == "true" ]]; then
               echo "should_publish=true" >> $GITHUB_OUTPUT
+              RELEASE_TAG=$(python scripts/check_release_version.py resolve --commit "${{ github.sha }}")
+              echo "enforce_version=true" >> $GITHUB_OUTPUT
+              echo "release_tag=${RELEASE_TAG}" >> $GITHUB_OUTPUT
             else
               echo "should_publish=false" >> $GITHUB_OUTPUT
+              echo "enforce_version=false" >> $GITHUB_OUTPUT
+              echo "release_tag=" >> $GITHUB_OUTPUT
               echo "::notice::Dry run: images will be built but not pushed"
             fi
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "should_publish=true" >> $GITHUB_OUTPUT
+            echo "enforce_version=true" >> $GITHUB_OUTPUT
+            echo "release_tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
           else
             echo "should_publish=true" >> $GITHUB_OUTPUT
+            echo "enforce_version=false" >> $GITHUB_OUTPUT
+            echo "release_tag=" >> $GITHUB_OUTPUT
           fi
 
   warning-gate:
@@ -68,10 +78,19 @@ jobs:
     if: needs.pre-check.outputs.should_build == 'true'
     uses: ./.github/workflows/warning-gate.yaml
 
+  version-gate:
+    needs: pre-check
+    uses: ./.github/workflows/version-gate.yaml
+    with:
+      enforce: ${{ needs.pre-check.outputs.enforce_version == 'true' }}
+      release_tag: ${{ needs.pre-check.outputs.release_tag }}
+      release_commit: ${{ github.sha }}
+
   build:
     needs:
       - pre-check
       - warning-gate
+      - version-gate
     if: needs.pre-check.outputs.should_build == 'true'
     runs-on: ${{ matrix.runner }}
     outputs:
@@ -96,11 +115,11 @@ jobs:
       - name: Determine version
         id: version
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          if [ -n "${{ needs.pre-check.outputs.release_tag }}" ]; then
+            echo "version=${{ needs.pre-check.outputs.release_tag }}" >> $GITHUB_OUTPUT
             echo "is_beta=false" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
             echo "is_beta=false" >> $GITHUB_OUTPUT
           else
             SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-6)
@@ -128,6 +147,8 @@ jobs:
           cache-to: ${{ needs.pre-check.outputs.should_publish == 'true' && 'type=gha,mode=max' || '' }}
           push: ${{ needs.pre-check.outputs.should_publish == 'true' }}
           provenance: false
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
           tags: ghcr.io/${{ github.repository_owner }}/kiro-rs:${{ steps.version.outputs.version }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
