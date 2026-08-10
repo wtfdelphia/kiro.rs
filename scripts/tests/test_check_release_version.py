@@ -62,25 +62,60 @@ class ReleaseVersionTest(unittest.TestCase):
 
         self.assert_validation_error("Cargo.toml version", tag)
 
-    def test_rejects_invalid_calendar_date(self):
+    def test_accepts_sequence_that_is_not_a_calendar_day(self):
+        # 第三段是当月发布序号，不是日历日：2 月没有 30 日，但 30 是合法序号
+        self.write_manifest("2026.2.30")
+        self.git("commit", "--allow-empty", "-am", "version 2026.2.30")
+        self.commit = self.git("rev-parse", "HEAD")
         tag = self.annotated_tag("v2026.2.30")
 
-        self.assert_validation_error("valid calendar date", tag)
+        result = validate_release(self.repo, tag, self.commit, "main")
+
+        self.assertEqual(result, "2026.2.30")
 
     def test_rejects_revision_suffix(self):
         tag = self.annotated_tag("v2026.8.7-1")
 
-        self.assert_validation_error("vYYYY.M.D", tag)
+        self.assert_validation_error("vYYYY.MM.MICRO", tag)
 
-    def test_rejects_leading_zero_month_or_day(self):
+    def test_rejects_leading_zero_month_or_micro(self):
         tag = self.annotated_tag("v2026.08.07")
 
-        self.assert_validation_error("vYYYY.M.D", tag)
+        self.assert_validation_error("vYYYY.MM.MICRO", tag)
+        self.assert_validation_error("vYYYY.MM.MICRO", self.annotated_tag("v2026.8.011"))
 
     def test_rejects_lightweight_tag(self):
         self.git("tag", "v2026.8.7")
 
         self.assert_validation_error("annotated", "v2026.8.7")
+
+    def release_at_new_commit(self, version):
+        """Tag a fresh commit whose Cargo version matches, then validate it."""
+        self.write_manifest(version)
+        self.git("commit", "--allow-empty", "-am", f"version {version}")
+        commit = self.git("rev-parse", "HEAD")
+        tag = f"v{version}"
+        self.git("tag", "-a", tag, "-m", f"Release {tag}")
+        return validate_release(self.repo, tag, commit, "main")
+
+    def test_accepts_multiple_releases_in_same_month(self):
+        # 同一年月内可发布多个正式版本；序号递增即可，不受同日限制
+        self.assertEqual(self.release_at_new_commit("2026.8.11"), "2026.8.11")
+        self.assertEqual(self.release_at_new_commit("2026.8.12"), "2026.8.12")
+
+    def test_accepts_sequence_above_two_digits(self):
+        # 序号无上界：原 [1-9]\d? 的两位上限来自日期语义，已放宽
+        self.assertEqual(self.release_at_new_commit("2026.8.100"), "2026.8.100")
+
+    def test_rejects_month_above_twelve(self):
+        # dt.date() 移除后，月份上界必须由显式校验保证
+        tag = self.annotated_tag("v2026.13.1")
+
+        self.assert_validation_error("invalid month 13", tag)
+
+    def test_rejects_zero_month_or_zero_sequence(self):
+        self.assert_validation_error("vYYYY.MM.MICRO", self.annotated_tag("v2026.0.1"))
+        self.assert_validation_error("vYYYY.MM.MICRO", self.annotated_tag("v2026.8.0"))
 
     def test_rejects_commit_not_reachable_from_main(self):
         self.git("checkout", "--orphan", "other")
