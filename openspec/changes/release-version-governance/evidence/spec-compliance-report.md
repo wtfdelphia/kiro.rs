@@ -3,7 +3,7 @@
 Change：`release-version-governance`
 日期：2026-08-10
 范围：任务 2.1-7.7 实现后、归档前审查
-总体状态：**WARN**（本地实现与验证完整；CI 红/绿 run 与 Docker inspect 需维护者补证）
+总体状态：**PASS**（2026-08-10 第二轮更新：Docker inspect、CI 红路径与绿路径均已实测取证）
 
 ## 六维审查
 
@@ -13,7 +13,7 @@ Change：`release-version-governance`
 | Design | PASS | D1 附注 CalVer 身份、D2 双 gate 并列、D3 人工发布身份解析在非矩阵 job、D4 稳定触发器迁 `main`、D5 运行时与 OCI 可观测、D6 MSRV 1.97.1 均已落地 |
 | Scenarios | PASS（本地）| 7 个 Requirement 的场景由 `scripts/tests/` 23 个用例与本地命令覆盖；镜像 label 场景已由 2026-08-10 补验的真实 `docker build` + `docker image inspect` 证实（`evidence/docker-oci-version-label.md`） |
 | Project Rules | PASS | OpenSpec 流程完整；`cargo check --release --all-targets` 告警 0，相对基线零新增；无真实凭据、token、`.codegraph/` 进入候选提交 |
-| Verification | WARN | 本地命令全部真实运行并记录；Docker inspect 已补验通过，真实 CI run（7.5/7.6）仍明确待维护者并写入剩余风险 |
+| Verification | PASS | 本地命令全部真实运行；Docker inspect 已补验；CI 红路径（runs 31363555851 / 31363555870）与绿路径（runs 31367150384 / 31367150378）均已实测，红路径临时 tag 已清理 |
 | Docs Sync | PASS | README 已同步 MSRV、CalVer 约定、附注 tag 发布清单、`main` 落点、正式/非正式边界、人工镜像发布规则、`beta` 来源改为 `main`；AGENTS.md 无需改动（既有 OpenSpec/零告警/CI 红路径纪律已覆盖） |
 
 ## 场景到证据映射
@@ -30,12 +30,16 @@ Change：`release-version-governance`
 
 ## 发现项
 
-1. 门禁失败传播只有静态作业图证据（`test_every_artifact_job_depends_on_both_gates` 覆盖 build/release/manifest 的传递依赖），GitHub 上的 skipped 传播行为仍需真实红路径 run 证实。非阻塞。
+1. 门禁失败传播已由真实红路径 run 证实：两条 workflow 的 `build`/`release`/`manifest` 均为 skipped（非 failure、非 success），与 `test_every_artifact_job_depends_on_both_gates` 的静态断言一致。
+1b. 本轮红路径另暴露并修复一处真实缺陷：`actions/checkout` 执行 `git fetch --no-tags origin +<sha>:refs/tags/<tag>` 覆盖本地 tag ref，使 `git cat-file -t` 返回 `commit`，导致任何合法附注 tag 被误报为轻量 tag。已改为经 `git ls-remote` 的 peeled `^{}` 行从远端权威判定，并新增 6 个回归用例（23 → 40 passed）。
 2. `version-gate` job 不带 `if`，避免 skipped 传播误伤分支与 dry-run 产物，已由 `test_version_gate_is_never_skipped_for_non_release_builds` 固定。
 3. 目标 CalVer 取 `2026.8.10`（当日，远端最新正式 tag 为 `v2026.8.4`，`v2026.8.10` 不存在）。发版日期若不是当天，需维护者改 `Cargo.toml` 与 `Cargo.lock` 后重跑检查。
 
 ## 剩余风险
 
-- 本机无 actionlint：workflow lint 仍为 SKIPPED，只经 YAML 解析与作业图断言。任务 5.3 的镜像 inspect 已在 Docker 29.1.3 上完成（linux/amd64、经典 builder）；arm64 矩阵腿与 GHA 缓存行为仍待 CI 证据。
+- 本机无 actionlint：workflow lint 仍为 SKIPPED，只经 YAML 解析、作业图断言与真实 run 行为验证。
+- 任务 5.3 的镜像 inspect 已在 Docker 29.1.3 上完成（linux/amd64、经典 builder）；arm64 矩阵腿与 GHA 缓存行为已由绿路径 run `31367150378` 的 amd64/arm64 双腿与 manifest 成功间接覆盖。
+- 已发布 GHCR 镜像的 OCI label 未经直接 inspect（package 私有，本机 token 无 `read:packages`）；一致性由 CI 日志的 `--build-arg VERSION=v2026.8.10` 与本地同一 Dockerfile 的 label 实测两段证据推得。
+- 正式 tag 必须打在 `main`：`main` 与 `master` 因双 PR 各自产生 merge commit，`master` HEAD 不从 `main` 可达，在其上打 tag 会被门禁正确拒绝。
 - 任务 7.5/7.6 的真实 CI 绿/红 run URL 需维护者提供；临时失配 tag 的创建与删除不由本次实现执行。
 - 未 push、未创建 PR、未合并、未创建远端 tag、未归档。

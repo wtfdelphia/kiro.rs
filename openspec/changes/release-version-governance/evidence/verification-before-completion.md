@@ -1,6 +1,57 @@
 # Verification Before Completion
 
-> 本文件含三轮记录。第三轮（2026-08-10 补验）完成任务 5.3 的真实 Docker 取证，第二轮（2026-08-10）是实现后的最终验证，第一轮（2026-08-07）保留为实现前基线。
+> 本文件含四轮记录。第四轮（2026-08-10 归档前）完成 CI 红/绿路径与分支收敛，第三轮完成任务 5.3 的真实 Docker 取证，第二轮是实现后的最终验证，第一轮（2026-08-07）保留为实现前基线。
+
+## 第四轮：归档前最终验证（2026-08-10）
+
+范围：任务 7.5、7.6 由本会话实际执行；分支按 `dev` 推送 + `main`/`master` 双 PR 收敛；32/33 完成，仅余 8.4 归档。
+
+### Verification
+
+| 命令 / 检查 | 结果 | 结论 |
+| --- | --- | --- |
+| `cargo check --release --all-targets` | exit 0，**告警 0** | 与基线 0 一致，零新增告警 |
+| `python -m unittest` 三个门禁模块 | **40 passed** | 原 23 例 + 本轮新增 6 例远端 tag 判定回归 + 既有覆盖 |
+| `openspec validate --all` | 21 passed, 0 failed | schema 通过 |
+| `check_release_version.py validate`（正式 tag 本地演练） | `release identity valid: v2026.8.10 (Cargo 2026.8.10)` | 推送前身份齐备 |
+| 红路径 build run `31363555851` | `version-gate` failure、`warning-gate` success、`build`/`release` **skipped** | 门禁可拦，产物不启动 |
+| 红路径 docker run `31363555870` | 同上，`build`/`manifest` **skipped** | 两条流水线行为一致 |
+| 红路径 annotation | `Cargo.toml version '2026.8.10' does not match release tag 'v2026.8.11'; set ...` | 含具体修复指引 |
+| 红路径副作用 | 无 `v2026.8.11` Release；GHCR 无任何 `v2026.8.11*` tag | 拦截先于发布 |
+| 绿路径 build run `31367150384` | 全 success：两 gate + 7 腿产物 + `release` | 门禁可放 |
+| 绿路径 docker run `31367150378` | 全 success：两 gate + amd64/arm64 + `manifest` | 多架构发布完成 |
+| Release `v2026.8.10` | 7 个 `kiro-rs-v2026.8.10-*` 资产，非 prerelease、非 draft | 资产名与正式 tag 一致 |
+| GHCR tag | 新增 `v2026.8.10`、`latest`、`v2026.8.10-amd64`、`v2026.8.10-arm64` | 镜像 tag 与正式 tag 一致 |
+| gate 并行（run `31363555851` job 时间） | 两 gate 同秒 06:51:37Z 启动；version 6s 失败，warning 29s | version gate 不等待 warning gate |
+| dev 路径 run `31364313666` / `31364313707` | `build.yaml` version-gate success（`enforce=false`）；`build-dev-release.yaml` 无 version gate | 非正式路径不受正式门禁约束 |
+| `dev-latest` Release | prerelease，标题含短 SHA，正文含完整 commit 与 workflow | 非正式构建可追溯 |
+| 临时 tag 清理 | 两轮 `v2026.8.11` 均已从远端与本地删除，`git ls-remote` 无输出 | 无遗留污点 |
+| 分支收敛 | `git diff --quiet` 证实 dev/main/master 树内容一致；三分支 Cargo 均 `2026.8.10` | 无强推、无 reset、无删分支 |
+| `git status --short --untracked-files=all` | 仅本 change 的 evidence/tasks 改动 | 无 `config.json`、`credentials.*`、`.codegraph/` |
+
+### 本轮发现并修复的缺陷
+
+红路径暴露 version gate 的真实缺陷：`actions/checkout@v5` 在 tag 已存在时执行
+`git fetch --no-tags origin +<sha>:refs/tags/<tag>`，把 commit SHA 覆盖写入本地 tag ref，
+使 `git cat-file -t` 返回 `commit`，导致**任何**合法附注 tag 都被误报为轻量 tag。该判定先于
+Cargo 一致性检查，修复前绿路径必定被误拦。
+
+修复：改用 `git ls-remote` 的 peeled `^{}` 行从远端权威判定 tag 类型（必须用 glob refspec，
+精确 ref 名会抑制 peeled 行），`rev-parse` 改用 `^{commit}`，并新增 6 个回归用例。
+详见 `evidence/ci-red-green-path.md`。
+
+### Residual Risk（第四轮后）
+
+- 已发布 GHCR 镜像的 OCI label **未**经直接 inspect：该 package 为私有，本机 token 无
+  `read:packages` scope。一致性由「CI 日志中的 `--build-arg VERSION=v2026.8.10`」＋「任务 5.3
+  本地同一 Dockerfile 的 label 实测」两段证据推得，非端到端复核。
+- `main` 与 `master` 因双 PR 各自产生 merge commit，互有独有提交（非合并差异为 0，树一致）。
+  正式 tag 必须打在 `main`：门禁校验 `origin/main` 可达性，`master` 的 merge commit 不从
+  `main` 可达。
+- 本机无 actionlint：workflow 仅经 YAML 解析、作业图断言与真实 run 行为验证。
+- `docker compose` 落地启动验证（手册 1.9 节）未执行，容器内启动日志顺序仅由单测覆盖。
+
+---
 
 ## 第三轮：任务 5.3 Docker 补验（2026-08-10）
 
