@@ -44,7 +44,7 @@
 - [x] 7.2 在 Rust 1.97.1 上运行 `RUSTFLAGS="-D warnings" cargo check --release --all-targets --locked`
 - [x] 7.3 在 Rust 1.97.1 上运行 `RUSTFLAGS="-D warnings" cargo check --release --all-targets --locked --no-default-features`
 - [x] 7.4 验证 branch artifact、dev-latest Release 元数据与 Actions run 均可追溯到 commit，且 dev workflow 不出现 version gate
-- [ ] 7.5 由维护者执行正式版本一致的 CI 绿路径，并提供 build 与 Docker workflow 的 Actions run URL
+- [x] 7.5 由维护者执行正式版本一致的 CI 绿路径，并提供 build 与 Docker workflow 的 Actions run URL
 - [x] 7.6 由维护者创建 Cargo 失配的临时附注 `v*` tag，提供两个 workflow 均被 version gate 拦截且产物 job skipped 的 run URL，随后确认远端临时 tag 已删除
 - [x] 7.7 验证同一 run 中 version gate 与 warning gate 并行，version gate 不等待 warning gate 完成
 
@@ -53,4 +53,4 @@
 - [x] 8.1 运行 `spec-compliance-check` 并修复范围、设计、场景、项目规则、验证和文档同步问题
 - [x] 8.2 运行 `openspec-verify-change`，产出归档前验证报告
 - [x] 8.3 运行 `verification-before-completion`，记录真实命令、告警数、文档同步、`git status --short` 与剩余风险
-- [ ] 8.4 用户确认实现与证据后再运行 `openspec-archive-change`；本任务不自动推送、创建 PR、合并或删除远端分支
+- [x] 8.4 用户确认实现与证据后再运行 `openspec-archive-change`；本任务不自动推送、创建 PR、合并或删除远端分支

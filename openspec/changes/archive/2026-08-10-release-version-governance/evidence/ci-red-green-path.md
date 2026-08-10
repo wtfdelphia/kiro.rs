@@ -142,6 +142,8 @@ body: Commit: 55b64a34acd083d1fbd45f7f4b0b1a205e3d17a1 / Short SHA: 55b64a3 / Wo
 | PR #7 | `codex/release-version-governance-main` → `main`，普通 merge，version gate 附注 tag 判定修复 |
 | `dev` | fast-forward 至 `55b64a3`（与 `main` 同点），无历史改写 |
 | PR #8 | `dev` → `master`，普通 merge，master 合并后为 `671fadd` |
+| PR #9 | `dev` → `main`，普通 merge，证据回填，main 合并后为 `674c2cc` |
+| PR #10 | `dev` → `master`，普通 merge，同批证据同步，master 合并后为 `0e1071a` |
 
 收敛后核验：
 
@@ -149,7 +151,18 @@ body: Commit: 55b64a34acd083d1fbd45f7f4b0b1a205e3d17a1 / Short SHA: 55b64a3 / Wo
 | --- | --- |
 | `git diff --stat origin/main origin/master` | 无输出（树内容一致） |
 | `git diff --quiet origin/dev origin/main` | exit 0（一致） |
-| `git merge-base --is-ancestor origin/main origin/master` | exit 0（master 已含 main 全部提交） |
+| `git diff --quiet origin/main origin/master` | exit 0（树内容一致） |
+| 三分支 `Cargo.toml` 版本 | 均为 `2026.8.10` |
+| `master` 上 workflow | 含 `version-gate.yaml`，与 `main` 一致 |
+
+### 合并拓扑说明
+
+`dev` 分别向 `main` 与 `master` 开 PR，每次合并各自生成一个 merge commit，因此两条分支
+互有「独有提交」，但双向**非合并**提交差异均为 0，树内容经 `git diff --quiet` 证实完全一致。
+
+由此产生一条发布纪律：正式 tag MUST 打在 `main` 上。门禁校验 `origin/main` 可达性，而
+`master` 的 merge commit 不从 `main` 可达；在 `master` HEAD 上打正式 tag 会被门禁正确拒绝。
+这与 D4「main 是唯一稳定发版落点」一致。
 
 全程无强推、无 reset、无分支删除。
 
@@ -164,18 +177,81 @@ body: Commit: 55b64a34acd083d1fbd45f7f4b0b1a205e3d17a1 / Short SHA: 55b64a3 / Wo
 
 失败的 Actions run 记录保留在历史中，它们正是红路径证据本身。
 
-## 任务 7.5：正式发布绿路径（未执行）
+## 任务 7.5：正式发布绿路径（已执行）
 
-**状态：BLOCKED，待维护者授权。**
+**状态：PASS。** 经维护者授权后执行。
 
-正式附注 tag `v2026.8.10` 已在本地创建并指向 `55b64a3`（`git cat-file -t` 为 `tag`），
-Cargo 版本 `2026.8.10` 与当日 CalVer 一致，前置条件齐备。
+### 发布身份
 
-推送该 tag 会创建真实的 GitHub Release 与 GHCR 正式镜像（`v2026.8.10` 与 `latest`），
-属不可逆的高影响外部副作用，实施代理未获得该具体动作的授权，因此停在推送前。
+| 项 | 值 |
+| --- | --- |
+| 正式 tag | `v2026.8.10`，附注（`git cat-file -t` → `tag`） |
+| 指向提交 | `674c2cc9e546c161efa39606a28b8d8d1e48c233`（`origin/main` HEAD） |
+| `origin/main` 可达 | `git merge-base --is-ancestor` exit 0 |
+| Cargo 版本 | `2026.8.10`，与 tag 去 `v` 后一致 |
+| 推送前本地演练 | `check_release_version.py validate` → `release identity valid: v2026.8.10 (Cargo 2026.8.10)` |
 
-待授权后需补充的证据：两条 workflow 的绿路径 run URL、Release 资产名、
-`docker image inspect ghcr.io/wtfdelphia/kiro-rs:v2026.8.10` 的 OCI version label。
+首个本地 tag 曾指向 `55b64a3`（PR #9 合并前的 main）；推送前删除该仅存在于本地的 tag 并在
+最新 main HEAD 重建，未涉及远端 tag 改写。
 
-需注意：`main` 与 `master` 现已同点，`master` 上也存在 `v*` tag 触发器；正式 tag 指向的
-提交同时可从两条分支到达，门禁的 `origin/main` 可达性检查不受影响。
+### 绿路径 run
+
+| Workflow | Run | 结论 |
+| --- | --- | --- |
+| Build Artifacts | https://github.com/wtfdelphia/kiro.rs/actions/runs/31367150384 | 全 success：`pre-check`、`version-gate`、`warning-gate`、7 条产物腿、`release` |
+| Build and Push Docker Images | https://github.com/wtfdelphia/kiro.rs/actions/runs/31367150378 | 全 success：`pre-check`、`version-gate`、`warning-gate`、amd64/arm64 两腿、`manifest` |
+
+两条流水线的 `version-gate` 均为 **success**，与红路径的 failure 形成对照，证明门禁既能拦也能放。
+
+### Release 资产
+
+```
+name: v2026.8.10 | tag: v2026.8.10 | prerelease: False | draft: False
+target: 674c2cc9e546c161efa39606a28b8d8d1e48c233
+assets:
+  kiro-rs-v2026.8.10-Linux-arm64
+  kiro-rs-v2026.8.10-Linux-musl-arm64
+  kiro-rs-v2026.8.10-Linux-musl-x64
+  kiro-rs-v2026.8.10-Linux-x64
+  kiro-rs-v2026.8.10-macOS-arm64
+  kiro-rs-v2026.8.10-macOS-x64
+  kiro-rs-v2026.8.10-Windows-x64.exe
+```
+
+7 个资产名均含正式 tag，非 prerelease、非 draft。
+
+### 镜像版本一致性
+
+GHCR tag 列表（`gh api users/wtfdelphia/packages/container/kiro-rs/versions`）新增：
+`v2026.8.10`、`latest`、`v2026.8.10-amd64`、`v2026.8.10-arm64`。
+
+Docker 构建 job 日志显示 CI 实际执行：
+
+```
+docker buildx build --build-arg VERSION=v2026.8.10 \
+  --label org.opencontainers.image.source=https://github.com/wtfdelphia/kiro.rs \
+  --label org.opencontainers.image.description=Kiro.rs Docker Image \
+  --platform linux/amd64 --tag ghcr.io/wtfdelphia/kiro-rs:v2026.8.10-amd64 --push .
+```
+
+`VERSION` 取自门禁确认的 `release_tag`（日志中 `version=v2026.8.10`），source/description
+labels 保留。结合任务 5.3 本地实测的「传入 build-arg → OCI label 一致」，链路两端均有证据。
+
+**未能直接 inspect 已发布镜像**：GHCR 上该 package 为私有，本机 `gh` token 无 `read:packages`
+scope，`docker pull` 与 registry API 均返回 unauthorized。因此已发布镜像的 label **未**经
+直接 inspect 复核，仅由「CI 传入值」＋「本地同一 Dockerfile 的 label 实测」两段证据推得。
+剩余风险见下。
+
+### 版本可观测面一致性
+
+| 面 | 值 | 来源 |
+| --- | --- | --- |
+| 正式 tag | `v2026.8.10` | 远端附注 tag |
+| Cargo 版本 | `2026.8.10` | `Cargo.toml` |
+| 二进制 `--version` | `kiro-rs 2026.8.10` | 任务 5.3 镜像内 smoke test |
+| 启动首条 info 日志 | `kiro-rs v2026.8.10` | `test_startup_reports_version_before_config_error` |
+| Release 资产名 | `kiro-rs-v2026.8.10-*` | 本节 Release 资产 |
+| 镜像 tag | `v2026.8.10` | GHCR tag 列表 |
+| OCI version label | `v2026.8.10` | CI build-arg ＋ 任务 5.3 本地 inspect |
+
+去掉 `v` 前缀后七处一致。
