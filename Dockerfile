@@ -20,6 +20,9 @@ RUN cargo build --release --no-default-features --locked
 
 FROM alpine:3.21
 
+ARG VERSION=unknown
+LABEL org.opencontainers.image.version=$VERSION
+
 RUN apk add --no-cache ca-certificates
 
 WORKDIR /app

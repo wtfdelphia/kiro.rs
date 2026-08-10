@@ -1,0 +1,46 @@
+name: Version Gate
+
+on:
+  workflow_call:
+    inputs:
+      enforce:
+        description: Validate a formal release identity when true.
+        required: true
+        type: boolean
+      release_tag:
+        description: Annotated CalVer tag to validate.
+        required: false
+        type: string
+        default: ''
+      release_commit:
+        description: Commit that must be reachable from origin/main.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  version-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release identity
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Validate release identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.enforce }}" != "true" ]]; then
+            echo "::notice::Non-release build; version identity gate passed without enforcement"
+            exit 0
+          fi
+
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          python scripts/check_release_version.py validate \
+            --tag "${{ inputs.release_tag }}" \
+            --commit "${{ inputs.release_commit }}" \
+            --main-ref origin/main \
+            --remote origin
