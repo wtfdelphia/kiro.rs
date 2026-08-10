@@ -1,4 +1,5 @@
 import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -74,7 +75,8 @@ class ReleaseGovernanceFilesTest(unittest.TestCase):
             text=True,
         )
         target_dir = Path(json.loads(metadata.stdout)["target_directory"])
-        binary = target_dir / "debug" / "kiro-rs.exe"
+        binary_name = "kiro-rs.exe" if sys.platform == "win32" else "kiro-rs"
+        binary = target_dir / "debug" / binary_name
         with tempfile.TemporaryDirectory() as temp_dir:
             invalid = Path(temp_dir) / "invalid-config.json"
             invalid.write_text("{", encoding="utf-8")

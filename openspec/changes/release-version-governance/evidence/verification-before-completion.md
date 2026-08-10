@@ -1,6 +1,33 @@
 # Verification Before Completion
 
-> 本文件含两轮记录。第二轮（2026-08-10）是实现后的最终验证，第一轮（2026-08-07）保留为实现前基线。
+> 本文件含三轮记录。第三轮（2026-08-10 补验）完成任务 5.3 的真实 Docker 取证，第二轮（2026-08-10）是实现后的最终验证，第一轮（2026-08-07）保留为实现前基线。
+
+## 第三轮：任务 5.3 Docker 补验（2026-08-10）
+
+范围：仅任务 5.3。本机取得 Docker 访问权限后，将第二轮的 SKIPPED 替换为真实构建与 inspect 证据。
+
+### Verification
+
+| 命令 | 结果 | 结论 |
+| --- | --- | --- |
+| `docker info --format '{{.ServerVersion}}'` | `29.1.3` | 本机 Docker 可用，第二轮「命令不存在」结论已失效 |
+| `docker build --build-arg VERSION=v2026.8.10 -t kiro-rs-version-label-test:v2026.8.10 .` | 成功；镜像内 `./kiro-rs --version` 输出 `kiro-rs 2026.8.10` | Dockerfile 全链路可构建，二进制自报版本等于 Cargo 版本 |
+| `docker image inspect ... --format '{{json .Config.Labels}}'` | `{"org.opencontainers.image.version":"v2026.8.10"}` | OCI version label 精确等于传入 build-arg |
+| 不传 `VERSION` 并附加 source/description labels 构建后 inspect | `version=unknown` 且 source/description 共存 | `ARG VERSION=unknown` 默认值生效，未覆盖既有 labels |
+| `docker rmi`（两个临时 tag） | 已删除 | 未推送任何仓库，无残留发布副作用 |
+| `openspec validate --all` | 21 passed, 0 failed | 文档改动后 schema 仍通过 |
+| `git status --short` | 见下方说明 | 仅本 change 相关文件，无凭据或 `.codegraph/` |
+
+明细见 `evidence/docker-oci-version-label.md`。
+
+### Residual Risk（第三轮后更新）
+
+- 本轮只验证 linux/amd64 与经典 builder；arm64 矩阵腿和 `cache-*: type=gha` 仍只有 CI 侧证据。
+- `docker-build.yaml` 传入的版本值本身仍靠静态断言，真实取值待任务 7.5 的 CI run。
+- 本机仍无 actionlint；workflow 只经 `yaml.safe_load` 与作业图断言。
+- 任务 7.5/7.6 的 Actions run URL 与临时 tag 清理仍待维护者；任务 8.4 归档待用户授权。
+
+---
 
 ## 第二轮：实现后最终验证（2026-08-10）
 
@@ -26,7 +53,7 @@
 | `git diff --quiet origin/main origin/master` | exit 0 | 两分支树内容一致，触发器迁移前置成立 |
 | `openspec validate --all` | 21 passed, 0 failed | schema 通过 |
 | `git status --short --untracked-files=all` | 9 项 modified + 12 项 untracked，全部属于本 change | 无 `config.json`、`credentials.*`、`.codegraph/`；`__pycache__` 已由新增 `.gitignore` 规则排除 |
-| `docker` / `actionlint` | 命令不存在 | **SKIPPED**：任务 5.3 镜像 inspect 与 workflow lint 无法本地执行 |
+| `docker` / `actionlint` | 命令不存在 | **SKIPPED**：任务 5.3 镜像 inspect 与 workflow lint 无法本地执行（注：`docker` 部分已由第三轮补验推翻，见本文件顶部） |
 
 ### Documentation Sync
 
@@ -42,7 +69,7 @@
 ### Residual Risk
 
 - 目标 CalVer 取当日 `2026.8.10`（远端最新正式 tag 为 `v2026.8.4`，`v2026.8.10` 不存在）。若实际发版不在当天，需改 `Cargo.toml` 与 `Cargo.lock` 并重跑 Cargo 检查。
-- 本机无 Docker：OCI version label 只有静态断言，label 值与传入版本的一致性需 CI 或有 Docker 环境 inspect 补证。
+- 本机无 Docker：OCI version label 只有静态断言，label 值与传入版本的一致性需 CI 或有 Docker 环境 inspect 补证。（第三轮已补证，本条仅保留为当时状态记录）
 - 本机无 actionlint：workflow 仅经 `yaml.safe_load` 结构解析与作业图断言，未做 Actions 专用 lint。
 - GitHub 上 gate 失败的 skipped 传播行为只有静态作业图证据，需真实红路径 run 证实（任务 7.6）。
 - 任务 7.5/7.6 的 Actions run URL 与临时 tag 清理需维护者执行。

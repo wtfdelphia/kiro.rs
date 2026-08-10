@@ -29,7 +29,7 @@
 
 - [x] 5.1 在 Dockerfile 最终 stage 增加 `ARG VERSION=unknown` 与 `org.opencontainers.image.version` OCI label
 - [x] 5.2 从 `docker-build.yaml` 向 Docker build 传入门禁确认的版本，并保留现有 source/description labels
-- [ ] 5.3 使用测试版本构建并 inspect 镜像，确认 OCI version label 与传入值一致；记录无法运行 Docker 时的 SKIPPED 原因与剩余风险
+- [x] 5.3 使用测试版本构建并 inspect 镜像，确认 OCI version label 与传入值一致；记录无法运行 Docker 时的 SKIPPED 原因与剩余风险
 
 ## 6. 文档与规格同步
 
