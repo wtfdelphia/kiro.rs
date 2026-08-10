@@ -17,3 +17,5 @@
 .worktrees/
 .claude/settings.local.json
 *.log
+__pycache__/
+*.py[cod]
