@@ -1,8 +1,31 @@
 # OpenSpec Verify Report
 
 Change：`release-version-governance`
-日期：2026-08-10
-结论：**归档条件未完全满足**——本地实现与验证已完成，任务 5.3 为环境 SKIPPED，任务 7.5/7.6/8.4 需维护者提供 CI 证据与授权。
+日期：2026-08-10（第二轮复核，含 CI 红/绿路径与分支收敛）
+结论：**归档条件已满足**——32/33 完成，仅余 8.4 归档动作本身。任务 5.3 已由真实 Docker 构建取证，
+7.5/7.6 已由真实 CI run 取证，临时 tag 已清理。
+
+## 第二轮复核（归档就绪）
+
+| 任务 | 状态 | 证据 |
+| --- | --- | --- |
+| 5.3 镜像 OCI label | **PASS** | Docker 29.1.3 实测：传入 `VERSION=v2026.8.10` 后 label 一致，缺省为 `unknown`，见 `evidence/docker-oci-version-label.md` |
+| 7.5 CI 绿路径 | **PASS** | runs `31367150384`（7 腿产物 + release）与 `31367150378`（两架构 + manifest）全 success；Release 7 资产名均含 `v2026.8.10`；GHCR 出现 `v2026.8.10` 与 `latest` |
+| 7.6 CI 红路径 | **PASS** | runs `31363555851` 与 `31363555870` 均因 Cargo 失配被拦，产物 job 全 skipped，无 Release 无镜像；两轮临时 tag 已从远端删除 |
+| 7.7 gate 并行 | **PASS** | 两 gate 同秒启动，version gate 6s 失败而 warning gate 29s，实测不等待 |
+| 7.4 非正式构建 | **PASS** | dev 滚动 workflow 无 version gate；`dev-latest` prerelease 含完整 commit |
+| 8.4 归档 | 进行中 | 本轮执行 |
+
+本轮另修复一处门禁真实缺陷：`actions/checkout` 改写本地 tag ref 导致附注 tag 误判，已改为从
+远端 `ls-remote` 权威判定并新增 6 个回归用例（门禁测试 23 → 40 passed）。详见
+`evidence/ci-red-green-path.md`。
+
+分支按维护者要求收敛：`dev` 推送，`main` 与 `master` 均经 PR 合入（#6 #7 #8 #9 #10），
+全程普通 merge，无强推、无 reset、无删分支；三分支树内容一致。
+
+---
+
+## 第一轮记录（保留）
 
 ## Completeness
 
@@ -10,7 +33,7 @@ Change：`release-version-governance`
 | --- | --- |
 | `openspec status --change release-version-governance --json` | `isComplete: true`，proposal/design/specs/tasks 4/4 done |
 | `openspec validate --all` | 21 passed, 0 failed |
-| tasks.md | 33 项中 27 项完成；未完成为 5.3（环境 SKIPPED）、7.5、7.6、8.2、8.3、8.4 |
+| tasks.md | 33 项中 27 项完成；未完成为 5.3（环境 SKIPPED）、7.5、7.6、8.2、8.3、8.4（第一轮时状态） |
 | evidence | `bridge-plan.md`、`spec-compliance-report.md`、`openspec-verify-report.md`、`verification-before-completion.md` 均存在 |
 
 ## Correctness
@@ -42,3 +65,4 @@ Change：`release-version-governance`
 | 8.4 归档 | 待授权 | 需用户确认实现与证据后执行 |
 
 归档应在 7.5/7.6 证据补齐后进行；在此之前不建议执行 `openspec-archive-change`。
+（第二轮：7.5/7.6 证据已补齐，归档条件成立。）
