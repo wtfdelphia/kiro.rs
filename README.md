@@ -86,6 +86,8 @@
 
 ### 1. 编译
 
+最低支持 Rust 版本（MSRV）为 **1.97.1**。更低版本不在支持范围内；正式产物流水线可以使用高于该版本的 stable 工具链。
+
 > PS: 不想本地编译时可直接下载发布包，详见 [下载 / Releases](#下载--releases)。
 >
 > - 正式版：<https://github.com/wtfdelphia/kiro.rs/releases/latest>
@@ -210,6 +212,30 @@ curl http://127.0.0.1:8990/v1/messages \
 
 > 说明：`push v*` 后，`build.yaml` 会在多平台构建成功后自动创建正式 Release 并挂载二进制。  
 > `dev` 分支成功构建后会更新滚动 prerelease `dev-latest`（不覆盖正式 Latest）。
+> 分支 artifact、`dev-latest` 和人工 dry run 都是非正式构建：其外部标签无需等于 Cargo 版本，但 Release / Actions 元数据必须能追溯到源码 commit。
+
+### 版本与发布规则
+
+- `Cargo.toml` 的 `[package].version` 是源码版本声明，格式为 `YYYY.M.D`，例如 `2026.8.10`。
+- 正式发布使用与 Cargo 版本一致的附注 tag：`vYYYY.M.D`。月份和日期不补零，不使用 `-1` 等修订后缀；同一自然日只发布一个正式版本。
+- 正式 tag 必须指向已进入 `main` 的发版提交。版本门禁会校验 tag 格式、有效日期、附注类型、tag 指向、Cargo 版本和 `main` 可达性。
+- `admin-ui/package.json` 的版本不属于发布身份。Admin UI 随 Rust 二进制内嵌发布，不跟随主项目 CalVer。
+
+发布清单（以 `2026.8.10` 为例）：
+
+```bash
+# 1. 更新 Cargo.toml 的 package.version，并刷新/验证锁文件
+cargo check --release --all-targets
+
+# 2. 提交并通过 PR/普通合并进入 main，确认提交可达
+git merge-base --is-ancestor <release-commit> origin/main
+
+# 3. 在该提交创建附注 tag，再推送 tag
+git tag -a v2026.8.10 -m "Release v2026.8.10" <release-commit>
+git push origin v2026.8.10
+```
+
+门禁失败时先修正 Cargo 版本或 tag，再删除并重新创建尚未发布成功的 tag；不要在 tag 之后补改版本。
 
 ### 资源命名
 
@@ -276,8 +302,10 @@ https://github.com/wtfdelphia/kiro.rs/releases/download/<tag>/kiro-rs-<tag>-<pla
 | --- | --- |
 | `latest` | 最近一次正式 `v*` 构建 |
 | `v2026.7.27` 等 | 指定正式版本 |
-| `beta` | `master` 分支 beta 构建 |
+| `beta` | `main` 分支 beta 构建 |
 | `dev-latest` 相关 | 仅二进制 prerelease；Docker 工作流当前不发 dev 滚动镜像 |
+
+人工触发 Docker workflow 时，`publish=false`（默认）只执行 dry run，`version` 输入仅作为本次非正式构建标签，不登录或推送 GHCR。设置 `publish=true` 时，workflow 会忽略自由 `version` 输入，并要求所选提交上恰好存在一个合法的附注 `vYYYY.M.D` tag；该 tag 通过正式版本门禁后才允许发布。
 
 拉取示例：
 
