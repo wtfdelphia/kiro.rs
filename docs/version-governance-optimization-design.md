@@ -10,6 +10,12 @@
 >   - D2 补齐与既有 warning-gate 的接线关系、reusable 取舍改判，验证方案补 CI 红路径要求。
 > - 2026-08-07 决策复核：MSRV 不再取 edition 2024 的理论下限 1.85，改为当前已实际验证且被 warning-gate 钉住的 Rust 1.97.1；后续升级须显式验证。
 > - 2026-08-07 设计定稿：正式版本以 Cargo.toml 为声明源，`v*` 附注 tag 为发布身份；正式发布落点统一为 GitHub 默认分支 main；同一自然日只允许一个正式版；人工镜像发布不得绕过版本门禁；长期规格写入 openspec/specs；本地私有 tag 不列入项目验收。
+> - 2026-08-10 **格式纠正（correct-calver-to-month-sequence）**：本文档第 84 行「实测 6 个 tag 全部吻合，可确认实际约定为 CalVer YYYY.M.D」是一次抽样误判，据此定稿的「第三段=日历日」与「同一自然日只允许一个正式版」两条结论**不成立**，现已推翻。
+>   - 纠正依据：复核全部 29 个历史 tag 与其提交日期，原约定始终是 `YYYY.MM.MICRO`（第三段=当月发布序号）。`2025.12.1`–`2025.12.7` 集中在 2025-12-28 至 12-31 四天内发布；`2026.1.2`/`2026.1.3` 同为 2026-01-07；`2026.2.1`/`2026.2.2`/`2026.2.3` 同为 2026-02-06；`v2026.1.4`/`v2026.1.5` 同为 2026-01-13。第三段显然不是日期。
+>   - 误判成因：只核对了 `v2026.7.27` 起最近 6 个 tag。那几次恰好一天一发，序号与当日日期数值重合，被当成了约定。
+>   - 外部依据：calver.org 明确收录 `YYYY.MM.MICRO` 三段式（Twisted 自 2002 年沿用至今，并扩散到 Klein、Treq、PyOpenSSL），其弃用 SemVer 的理由（组件众多、各自独立弃用与破坏兼容）与本项目一致；同一规范指出「four-numeric-segment versions are discouraged」，故 `vYYYY.M.D.N` 不作为备选。SemVer 亦不适用：semver.org 的前提是识别 public API 并向依赖方传递兼容性信号，而本项目是兼容代理，用户以镜像/二进制运行，无下游代码依赖。
+>   - 实际影响：误判引入了能力回退。2026-08-10 已发布 `v2026.8.10` 后，同日完成的 Claude Opus 5 支持无法再发正式版。纠正后同月可发多版，序号递增。
+>   - 不追溯改写历史 tag。`v2026.7.27` 起若干 tag 第三段与日期重合的痕迹保留；代价是该区段序号存在语义空洞（7 月并未真的发布 31 次），换取已发布镜像与二进制引用稳定。
 
 # 版本治理优化方案
 
@@ -82,10 +88,12 @@ build.yaml 与 docker-build.yaml 均只以 tags: ['v*'] 触发发布，旧格式
 ### 问题 3：版本 scheme 无文档，CI 描述与现行约定脱节
 
 - tag 日期与 tag 名一一对应（实测 6 个 tag 全部吻合），可确认实际约定为 CalVer YYYY.M.D + v 前缀，但 README 与 `openspec/specs/` 均未记载；2026.3.1 这类写法同时可被解读为 semver，语义模糊。
+  > **已于 2026-08-10 推翻**：本条只抽样了最近 6 个 tag。复核全部 29 个后，原约定实为 `YYYY.MM.MICRO`（第三段=当月序号），见顶部修订记录。
 - workflow_dispatch 的 version 输入实测分两种语义，修描述时不可一刀切：
   build.yaml:12 与 docker-build.yaml:11 写 description: '... (e.g., 2025.12.1)'、required: true、default: '2026.1.1'——示例是旧的无前缀格式，默认值是 7 个月前的版本号，二者都该更新为现行 v 前缀格式。
   build-dev-release.yaml:19 的语义不同：description 为 'Optional tag override. Leave empty to use rolling tag dev-latest.'、required: false、default: ''，留空即走 dev-latest。它本身表述正确，**不需要改**，也不应被套上 CalVer 示例。
 - 同日二次发布无约定（当前历史上未发生过，6 个漂移 tag 分属 6 天）。本方案明确同一自然日只允许一个正式版，紧急修复使用下一个自然日版本。
+  > **已于 2026-08-10 推翻**：「历史上未发生过」不成立——`2026.2.1`–`2026.2.3` 同日发布，`2026.1.2`/`2026.1.3` 同日发布。同月多版本为原有能力，现已恢复。
 - 仓库已有 `openspec/specs/` 长期规格体系；版本治理应新增对应 capability，不另建顶层 `spec/`。
 
 ### 问题 4：admin-ui 版本与主项目脱轨
@@ -143,9 +151,11 @@ admin-ui/package.json 实测 version: 1.0.0，从未跟随主项目。该前端�
 
 成文规则，写入 README「下载 / Releases」小节与 `openspec/specs/release-version-governance/spec.md`：
 
-1. 版本号 = CalVer YYYY.M.D，git tag 加 v 前缀：v2026.8.4。
+1. 版本号 = CalVer YYYY.MM.MICRO（第三段为当月发布序号，非日历日），git tag 加 v 前缀：v2026.8.11。
+   > 2026-08-10 纠正：原文为 `YYYY.M.D`（日历日），见顶部修订记录。
 2. `Cargo.toml [package].version` 是源码版本声明源；正式 `v*` tag 是不可变发布身份，必须等于 Cargo 版本加 `v` 前缀。
-3. 同一自然日只允许一个正式版。紧急修复使用下一个自然日版本，不用 `-1` 等 SemVer 预发布后缀冒充第二个正式版。
+3. 同一年月内可发布多个正式版本，序号严格递增且不复用；同一自然日 MAY 发布多次。不用 `-1` 等 SemVer 预发布后缀冒充第二个正式版。
+   > 2026-08-10 纠正：原文限制「同一自然日只允许一个正式版，紧急修复使用下一个自然日」，见顶部修订记录。
 4. 杂散 tag（如 add）不允许存在；dev 滚动 tag（dev-latest）属既定机制，由 build-dev-release.yaml 维护，保留。
 5. 新的正式发布 tag 统一用**附注 tag**，保留 tagger、创建时间和说明；历史 tag 不追溯改写。
 6. `main` 是唯一稳定发版落点。正式 tag 所指提交必须可从 `origin/main` 到达；dev 为日常开发分支并通过 PR/合并回流 main。正式产物 workflow 的分支触发器从 master 迁移到 main。
@@ -322,6 +332,7 @@ CI 红路径为**硬性要求**，不可用本地等价执行替代：AGENTS.md 
 7. build-dev-release.yaml 的 dev-latest 发布路径未受影响：push dev 后产物与预发布正常产出，且该 workflow 无 version-gate job；Release 元数据可追溯 commit。
 8. version-gate 与 warning-gate 在同一次 run 中并行，二者互不阻塞。
 9. docker workflow 的 publish=true 不能使用自由 version 输入绕过正式 tag/Cargo 一致性；publish=false dry-run 仍可使用自由标签且无发布副作用。
-10. 新正式 tag 为附注 tag；同一自然日不创建第二个正式版本。
+10. 新正式 tag 为附注 tag；同一年月内可发布多个正式版本，序号递增即可。
+    > 2026-08-10 纠正：原文限制「同一自然日不创建第二个正式版本」，见顶部修订记录。
 11. `rust-version = "1.97.1"`，并在该工具链上通过 default 与 `--no-default-features` 两种锁定检查。
 12. 长期规格归入 `openspec/specs/release-version-governance/`，不新建顶层 `spec/`。

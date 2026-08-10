@@ -23,7 +23,12 @@ cargo run --quiet -- --version        # 必须输出 kiro-rs <新版本>
 ```
 
 严格 CalVer 不补零、无修订后缀：`2026.8.12` 合法，`2026.08.12` 与 `2026.8.12-1` 都会被拒。
-同一自然日只能有一个正式版本，改期就改日期。
+
+> **2026-08-10 格式纠正**：本节「改期就改日期」「同一自然日只能有一个正式版本」已随
+> `correct-calver-to-month-sequence` 推翻。版本第三段是**当月发布序号**，不是日历日；同一年月内
+> 可发布多个正式版本，序号递增即可，同一天也能发多次。因此上面「把版本改成实际发版日」应读作
+> 「把版本改成本月下一个可用序号」。详见 `docs/version-governance-optimization-design.md` 顶部
+> 修订记录。
 
 ---
 
@@ -281,7 +286,7 @@ docker image inspect ghcr.io/wtfdelphia/kiro-rs:latest \
 门禁拦住临时 tag 后，对应镜像根本不该存在。用 compose 拉一次，失败才是正确结果：
 
 ```bash
-IMAGE_TAG=v2026.8.11 docker compose pull    # 期望：manifest unknown / not found
+IMAGE_TAG=v2026.8.900 docker compose pull    # 期望：manifest unknown / not found
 ```
 
 若这条命令成功拉到镜像，说明发布副作用没被前置拦住，属于第 6 节的停止条件。
@@ -376,15 +381,15 @@ docker buildx imagetools inspect ghcr.io/wtfdelphia/kiro-rs:v2026.8.10
 ### 3.1 制造 Cargo 失配
 
 挑一个与 `Cargo.toml` 版本不同、且是合法 CalVer 的日期。假设 `Cargo.toml` 是
-`2026.8.10`，用 `v2026.8.11`：
+`2026.8.10`，用 `v2026.8.900`（高位序号，不会与真实发布撞号）：
 
 ```bash
 git fetch origin
-git tag -a v2026.8.11 -m "TEMP gate red-path test" origin/main
-git push origin v2026.8.11
+git tag -a v2026.8.900 -m "TEMP gate red-path test" origin/main
+git push origin v2026.8.900
 ```
 
-这个 tag 的一切都合法（附注、有效日期、main 可达），唯一的问题是 Cargo 版本对不上。
+这个 tag 的一切都合法（附注、月份合法、序号合法、main 可达），唯一的问题是 Cargo 版本对不上。
 这样能精准隔离出「Cargo 一致性」这一条判定。
 
 ### 3.2 期望结果
@@ -403,11 +408,11 @@ gh run view <run-id>
 - 失败 annotation 形如：
 
   ```
-  ::error::Cargo.toml version '2026.8.10' does not match release tag 'v2026.8.11';
-  set [package].version to '2026.8.11', update Cargo.lock, commit, and recreate the tag
+  ::error::Cargo.toml version '2026.8.10' does not match release tag 'v2026.8.900';
+  set [package].version to '2026.8.900', update Cargo.lock, commit, and recreate the tag
   ```
 
-- GHCR 上没有出现 `v2026.8.11` 任何 tag，GitHub Releases 里没有对应 Release
+- GHCR 上没有出现 `v2026.8.900` 任何 tag，GitHub Releases 里没有对应 Release
 
 顺手确认 version gate 没有等 warning gate（任务 7.7 的运行时侧证据）：两个 gate 的
 开始时间应该几乎相同，version gate 应在 warning gate 的 20 分钟编译还在跑时就已经
@@ -423,9 +428,9 @@ gh run view <run-id> --json jobs \
 验证完立刻清理，否则 tag 列表会留污点：
 
 ```bash
-git push origin :refs/tags/v2026.8.11
-git tag -d v2026.8.11
-git ls-remote --tags origin | grep 2026.8.11    # 应无输出
+git push origin :refs/tags/v2026.8.900
+git tag -d v2026.8.900
+git ls-remote --tags origin | grep 2026.8.900    # 应无输出
 ```
 
 失败的 run 记录会留在 Actions 历史里，这没问题，它正是证据本身。
@@ -438,8 +443,9 @@ git ls-remote --tags origin | grep 2026.8.11    # 应无输出
 # 轻量 tag（无 -a）：应报 must be an annotated tag
 git tag v2026.8.12 && git push origin v2026.8.12
 
-# 非法日历日：应报 not a valid calendar date
-git tag -a v2026.2.30 -m "TEMP" && git push origin v2026.2.30
+# 非法月份：应报 invalid month 13
+# （注：v2026.2.30 曾作为「非法日历日」反例，但第三段已修正为当月序号，30 现为合法序号）
+git tag -a v2026.13.1 -m "TEMP" && git push origin v2026.13.1
 ```
 
 每个验完都按 3.3 删除。这两条本地单测已覆盖（`test_rejects_lightweight_tag`、
