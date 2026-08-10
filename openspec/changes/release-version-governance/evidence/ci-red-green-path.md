@@ -142,6 +142,8 @@ body: Commit: 55b64a34acd083d1fbd45f7f4b0b1a205e3d17a1 / Short SHA: 55b64a3 / Wo
 | PR #7 | `codex/release-version-governance-main` → `main`，普通 merge，version gate 附注 tag 判定修复 |
 | `dev` | fast-forward 至 `55b64a3`（与 `main` 同点），无历史改写 |
 | PR #8 | `dev` → `master`，普通 merge，master 合并后为 `671fadd` |
+| PR #9 | `dev` → `main`，普通 merge，证据回填，main 合并后为 `674c2cc` |
+| PR #10 | `dev` → `master`，普通 merge，同批证据同步，master 合并后为 `0e1071a` |
 
 收敛后核验：
 
@@ -149,7 +151,18 @@ body: Commit: 55b64a34acd083d1fbd45f7f4b0b1a205e3d17a1 / Short SHA: 55b64a3 / Wo
 | --- | --- |
 | `git diff --stat origin/main origin/master` | 无输出（树内容一致） |
 | `git diff --quiet origin/dev origin/main` | exit 0（一致） |
-| `git merge-base --is-ancestor origin/main origin/master` | exit 0（master 已含 main 全部提交） |
+| `git diff --quiet origin/main origin/master` | exit 0（树内容一致） |
+| 三分支 `Cargo.toml` 版本 | 均为 `2026.8.10` |
+| `master` 上 workflow | 含 `version-gate.yaml`，与 `main` 一致 |
+
+### 合并拓扑说明
+
+`dev` 分别向 `main` 与 `master` 开 PR，每次合并各自生成一个 merge commit，因此两条分支
+互有「独有提交」，但双向**非合并**提交差异均为 0，树内容经 `git diff --quiet` 证实完全一致。
+
+由此产生一条发布纪律：正式 tag MUST 打在 `main` 上。门禁校验 `origin/main` 可达性，而
+`master` 的 merge commit 不从 `main` 可达；在 `master` HEAD 上打正式 tag 会被门禁正确拒绝。
+这与 D4「main 是唯一稳定发版落点」一致。
 
 全程无强推、无 reset、无分支删除。
 
