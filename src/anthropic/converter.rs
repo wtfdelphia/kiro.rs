@@ -200,7 +200,10 @@ pub fn normalize_claude_model(model: &str) -> Option<String> {
             None
         }
     } else if base.contains("opus") {
-        if base.contains("4-8") || base.contains("4.8") {
+        // 具体版本先于宽松版本：避免将来的 opus-5-x 被 4-x 分支提前截获。
+        if base.contains("opus-5") {
+            Some("claude-opus-5".to_string())
+        } else if base.contains("4-8") || base.contains("4.8") {
             Some("claude-opus-4.8".to_string())
         } else if base.contains("4-7") || base.contains("4.7") {
             Some("claude-opus-4.7".to_string())
@@ -348,11 +351,12 @@ pub fn resolve_model(
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// Sonnet 5 / Opus 4.7 / 4.8 同 1M
+/// Sonnet 5 / Opus 4.7 / 4.8 / Opus 5 同 1M
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
         Some(mapped)
             if mapped == "claude-sonnet-5"
+                || mapped == "claude-opus-5"
                 || mapped == "claude-sonnet-4.6"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
@@ -1369,6 +1373,37 @@ mod tests {
             Some("claude-opus-4.8".to_string())
         );
         assert_eq!(get_context_window_size("claude-opus-4-8"), 1_000_000);
+    }
+
+    #[test]
+    fn test_map_model_opus_5() {
+        assert_eq!(map_model("claude-opus-5"), Some("claude-opus-5".to_string()));
+        assert_eq!(
+            map_model("claude-opus-5-thinking"),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-opus-5"), 1_000_000);
+    }
+
+    #[test]
+    fn test_map_model_opus_4_x_not_captured_by_opus_5() {
+        // opus-5 判定位于 4-x 之前，各 4-x 版本仍须走自己的分支
+        assert_eq!(
+            map_model("claude-opus-4-5-20251101"),
+            Some("claude-opus-4.5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4-6"),
+            Some("claude-opus-4.6".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4-7"),
+            Some("claude-opus-4.7".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4-8"),
+            Some("claude-opus-4.8".to_string())
+        );
     }
 
     #[test]
