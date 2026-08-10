@@ -119,5 +119,102 @@ class ReleaseVersionTest(unittest.TestCase):
             resolve_release_tag(self.repo, self.commit)
 
 
+class RemoteTagObjectTypeTest(ReleaseVersionTest):
+    """Cover tag-type detection against a remote.
+
+    actions/checkout fetches `+<sha>:refs/tags/<tag>` when the tag already
+    exists, which replaces the local annotated tag ref with a commit object.
+    The gate must consult the remote so a legitimate annotated tag is not
+    misreported as lightweight.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.remote_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.remote_dir.cleanup)
+        self.remote = Path(self.remote_dir.name)
+        subprocess.run(
+            ["git", "init", "--bare", str(self.remote)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.git("remote", "add", "origin", str(self.remote))
+
+    def push_all(self):
+        self.git("push", "--quiet", "origin", "main", "--tags")
+
+    def overwrite_local_tag_ref_like_checkout(self, tag):
+        """Reproduce the actions/checkout ref rewrite that hides annotation."""
+        self.git("update-ref", f"refs/tags/{tag}", self.commit)
+        self.assertEqual(
+            self.git("cat-file", "-t", f"refs/tags/{tag}"),
+            "commit",
+            "precondition: local tag ref must look lightweight",
+        )
+
+    def test_accepts_annotated_tag_after_checkout_rewrites_local_ref(self):
+        tag = self.annotated_tag()
+        self.push_all()
+        self.overwrite_local_tag_ref_like_checkout(tag)
+
+        result = validate_release(self.repo, tag, self.commit, "main", str(self.remote))
+
+        self.assertEqual(result, "2026.8.7")
+
+    def test_reports_cargo_mismatch_instead_of_tag_type_after_rewrite(self):
+        tag = self.annotated_tag()
+        self.push_all()
+        self.overwrite_local_tag_ref_like_checkout(tag)
+        self.write_manifest("2026.8.6")
+
+        with self.assertRaisesRegex(ReleaseVersionError, "Cargo.toml version"):
+            validate_release(self.repo, tag, self.commit, "main", str(self.remote))
+
+    def test_rejects_lightweight_tag_on_remote(self):
+        self.git("tag", "v2026.8.7")
+        self.push_all()
+
+        with self.assertRaisesRegex(ReleaseVersionError, "annotated"):
+            validate_release(
+                self.repo, "v2026.8.7", self.commit, "main", str(self.remote)
+            )
+
+    def test_rejects_tag_missing_on_remote(self):
+        tag = self.annotated_tag()
+
+        with self.assertRaisesRegex(ReleaseVersionError, "does not exist on remote"):
+            validate_release(self.repo, tag, self.commit, "main", str(self.remote))
+
+    def test_glob_refspec_does_not_confuse_prefix_sharing_tags(self):
+        """`v2026.8.1*` also matches `v2026.8.10`; exact ref filtering must hold."""
+        self.write_manifest("2026.8.1")
+        self.git("commit", "--allow-empty", "-am", "version 2026.8.1")
+        self.commit = self.git("rev-parse", "HEAD")
+        self.git("tag", "-a", "v2026.8.1", "-m", "Release v2026.8.1")
+        self.git("tag", "v2026.8.10")  # lightweight, shares the glob prefix
+        self.push_all()
+        self.overwrite_local_tag_ref_like_checkout("v2026.8.1")
+
+        result = validate_release(
+            self.repo, "v2026.8.1", self.commit, "main", str(self.remote)
+        )
+
+        self.assertEqual(result, "2026.8.1")
+
+    def test_lightweight_tag_still_rejected_when_prefix_peer_is_annotated(self):
+        self.write_manifest("2026.8.1")
+        self.git("commit", "--allow-empty", "-am", "version 2026.8.1")
+        self.commit = self.git("rev-parse", "HEAD")
+        self.git("tag", "v2026.8.1")  # lightweight, the one under validation
+        self.git("tag", "-a", "v2026.8.10", "-m", "Release v2026.8.10")
+        self.push_all()
+
+        with self.assertRaisesRegex(ReleaseVersionError, "annotated"):
+            validate_release(
+                self.repo, "v2026.8.1", self.commit, "main", str(self.remote)
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

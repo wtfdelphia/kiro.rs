@@ -42,4 +42,5 @@ jobs:
           python scripts/check_release_version.py validate \
             --tag "${{ inputs.release_tag }}" \
             --commit "${{ inputs.release_commit }}" \
-            --main-ref origin/main
+            --main-ref origin/main \
+            --remote origin

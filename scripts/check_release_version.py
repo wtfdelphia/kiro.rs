@@ -56,7 +56,36 @@ def read_cargo_version(repo: Path) -> str:
         ) from error
 
 
-def validate_release(repo: Path, tag: str, commit: str, main_ref: str) -> str:
+def tag_object_type(repo: Path, tag: str, remote: str | None) -> str:
+    """Report whether a release tag is annotated ("tag") or lightweight ("commit").
+
+    The local ref is not authoritative: actions/checkout fetches
+    `+<sha>:refs/tags/<tag>` when the tag already exists, which overwrites the
+    ref with the commit object and makes every annotated tag look lightweight.
+    When a remote is available, ask it instead -- it advertises an extra
+    `<tag>^{}` peeled line only for annotated tags.
+    """
+    if remote:
+        # A glob refspec is required: git suppresses the peeled `^{}` line when
+        # the refspec names a ref exactly, and that line is the only signal
+        # distinguishing an annotated tag from a lightweight one.
+        listing = git(repo, "ls-remote", remote, f"refs/tags/{tag}*")
+        refs = {
+            line.split("\t", 1)[1].strip()
+            for line in listing.splitlines()
+            if "\t" in line
+        }
+        if f"refs/tags/{tag}" not in refs:
+            raise ReleaseVersionError(
+                f"release tag {tag!r} does not exist on remote {remote!r}"
+            )
+        return "tag" if f"refs/tags/{tag}^{{}}" in refs else "commit"
+    return git(repo, "cat-file", "-t", f"refs/tags/{tag}")
+
+
+def validate_release(
+    repo: Path, tag: str, commit: str, main_ref: str, remote: str | None = None
+) -> str:
     match = CALVER_TAG.fullmatch(tag)
     if not match:
         raise ReleaseVersionError(
@@ -69,11 +98,11 @@ def validate_release(repo: Path, tag: str, commit: str, main_ref: str) -> str:
     except ValueError as error:
         raise ReleaseVersionError(f"release tag {tag!r} is not a valid calendar date") from error
 
-    object_type = git(repo, "cat-file", "-t", f"refs/tags/{tag}")
+    object_type = tag_object_type(repo, tag, remote)
     if object_type != "tag":
         raise ReleaseVersionError(f"release tag {tag!r} must be an annotated tag")
 
-    tag_commit = git(repo, "rev-parse", f"refs/tags/{tag}^{{}}")
+    tag_commit = git(repo, "rev-parse", f"refs/tags/{tag}^{{commit}}")
     release_commit = git(repo, "rev-parse", commit)
     if tag_commit != release_commit:
         raise ReleaseVersionError(
@@ -116,6 +145,11 @@ def parser() -> argparse.ArgumentParser:
     validate.add_argument("--tag", required=True)
     validate.add_argument("--commit", required=True)
     validate.add_argument("--main-ref", default="origin/main")
+    validate.add_argument(
+        "--remote",
+        default=None,
+        help="Remote to consult for the authoritative tag object type.",
+    )
     return result
 
 
@@ -126,7 +160,7 @@ def main() -> int:
             print(resolve_release_tag(args.repo, args.commit))
         else:
             version = validate_release(
-                args.repo, args.tag, args.commit, args.main_ref
+                args.repo, args.tag, args.commit, args.main_ref, args.remote
             )
             print(f"release identity valid: {args.tag} (Cargo {version})")
     except ReleaseVersionError as error:
