@@ -240,6 +240,24 @@ fn static_fallback_models() -> Vec<Model> {
             max_tokens: 128_000,
         },
         Model {
+            id: "claude-opus-5".to_string(),
+            object: "model".to_string(),
+            created: 1782777600, // Jun 30, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
+            id: "claude-opus-5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1782777600, // Jun 30, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
             id: "claude-opus-4-8".to_string(),
             object: "model".to_string(),
             created: 1779897600, // May 28, 2026
@@ -839,7 +857,8 @@ pub(crate) fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 
     let is_adaptive_thinking = (model_lower.contains("opus")
         && (model_lower.contains("4-6") || model_lower.contains("4.6")))
-        || model_lower.contains("sonnet-5");
+        || model_lower.contains("sonnet-5")
+        || model_lower.contains("opus-5");
 
     let thinking_type = if is_adaptive_thinking {
         "adaptive"
@@ -1171,6 +1190,8 @@ mod tests {
         let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"claude-sonnet-5"));
         assert!(ids.contains(&"claude-sonnet-5-thinking"));
+        assert!(ids.contains(&"claude-opus-5"));
+        assert!(ids.contains(&"claude-opus-5-thinking"));
         assert!(ids.contains(&"claude-sonnet-4-6"));
         assert!(ids.contains(&"claude-haiku-4-5-20251001"));
         assert!(models.iter().all(|m| m.object == "model"));
@@ -1186,6 +1207,42 @@ mod tests {
                 m.id
             );
         }
+    }
+
+    fn thinking_payload(model: &str) -> MessagesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": model,
+            "max_tokens": 1024,
+            "messages": [{ "role": "user", "content": "hi" }],
+        }))
+        .expect("payload must deserialize")
+    }
+
+    #[test]
+    fn opus_5_thinking_uses_adaptive_and_high_effort() {
+        let mut payload = thinking_payload("claude-opus-5-thinking");
+
+        override_thinking_from_model_name(&mut payload);
+
+        let thinking = payload.thinking.expect("thinking must be set");
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.budget_tokens, 20000);
+        assert_eq!(
+            payload.output_config.map(|c| c.effort),
+            Some("high".to_string())
+        );
+    }
+
+    #[test]
+    fn opus_4_5_thinking_stays_enabled_without_output_config() {
+        // 非 adaptive 模型不得因 opus-5 分支被误纳入 adaptive
+        let mut payload = thinking_payload("claude-opus-4-5-thinking");
+
+        override_thinking_from_model_name(&mut payload);
+
+        let thinking = payload.thinking.expect("thinking must be set");
+        assert_eq!(thinking.thinking_type, "enabled");
+        assert!(payload.output_config.is_none());
     }
 
     #[test]
