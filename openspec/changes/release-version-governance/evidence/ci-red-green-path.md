@@ -75,6 +75,107 @@ git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules \
 
 `python -m unittest` 三个模块：**40 passed**（原 23 + 新增回归与既有覆盖）。
 
-## 临时 tag 清理
+## 第二轮红路径：修复后重跑（v2026.8.11）
 
-见本文件末尾「清理确认」小节。
+删除第一轮临时 tag 后，在修复后的 main（`55b64a3`）上重建同名附注 tag，Cargo 仍为 `2026.8.10`。
+
+| Workflow | Run | 结论 |
+| --- | --- | --- |
+| Build Artifacts | https://github.com/wtfdelphia/kiro.rs/actions/runs/31363555851 | `version-gate` **failure**、`warning-gate` success、`build` **skipped**、`release` **skipped** |
+| Build and Push Docker Images | https://github.com/wtfdelphia/kiro.rs/actions/runs/31363555870 | `version-gate` **failure**、`warning-gate` success、`build` **skipped**、`manifest` **skipped** |
+
+两条 workflow 的 annotation 均为预期原文：
+
+```
+::error::Cargo.toml version '2026.8.10' does not match release tag 'v2026.8.11';
+set [package].version to '2026.8.11', update Cargo.lock, commit, and recreate the tag
+```
+
+### 无发布副作用确认
+
+| 检查 | 结果 |
+| --- | --- |
+| GitHub Releases | 无 `v2026.8.11`；最新正式 Release 仍为 `v2026.8.4` |
+| GHCR tag 列表（`gh api users/wtfdelphia/packages/container/kiro-rs/versions`） | 无任何 `v2026.8.11*`；最新正式镜像仍为 `v2026.8.4` 与 `latest` |
+
+### 任务 7.7 运行时证据（gate 并行）
+
+取自 run `31363555851` 的 job 起止时间：
+
+| Job | started | completed |
+| --- | --- | --- |
+| `pre-check` | 06:51:30Z | 06:51:35Z |
+| `version-gate` | 06:51:37Z | 06:51:43Z |
+| `warning-gate` | 06:51:37Z | 06:52:06Z |
+
+两个 gate 同秒启动；version gate 6 秒内失败，warning gate 持续 29 秒。version gate 不等待
+warning gate 完成，实测证实二者正交并行。
+
+## 任务 7.4：非正式构建可追溯（实测）
+
+`dev` 推送至 `55b64a3` 后：
+
+| Workflow | Run | version gate |
+| --- | --- | --- |
+| Build Artifacts（`build.yaml`） | https://github.com/wtfdelphia/kiro.rs/actions/runs/31364313666 | 存在但为 **success**（`enforce=false` 非强制通道；不带 `if`，避免 skipped 传播误伤分支产物） |
+| Build Dev Release（`build-dev-release.yaml`） | https://github.com/wtfdelphia/kiro.rs/actions/runs/31364313707 | **完全不存在** version gate |
+
+两条均 success，7 条产物腿全部通过。`dev-latest` Release 元数据：
+
+```
+name: Dev rolling build (55b64a3)
+tag: dev-latest | prerelease: true
+target: 55b64a34acd083d1fbd45f7f4b0b1a205e3d17a1
+body: Commit: 55b64a34acd083d1fbd45f7f4b0b1a205e3d17a1 / Short SHA: 55b64a3 / Workflow: Build Dev Release
+      "This prerelease does not replace the repository Latest stable release."
+```
+
+标题含短 SHA、正文含完整 commit 与 workflow，标记为 prerelease，满足「可追溯且不冒充正式版本」。
+
+## 分支收敛：dev 推送后 PR 合入 main 与 master
+
+按维护者要求，最终形态为 `dev` 推送、`main` 与 `master` 均经 PR 合入。
+
+| 步骤 | 内容 |
+| --- | --- |
+| PR #6 | `codex/release-version-governance-main` → `main`，普通 merge，实现落地 |
+| PR #7 | `codex/release-version-governance-main` → `main`，普通 merge，version gate 附注 tag 判定修复 |
+| `dev` | fast-forward 至 `55b64a3`（与 `main` 同点），无历史改写 |
+| PR #8 | `dev` → `master`，普通 merge，master 合并后为 `671fadd` |
+
+收敛后核验：
+
+| 检查 | 结果 |
+| --- | --- |
+| `git diff --stat origin/main origin/master` | 无输出（树内容一致） |
+| `git diff --quiet origin/dev origin/main` | exit 0（一致） |
+| `git merge-base --is-ancestor origin/main origin/master` | exit 0（master 已含 main 全部提交） |
+
+全程无强推、无 reset、无分支删除。
+
+## 临时 tag 清理确认
+
+两轮红路径的临时 tag 均已删除：
+
+| 轮次 | 操作 | 确认 |
+| --- | --- | --- |
+| 第一轮（`60e3171`） | `git push origin :refs/tags/v2026.8.11` + `git tag -d` | 远端 `- [deleted] v2026.8.11` |
+| 第二轮（`a8bc27c`） | 同上 | `git ls-remote --tags origin \| rg 2026.8.11` 无输出 |
+
+失败的 Actions run 记录保留在历史中，它们正是红路径证据本身。
+
+## 任务 7.5：正式发布绿路径（未执行）
+
+**状态：BLOCKED，待维护者授权。**
+
+正式附注 tag `v2026.8.10` 已在本地创建并指向 `55b64a3`（`git cat-file -t` 为 `tag`），
+Cargo 版本 `2026.8.10` 与当日 CalVer 一致，前置条件齐备。
+
+推送该 tag 会创建真实的 GitHub Release 与 GHCR 正式镜像（`v2026.8.10` 与 `latest`），
+属不可逆的高影响外部副作用，实施代理未获得该具体动作的授权，因此停在推送前。
+
+待授权后需补充的证据：两条 workflow 的绿路径 run URL、Release 资产名、
+`docker image inspect ghcr.io/wtfdelphia/kiro-rs:v2026.8.10` 的 OCI version label。
+
+需注意：`main` 与 `master` 现已同点，`master` 上也存在 `v*` tag 触发器；正式 tag 指向的
+提交同时可从两条分支到达，门禁的 `origin/main` 可达性检查不受影响。
