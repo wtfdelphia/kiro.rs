@@ -183,7 +183,7 @@ docker pull ghcr.io/<owner>/kiro-rs:v2026.3.1
 仓库根目录 [`docker-compose.yml`](../docker-compose.yml) 默认类似：
 
 ```yaml
-image: ghcr.io/${IMAGE_OWNER:-hank9999}/kiro-rs:${IMAGE_TAG:-latest}
+image: ghcr.io/${IMAGE_OWNER:-wtfdelphia}/kiro-rs:${IMAGE_TAG:-latest}
 ```
 
 本地可覆盖：
@@ -378,7 +378,7 @@ git push origin v2026.3.2
    从非正式分支手动跑 Docker 时要特别小心。
 
 5. **fork 镜像 owner 可能与 compose 默认值不同**  
-   compose 默认 owner 可能是 `hank9999`，而实际推送 owner 取决于当前 GitHub 仓库 owner。
+   compose 默认 owner 可能是 `wtfdelphia`，而实际推送 owner 取决于当前 GitHub 仓库 owner。
 
 ## 快速决策表
 
