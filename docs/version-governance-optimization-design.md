@@ -316,7 +316,7 @@ CI 红路径为**硬性要求**，不可用本地等价执行替代：AGENTS.md 
 | rust-version = "1.97.1" 排除旧工具链用户 | 中：这是有意收紧的兼容范围，Rust 1.96 及以下会在构建前被 Cargo 拒绝 | README / 长期规格明确 MSRV；发布前在 1.97.1 上验证 default 与 `--no-default-features` 两种构建面 |
 | 声明的 MSRV 与浮动产物工具链分离 | 中：Dockerfile rust:1 与 CI @stable 均浮动，实际产物可能使用高于 1.97.1 的版本 | 将 1.97.1 定义为最低支持版本而非产物工具链记录；每次调整 MSRV 时显式重跑门禁并同步文档 |
 | reusable version-gate 的 permissions 继承 | 低：reusable workflow 未声明时继承 caller 权限（build.yaml 的 contents: write） | 照 warning-gate.yaml 的做法显式声明 permissions: contents: read，收窄到只读 |
-| 同日紧急修复需要等待日期变化 | 低：换取版本排序与语义无歧义 | 明确同日只允许一个正式版；紧急修复使用下一个自然日版本 |
+| ~~同日紧急修复需要等待日期变化~~ | ~~低：换取版本排序与语义无歧义~~ | **2026-08-10 已消解**：第三段修正为当月发布序号后，同月可发布多个正式版本，同日亦可多次发布，该风险不再存在（见顶部修订记录） |
 | 人工 publish 绕过版本身份 | 高：自由输入可发布与 Cargo 无关的公共镜像 tag | publish=true 只能从当前提交的唯一附注 v* tag 推导版本，任何歧义均前置失败 |
 
 所有提交均可独立回退；CI 门禁若出现误拦，可临时在 workflow 中注释 version-gate 的 needs 引用（秒级恢复），不影响其他 job 与 warning-gate 逻辑。

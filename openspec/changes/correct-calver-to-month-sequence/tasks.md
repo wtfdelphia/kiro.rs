@@ -40,7 +40,7 @@
 
 ## 6. CI 红绿路径重新取证
 
-- [ ] 6.1 由维护者创建 Cargo 失配的临时附注 tag，验证两条 workflow 均被 version gate 拦截且产物 job skipped，随后删除远端临时 tag
+- [x] 6.1 由维护者创建 Cargo 失配的临时附注 tag，验证两条 workflow 均被 version gate 拦截且产物 job skipped，随后删除远端临时 tag
 - [ ] 6.2 将 `Cargo.toml` 与 `Cargo.lock` 更新为 `2026.8.11` 并经 PR 合入 main
 - [ ] 6.3 由维护者推送 `v2026.8.11` 正式 tag，验证绿路径产物链完整，Release 资产名与 GHCR 镜像 tag 均为 `v2026.8.11`
 - [ ] 6.4 确认该正式版本包含 Claude Opus 5 支持（提交 `9d4bdba` 可从 tag 到达）
@@ -51,3 +51,4 @@
 - [ ] 7.2 运行 `openspec-verify-change`，产出归档前验证报告
 - [ ] 7.3 运行 `verification-before-completion`，记录真实命令、告警数、文档同步、`git status --short` 与剩余风险
 - [ ] 7.4 用户确认后再运行 `openspec-archive-change`
+- [ ] 7.5 归档同步时手动修正主规格 `## Purpose` 段中的 `vYYYY.M.D` 表述（delta 只含 Requirements 段，不覆盖 Purpose，易漏）
