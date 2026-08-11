@@ -8,3 +8,5 @@
 - 工具来源：`docs/tooling-sources.md`
 
 开始任何实现前：读取 AGENTS.md 与当前 change 的 proposal/design/tasks/specs。
+
+提交信息走 `caveman-commit` skill，规则见 AGENTS.md「提交信息纪律」。本仓库提交信息不写 AI 归属 trailer，包括 `Assisted-by`、`Co-Authored-By`、`Co-authored-by`。
