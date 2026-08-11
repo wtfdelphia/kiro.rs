@@ -2,7 +2,6 @@
 """Validate and resolve the release identity used by CI workflows."""
 
 import argparse
-import datetime as dt
 import re
 import subprocess
 import sys
@@ -10,7 +9,10 @@ import tomllib
 from pathlib import Path
 
 
-CALVER_TAG = re.compile(r"^v(\d{4})\.([1-9]\d?)\.([1-9]\d?)$")
+# vYYYY.MM.MICRO -- the third segment is the release sequence within the month,
+# not a calendar day. Month and sequence reject leading zeros and zero values;
+# the sequence has no upper bound.
+CALVER_TAG = re.compile(r"^v(\d{4})\.([1-9]\d?)\.([1-9]\d*)$")
 
 
 class ReleaseVersionError(ValueError):
@@ -89,14 +91,18 @@ def validate_release(
     match = CALVER_TAG.fullmatch(tag)
     if not match:
         raise ReleaseVersionError(
-            f"release tag {tag!r} must use the exact vYYYY.M.D format"
+            f"release tag {tag!r} must use the exact vYYYY.MM.MICRO format, "
+            f"where MICRO is the release sequence within the month"
         )
 
-    year, month, day = (int(value) for value in match.groups())
-    try:
-        dt.date(year, month, day)
-    except ValueError as error:
-        raise ReleaseVersionError(f"release tag {tag!r} is not a valid calendar date") from error
+    # The regex alone cannot bound the month: it previously relied on
+    # datetime.date() to reject values above 12 as a side effect of the
+    # calendar-day semantics. That check is gone, so bound it explicitly.
+    month = int(match.group(2))
+    if not 1 <= month <= 12:
+        raise ReleaseVersionError(
+            f"release tag {tag!r} has invalid month {month}; month must be 1-12"
+        )
 
     object_type = tag_object_type(repo, tag, remote)
     if object_type != "tag":
