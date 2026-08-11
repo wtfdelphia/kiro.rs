@@ -50,5 +50,5 @@
 - [x] 7.1 运行 `spec-compliance-check` 并修复范围、设计、场景、项目规则、验证与文档同步问题
 - [x] 7.2 运行 `openspec-verify-change`，产出归档前验证报告
 - [x] 7.3 运行 `verification-before-completion`，记录真实命令、告警数、文档同步、`git status --short` 与剩余风险
-- [ ] 7.4 用户确认后再运行 `openspec-archive-change`
-- [ ] 7.5 归档同步时手动修正主规格 `## Purpose` 段中的 `vYYYY.M.D` 表述（delta 只含 Requirements 段，不覆盖 Purpose，易漏）
+- [x] 7.4 用户确认后再运行 `openspec-archive-change`
+- [x] 7.5 归档同步时手动修正主规格 `## Purpose` 段中的 `vYYYY.M.D` 表述（delta 只含 Requirements 段，不覆盖 Purpose，易漏）
