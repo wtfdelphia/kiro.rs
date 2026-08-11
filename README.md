@@ -7,8 +7,7 @@
 <table>
 <tr>
 <td>
-<b>特别感谢</b>：<a href="https://co.yes.vg/register?ref=hank9999">YesCode</a> 为本项目提供了 AI API 额度赞助, YesCode 作为一家低调务实的 AI API 中转服务商 <br>
-长期以来提供稳定高可用的服务, 如您有意体验, 请点击链接注册体验 → <a href="https://co.yes.vg/register?ref=hank9999">立即访问</a>
+<b>上游项目鸣谢</b>：<a href="https://co.yes.vg/register?ref=hank9999">YesCode</a> 曾为上游项目提供 AI API 额度赞助。该链接保留自上游 README，若需体验请自行判断适用性 → <a href="https://co.yes.vg/register?ref=hank9999">立即访问</a>
 </td>
 </tr>
 </table>
@@ -27,7 +26,7 @@
 因 TLS 默认从 native-tls 切换至 rustls，你可能需要专门安装证书后才能配置 HTTP 代理。可通过 `config.json` 的 `tlsBackend` 切回 `native-tls`。
 如果遇到请求报错, 尤其是无法刷新 token, 或者是直接返回 error request, 请尝试切换 tls 后端为 `native-tls`, 一般即可解决。
 
-**Write Failed/会话卡死**: 如果遇到持续的 Write File / Write Failed 并导致会话不可用，参考 Issue [#22](https://github.com/hank9999/kiro.rs/issues/22) 和 [#49](https://github.com/hank9999/kiro.rs/issues/49) 的说明与临时解决方案（通常与输出过长被截断有关，可尝试调低输出相关 token 上限）
+**Write Failed/会话卡死**: 如果遇到持续的 Write File / Write Failed 并导致会话不可用，可参考上游 Issue [#22](https://github.com/hank9999/kiro.rs/issues/22) 和 [#49](https://github.com/hank9999/kiro.rs/issues/49) 的说明与临时解决方案（通常与输出过长被截断有关，可尝试调低输出相关 token 上限）
 
 ## 功能特性
 

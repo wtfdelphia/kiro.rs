@@ -74,6 +74,7 @@ OpenSpec 官方 init 已提供：`openspec-propose`、`openspec-apply-change`、
 | 实现后/审查前 | spec-compliance-check |
 | 归档前 | openspec-verify-change |
 | 最终回复/PR/归档/合并前 | verification-before-completion |
+| 起草提交信息 / PR 标题 / squash 信息 | caveman-commit |
 
 ## CodeGraph
 
@@ -106,6 +107,19 @@ OpenSpec 官方 init 已提供：`openspec-propose`、`openspec-apply-change`、
 - 不隐藏失败
 - 不粘贴真实 token、账号、Cookie
 - 完成前 `git status --short`，防止密钥与 `.codegraph/` 误入
+
+## 提交信息纪律
+
+提交信息、PR 标题、squash 信息统一走 `caveman-commit` skill（`.codex/skills/caveman-commit/SKILL.md`，`.claude/skills/` 有等价镜像）。客户端不支持 skill 时按该文件规则等价产出。
+
+要点（完整规则见 skill）：
+
+- Conventional Commits：`<type>(<scope>): <祈使式摘要>`，摘要用中文祈使式，代码标识符保持原文
+- 长度按显示宽度计（CJK 算 2 宽度）：目标 ≤50，硬上限 72；结尾不加句号
+- scope 复用既有词表，不新造同义词
+- 正文默认省略，只写非显而易见的 why；breaking change、安全修复、schema 迁移、revert、告警门禁/发布路径/凭据相关改动必须写正文
+- 禁止「本次提交做了 X」式复述、emoji、在正文里叙述 AI 参与过程
+- 提交信息、PR 标题、squash 信息不写 `Assisted-by`、`Co-Authored-By`、`Co-authored-by` 等 AI 归属；真人共同作者的 `Co-authored-by` trailer 按实际协作保留
 
 ## README / AGENTS / spec 同步纪律
 

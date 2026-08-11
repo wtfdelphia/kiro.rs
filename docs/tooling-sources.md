@@ -13,6 +13,7 @@
 | pnpm | 本机 | 11.1.3 | admin-ui 构建 | `admin-ui/node_modules/` |
 | ECC | https://github.com/affaan-m/ECC | 仅参考，不安装 | rules / skills 结构借鉴 | 用户级配置、密钥 |
 | Karpathy skills | https://github.com/multica-ai/andrej-karpathy-skills | 仅参考 | 行为纪律项目化 | 未裁剪外部配置 |
+| caveman-commit | 用户级 skill，已裁剪落地为 `.codex/skills/caveman-commit/`（`.claude/skills/` 镜像） | 项目内版本 | 提交信息 / PR 标题 / squash 信息规范 | 无 |
 
 ## Cargo 依赖登记（非 CLI）
 
