@@ -3,13 +3,13 @@
 //! 不复用 Anthropic 的 `StreamContext`（它产出 Anthropic 事件），平行实现。
 //! thinking 内容走 `reasoning_content`，绝不混进 `content`（D12 相邻约束）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::anthropic::get_context_window_size;
-use crate::kiro::model::events::Event;
+use crate::kiro::model::events::{Event, EventStreamDiagnostics};
 
 use super::types::Usage;
 
@@ -65,6 +65,8 @@ pub struct OpenAiStreamContext {
     has_tool_use: bool,
     /// tool_use_id -> 状态
     tool_calls: HashMap<String, ToolCallState>,
+    /// 被判定为不完整的 tool_use_id，后续同 id 分片全部抑制公开输出
+    suppressed_tool_use_ids: HashSet<String>,
     next_tool_index: i32,
 
     /// thinking 标签跨 chunk 检测缓冲
@@ -73,6 +75,8 @@ pub struct OpenAiStreamContext {
     thinking_done: bool,
     /// 输出文本累计（用于估算 completion_tokens）
     output_text_len: usize,
+    /// Kiro EventStream 脱敏诊断摘要
+    diagnostics: EventStreamDiagnostics,
 }
 
 impl OpenAiStreamContext {
@@ -96,11 +100,13 @@ impl OpenAiStreamContext {
             finish_reason: None,
             has_tool_use: false,
             tool_calls: HashMap::new(),
+            suppressed_tool_use_ids: HashSet::new(),
             next_tool_index: 0,
             thinking_buffer: String::new(),
             in_thinking_block: false,
             thinking_done: false,
             output_text_len: 0,
+            diagnostics: EventStreamDiagnostics::default(),
         }
     }
 
@@ -136,14 +142,14 @@ impl OpenAiStreamContext {
     /// 处理一个 Kiro 事件，返回要发出的 chunk
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<OpenAiSseChunk> {
         let mut out = Vec::new();
+        self.diagnostics.observe(event);
+
         match event {
             Event::AssistantResponse(resp) => {
                 self.ensure_role(&mut out);
                 self.process_text(&resp.content, &mut out);
             }
             Event::ToolUse(tool_use) => {
-                self.ensure_role(&mut out);
-                self.has_tool_use = true;
                 self.process_tool_use(tool_use, &mut out);
             }
             Event::ContextUsage(usage) => {
@@ -211,10 +217,8 @@ impl OpenAiStreamContext {
                     self.thinking_buffer =
                         self.thinking_buffer[pos + THINKING_OPEN.len()..].to_string();
                     // 剥离开始标签后紧跟的换行
-                    self.thinking_buffer = self
-                        .thinking_buffer
-                        .trim_start_matches('\n')
-                        .to_string();
+                    self.thinking_buffer =
+                        self.thinking_buffer.trim_start_matches('\n').to_string();
                     self.in_thinking_block = true;
                     continue;
                 }
@@ -249,7 +253,26 @@ impl OpenAiStreamContext {
         out: &mut Vec<OpenAiSseChunk>,
     ) {
         let id = tool_use.tool_use_id.clone();
+        if id.is_empty() {
+            tracing::warn!("跳过缺少 tool_use_id 的 toolUseEvent public 输出");
+            return;
+        }
+
+        if self.suppressed_tool_use_ids.contains(&id) {
+            return;
+        }
+
         let is_new = !self.tool_calls.contains_key(&id);
+        if is_new && tool_use.name.is_empty() {
+            self.suppressed_tool_use_ids.insert(id.clone());
+            tracing::warn!(
+                tool_use_id_hash = %EventStreamDiagnostics::hash_public_id(&id),
+                "跳过缺少工具名的 toolUseEvent public 输出"
+            );
+            return;
+        }
+        self.ensure_role(out);
+        self.has_tool_use = true;
 
         if is_new {
             let index = self.next_tool_index;
@@ -339,6 +362,7 @@ impl OpenAiStreamContext {
         }
 
         out.push(OpenAiSseChunk::Done);
+        self.diagnostics.log_summary("openai-chat");
         out
     }
 
@@ -374,7 +398,9 @@ fn safe_flush_len(buf: &str, tag: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kiro::model::events::{ContextUsageEvent, ToolUseEvent};
+    use crate::kiro::model::events::{
+        ContextUsageEvent, MeteringEvent, ReasoningContentEvent, ToolUseEvent,
+    };
 
     fn text_event(content: &str) -> Event {
         // AssistantResponseEvent 含私有 extra 字段，用 serde 构造
@@ -564,7 +590,10 @@ mod tests {
     fn test_tool_name_restored_from_map() {
         // D8 第二项：超长工具名缩短后必须回显原名
         let mut map = HashMap::new();
-        map.insert("short_abc".to_string(), "very_long_original_tool_name".to_string());
+        map.insert(
+            "short_abc".to_string(),
+            "very_long_original_tool_name".to_string(),
+        );
         let mut ctx = OpenAiStreamContext::new("m", 10, false, false, map);
         let out = ctx.process_kiro_event(&tool_event("c", "short_abc", "", false));
         let d = datas(&out)
@@ -574,6 +603,53 @@ mod tests {
         assert_eq!(
             d["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
             "very_long_original_tool_name"
+        );
+    }
+
+    #[test]
+    fn test_tool_use_missing_name_suppresses_entire_lifecycle() {
+        let mut ctx = new_ctx(false, false);
+
+        let first = ctx.process_kiro_event(&tool_event("tool_1", "", "part1", false));
+        let second = ctx.process_kiro_event(&tool_event("tool_1", "test_tool", "part2", true));
+
+        assert!(first.is_empty());
+        assert!(second.is_empty());
+        assert!(ctx.tool_calls.is_empty());
+        assert!(ctx.suppressed_tool_use_ids.contains("tool_1"));
+        assert!(!ctx.has_tool_use);
+    }
+
+    #[test]
+    fn test_reasoning_and_metering_events_are_not_public_chat_chunks() {
+        let mut ctx = new_ctx(true, false);
+        let mut all = ctx.process_kiro_event(&Event::Reasoning(ReasoningContentEvent {
+            text: "abc".to_string(),
+            signature: "fixture_signature_value".to_string(),
+            ..Default::default()
+        }));
+        all.extend(ctx.process_kiro_event(&Event::Metering(MeteringEvent {
+            unit: "request".to_string(),
+            unit_plural: "requests".to_string(),
+            usage: 1.0,
+            ..Default::default()
+        })));
+        all.extend(ctx.process_kiro_event(&Event::Unknown {
+            event_type: "futureEvent".to_string(),
+            payload: b"fixture hidden payload".to_vec(),
+        }));
+        all.extend(ctx.finish());
+
+        let serialized = serde_json::to_string(&datas(&all)).expect("序列化 OpenAI chunk 失败");
+        assert!(!serialized.contains("diagnostic"));
+        assert!(!serialized.contains("metering"));
+        assert!(!serialized.contains("fixture_signature_value"));
+        assert!(!serialized.contains("fixture hidden payload"));
+        assert!(
+            datas(&all)
+                .iter()
+                .all(|d| d["choices"][0]["delta"].get("reasoning_content").is_none()),
+            "reasoningContentEvent 不应直接变成 OpenAI reasoning_content"
         );
     }
 
@@ -668,7 +744,10 @@ mod tests {
 
         assert_eq!(reasoning, "思考");
         assert_eq!(content, "答案");
-        assert!(!content.contains("thinking"), "被拆分的标签不得泄漏到 content");
+        assert!(
+            !content.contains("thinking"),
+            "被拆分的标签不得泄漏到 content"
+        );
     }
 
     #[test]

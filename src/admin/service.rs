@@ -46,6 +46,10 @@ pub struct AdminService {
     client_auth: Option<Arc<parking_lot::RwLock<crate::anthropic::AuthRuntime>>>,
     /// Provider 热更新（proxy/defaultEndpoint）
     provider: Option<Arc<crate::kiro::provider::KiroProvider>>,
+    /// WebSocket ingress 设置热更新句柄
+    ws_settings: Option<Arc<parking_lot::RwLock<crate::model::config::WsSettings>>>,
+    /// WS 准入计数器（GET 展示活跃连接数）
+    ws_admission: Option<Arc<crate::openai::ws_transport::WsAdmission>>,
 }
 
 impl AdminService {
@@ -76,7 +80,20 @@ impl AdminService {
             known_endpoints: known_endpoints.into_iter().collect(),
             client_auth,
             provider,
+            ws_settings: None,
+            ws_admission: None,
         }
+    }
+
+    /// 挂接 WebSocket ingress 运行时句柄（设置热更新 + 准入计数）
+    pub fn with_ws_runtime(
+        mut self,
+        ws_settings: Arc<parking_lot::RwLock<crate::model::config::WsSettings>>,
+        ws_admission: Arc<crate::openai::ws_transport::WsAdmission>,
+    ) -> Self {
+        self.ws_settings = Some(ws_settings);
+        self.ws_admission = Some(ws_admission);
+        self
     }
 
     /// 获取所有凭据状态
@@ -1373,6 +1390,143 @@ impl AdminService {
         )))
     }
 
+    /// WebSocket ingress 运行时设置（含活跃连接数）
+    pub fn get_ws_settings(&self) -> crate::admin::types::WsSettingsResponse {
+        use crate::model::config::WsSettings;
+        let (settings, active) = match (&self.ws_settings, &self.ws_admission) {
+            (Some(ws), Some(adm)) => (ws.read().clone(), adm.active()),
+            _ => (WsSettings::default(), 0),
+        };
+        crate::admin::types::WsSettingsResponse {
+            enabled: settings.enabled,
+            mode: Self::ws_mode_str(settings.mode).to_string(),
+            max_connections: settings.max_connections,
+            client_first_message_timeout_seconds: settings.client_first_message_timeout_seconds,
+            inter_turn_idle_timeout_seconds: settings.inter_turn_idle_timeout_seconds,
+            max_message_bytes: settings.max_message_bytes,
+            upstream_read_timeout_seconds: settings.upstream_read_timeout_seconds,
+            active_connections: active,
+        }
+    }
+
+    fn ws_mode_str(mode: crate::model::config::WsTransportMode) -> &'static str {
+        match mode {
+            crate::model::config::WsTransportMode::HttpBridge => "http_bridge",
+            crate::model::config::WsTransportMode::Passthrough => "passthrough",
+        }
+    }
+
+    /// WebSocket 设置部分更新：未携带字段保持当前值；写内存立即生效，
+    /// 随后更新中心配置并落盘；落盘失败时错误区分「已生效未落盘」。
+    pub fn update_ws_settings(
+        &self,
+        req: crate::admin::types::UpdateWsSettingsRequest,
+    ) -> Result<super::types::SuccessResponse, AdminServiceError> {
+        use crate::model::config::{WsSettings, WsTransportMode};
+
+        let Some(ws_handle) = &self.ws_settings else {
+            return Err(AdminServiceError::InternalError(
+                "WebSocket 运行时未挂接".to_string(),
+            ));
+        };
+        let current = ws_handle.read().clone();
+
+        // 未知 mode 显式 400（区别于配置加载期的静默回落）
+        let mode = match req.mode.as_deref().map(str::trim) {
+            None => current.mode,
+            Some("http_bridge") => WsTransportMode::HttpBridge,
+            Some("passthrough") => WsTransportMode::Passthrough,
+            Some(other) => {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "未知的 websocket.mode: {}（可选值: http_bridge / passthrough）",
+                    other
+                )));
+            }
+        };
+
+        let merged = WsSettings {
+            enabled: req.enabled.unwrap_or(current.enabled),
+            mode,
+            max_connections: req.max_connections.unwrap_or(current.max_connections),
+            client_first_message_timeout_seconds: req
+                .client_first_message_timeout_seconds
+                .unwrap_or(current.client_first_message_timeout_seconds),
+            inter_turn_idle_timeout_seconds: req
+                .inter_turn_idle_timeout_seconds
+                .unwrap_or(current.inter_turn_idle_timeout_seconds),
+            max_message_bytes: req.max_message_bytes.unwrap_or(current.max_message_bytes),
+            upstream_read_timeout_seconds: req
+                .upstream_read_timeout_seconds
+                .unwrap_or(current.upstream_read_timeout_seconds),
+        };
+
+        // 热更新留痕：只记录变更字段的旧→新（spec：Admin 可读写 WebSocket 运行时设置）
+        let mut diff: Vec<String> = Vec::new();
+        if current.enabled != merged.enabled {
+            diff.push(format!("enabled: {} -> {}", current.enabled, merged.enabled));
+        }
+        if current.mode != merged.mode {
+            diff.push(format!(
+                "mode: {} -> {}",
+                Self::ws_mode_str(current.mode),
+                Self::ws_mode_str(merged.mode)
+            ));
+        }
+        if current.max_connections != merged.max_connections {
+            diff.push(format!(
+                "maxConnections: {} -> {}",
+                current.max_connections, merged.max_connections
+            ));
+        }
+        if current.client_first_message_timeout_seconds
+            != merged.client_first_message_timeout_seconds
+        {
+            diff.push(format!(
+                "clientFirstMessageTimeoutSeconds: {} -> {}",
+                current.client_first_message_timeout_seconds,
+                merged.client_first_message_timeout_seconds
+            ));
+        }
+        if current.inter_turn_idle_timeout_seconds != merged.inter_turn_idle_timeout_seconds {
+            diff.push(format!(
+                "interTurnIdleTimeoutSeconds: {} -> {}",
+                current.inter_turn_idle_timeout_seconds, merged.inter_turn_idle_timeout_seconds
+            ));
+        }
+        if current.max_message_bytes != merged.max_message_bytes {
+            diff.push(format!(
+                "maxMessageBytes: {} -> {}",
+                current.max_message_bytes, merged.max_message_bytes
+            ));
+        }
+        if current.upstream_read_timeout_seconds != merged.upstream_read_timeout_seconds {
+            diff.push(format!(
+                "upstreamReadTimeoutSeconds: {} -> {}",
+                current.upstream_read_timeout_seconds, merged.upstream_read_timeout_seconds
+            ));
+        }
+        tracing::info!(
+            changes = if diff.is_empty() { "无字段变化".to_string() } else { diff.join(", ") },
+            "WebSocket ingress 设置已更新"
+        );
+
+        // 先写内存句柄（新连接立即按新语义），再更新中心配置并落盘
+        *ws_handle.write() = merged.clone();
+        let persisted = self
+            .token_manager
+            .update_config_with(|cfg| cfg.websocket = merged.clone())
+            .and_then(|_| self.token_manager.save_config());
+        match persisted {
+            Ok(()) => Ok(super::types::SuccessResponse::new(
+                "WebSocket 设置已更新并落盘",
+            )),
+            Err(e) => Err(AdminServiceError::InternalError(format!(
+                "WebSocket 设置已在内存生效但未落盘: {}",
+                e
+            ))),
+        }
+    }
+
     /// 对外 Public API 目录（只读）
     ///
     /// 注意：这里描述的是「客户端 -> 本代理」的端点，与 `get_endpoint_settings`
@@ -1681,6 +1835,31 @@ mod tests {
         (cfg, path)
     }
 
+    /// 挂接 WS 运行时的 service + 运行时句柄
+    fn ws_service() -> (
+        AdminService,
+        Arc<parking_lot::RwLock<crate::model::config::WsSettings>>,
+        Arc<crate::openai::ws_transport::WsAdmission>,
+    ) {
+        ws_service_with_manager(manager_with_one())
+    }
+
+    fn ws_service_with_manager(
+        mgr: Arc<MultiTokenManager>,
+    ) -> (
+        AdminService,
+        Arc<parking_lot::RwLock<crate::model::config::WsSettings>>,
+        Arc<crate::openai::ws_transport::WsAdmission>,
+    ) {
+        let ws = Arc::new(parking_lot::RwLock::new(
+            crate::model::config::WsSettings::default(),
+        ));
+        let adm = Arc::new(crate::openai::ws_transport::WsAdmission::new());
+        let service =
+            AdminService::new(mgr, Vec::<String>::new()).with_ws_runtime(ws.clone(), adm.clone());
+        (service, ws, adm)
+    }
+
     #[tokio::test]
     async fn test_credential_rejects_unmapped_model() {
         let mgr = manager_with_one();
@@ -1918,6 +2097,115 @@ mod tests {
             saved
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    // === WebSocket 运行时设置（任务 7.3）===
+
+    #[test]
+    fn test_ws_settings_get_returns_defaults_and_active_count() {
+        let (service, _ws, adm) = ws_service();
+        let resp = service.get_ws_settings();
+        assert!(resp.enabled, "缺省必须启用（兼容现网）");
+        assert_eq!(resp.mode, "http_bridge");
+        assert_eq!(resp.max_connections, 64);
+        assert_eq!(resp.active_connections, 0);
+
+        // 活跃连接数来自准入计数器实时值
+        let g1 = adm.try_acquire(64).expect("准入失败");
+        let _g2 = adm.try_acquire(64).expect("准入失败");
+        assert_eq!(service.get_ws_settings().active_connections, 2);
+        drop(g1);
+        assert_eq!(service.get_ws_settings().active_connections, 1);
+    }
+
+    #[test]
+    fn test_ws_settings_partial_update_merges_and_persists() {
+        let (cfg, path) = temp_config();
+        let (service, ws, _adm) = ws_service_with_manager(manager_with_config(cfg));
+
+        // 仅更新 enabled：其余字段必须保持不变
+        service
+            .update_ws_settings(crate::admin::types::UpdateWsSettingsRequest {
+                enabled: Some(false),
+                mode: None,
+                max_connections: None,
+                client_first_message_timeout_seconds: None,
+                inter_turn_idle_timeout_seconds: None,
+                max_message_bytes: None,
+                upstream_read_timeout_seconds: None,
+            })
+            .expect("部分更新失败");
+
+        let after = service.get_ws_settings();
+        assert!(!after.enabled, "enabled 必须热生效");
+        assert_eq!(after.mode, "http_bridge", "未携带字段必须保持原值");
+        assert_eq!(after.max_connections, 64);
+        assert!(!ws.read().enabled, "内存句柄必须已生效（新连接立即按新语义）");
+
+        let saved = std::fs::read_to_string(&path).expect("读取配置失败");
+        assert!(saved.contains("\"websocket\""), "websocket 块必须落盘: {}", saved);
+        assert!(saved.contains("\"enabled\": false"), "落盘值应为更新后: {}", saved);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_ws_settings_update_mode_and_unknown_mode_rejected() {
+        let (cfg, path) = temp_config();
+        let (service, ws, _adm) = ws_service_with_manager(manager_with_config(cfg));
+        service
+            .update_ws_settings(crate::admin::types::UpdateWsSettingsRequest {
+                enabled: None,
+                mode: Some("passthrough".to_string()),
+                max_connections: None,
+                client_first_message_timeout_seconds: None,
+                inter_turn_idle_timeout_seconds: None,
+                max_message_bytes: None,
+                upstream_read_timeout_seconds: None,
+            })
+            .expect("mode 更新失败");
+        assert_eq!(ws.read().mode, crate::model::config::WsTransportMode::Passthrough);
+        assert_eq!(service.get_ws_settings().mode, "passthrough");
+
+        let err = service
+            .update_ws_settings(crate::admin::types::UpdateWsSettingsRequest {
+                enabled: None,
+                mode: Some("bogus".to_string()),
+                max_connections: None,
+                client_first_message_timeout_seconds: None,
+                inter_turn_idle_timeout_seconds: None,
+                max_message_bytes: None,
+                upstream_read_timeout_seconds: None,
+            })
+            .expect_err("未知 mode 必须被拒绝");
+        assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            ws.read().mode,
+            crate::model::config::WsTransportMode::Passthrough,
+            "拒绝的更新不得改动内存值"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_ws_settings_applied_but_not_persisted_distinguished() {
+        // manager_with_one 的 Config 无 config_path：save_config 必然失败，
+        // 但内存值必须已生效，且错误文案区分「已生效未落盘」
+        let (service, ws, _adm) = ws_service();
+        let err = service
+            .update_ws_settings(crate::admin::types::UpdateWsSettingsRequest {
+                enabled: Some(false),
+                mode: None,
+                max_connections: Some(8),
+                client_first_message_timeout_seconds: None,
+                inter_turn_idle_timeout_seconds: None,
+                max_message_bytes: None,
+                upstream_read_timeout_seconds: None,
+            })
+            .expect_err("无配置路径时落盘必须失败");
+        let msg = err.to_string();
+        assert!(msg.contains("已在内存生效但未落盘"), "错误必须区分语义: {}", msg);
+        assert!(!ws.read().enabled, "内存值必须已生效");
+        assert_eq!(ws.read().max_connections, 8);
     }
 
     #[test]

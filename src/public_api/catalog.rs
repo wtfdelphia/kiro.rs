@@ -186,6 +186,24 @@ pub const ENDPOINTS: &[PublicEndpoint] = &[
         ],
     },
     PublicEndpoint {
+        id: "openai.responses.websocket",
+        family: "openai-responses",
+        method: "GET",
+        path: "/v1/responses",
+        aliases: &[],
+        auth: AuthKind::ClientApiKey,
+        status: EndpointStatus::Live,
+        stream: true,
+        summary: "OpenAI Responses WebSocket ingress（http_bridge：每 turn 桥接一次上游 HTTP/SSE）",
+        client_hints: &[
+            "传输为 WebSocket upgrade；非 upgrade 的普通 GET 返回 426",
+            "事件 JSON 与 POST /v1/responses 的 SSE data 行同形（无 keepalive 对应物）",
+            "单连接多 turn：response.create 每帧一轮；response.cancel 取消当前 turn；session.update 记录会话级 model 覆盖",
+            "运行时开关与限额见 Admin GET/PUT /api/admin/settings/websocket（热加载，不重启）",
+            "previous_response_id 同样被拒绝（无状态）；model 回显客户端请求名",
+        ],
+    },
+    PublicEndpoint {
         id: "openai.responses.retrieve",
         family: "openai-responses",
         method: "GET",
@@ -287,10 +305,11 @@ mod tests {
             ("POST", "/cc/v1/messages/count_tokens"),
             ("POST", "/v1/chat/completions"),
             ("POST", "/v1/responses"),
+            ("GET", "/v1/responses"),
         ] {
             assert!(live.contains(&expected), "缺少 live 端点: {:?}", expected);
         }
-        assert_eq!(live.len(), 7, "live 端点数量与预期不符: {:?}", live);
+        assert_eq!(live.len(), 8, "live 端点数量与预期不符: {:?}", live);
     }
 
     #[test]
@@ -306,7 +325,7 @@ mod tests {
     fn test_responses_live_retrieve_still_planned() {
         let live = ENDPOINTS
             .iter()
-            .find(|e| e.path == "/v1/responses")
+            .find(|e| e.path == "/v1/responses" && e.method == "POST")
             .expect("未登记 /v1/responses");
         assert_eq!(live.status, EndpointStatus::Live);
 
@@ -325,12 +344,27 @@ mod tests {
     fn test_responses_hints_document_stateless_and_websearch() {
         let e = ENDPOINTS
             .iter()
-            .find(|e| e.path == "/v1/responses")
+            .find(|e| e.path == "/v1/responses" && e.method == "POST")
             .expect("未登记 /v1/responses");
         let hints = e.client_hints.join(" ");
         assert!(hints.contains("previous_response_id"), "应说明无状态限制");
         assert!(hints.contains("web_search"), "应说明 web_search 支持与差异");
         assert!(hints.contains("event:"), "应说明 SSE 为命名事件");
+    }
+
+    #[test]
+    fn test_responses_websocket_entry_live_with_upgrade_hint() {
+        let e = ENDPOINTS
+            .iter()
+            .find(|e| e.path == "/v1/responses" && e.method == "GET")
+            .expect("未登记 GET /v1/responses");
+        assert_eq!(e.status, EndpointStatus::Live);
+        assert!(e.stream, "WS ingress 必须标记为流式");
+        let hints = e.client_hints.join(" ");
+        assert!(
+            hints.contains("WebSocket") || hints.contains("websocket"),
+            "client_hints 必须标注 WebSocket upgrade 传输"
+        );
     }
 
     #[test]

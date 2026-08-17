@@ -89,10 +89,11 @@
 
 > PS: 不想本地编译时可直接下载发布包，详见 [下载 / Releases](#下载--releases)。
 >
-> - 正式版：<https://github.com/wtfdelphia/kiro.rs/releases/latest>
-> - 开发滚动包：<https://github.com/wtfdelphia/kiro.rs/releases/tag/dev-latest>
+> - 正式版：[https://github.com/wtfdelphia/kiro.rs/releases/latest](https://github.com/wtfdelphia/kiro.rs/releases/latest)
+> - 开发滚动包：[https://github.com/wtfdelphia/kiro.rs/releases/tag/dev-latest](https://github.com/wtfdelphia/kiro.rs/releases/tag/dev-latest)
 
 > **前置步骤**：编译前需要先构建前端 Admin UI（用于嵌入到二进制中）：
+>
 > ```bash
 > cd admin-ui && pnpm install && pnpm build
 > ```
@@ -123,13 +124,16 @@ cargo build --release
    "region": "us-east-1"
 }
 ```
+
 > PS: 如果你需要 Web 管理面板, 请注意配置 `adminApiKey`
 
 创建 `credentials.json`（从 Kiro IDE 等中获取凭证信息）：
+
 > PS: 可以前往 Web 管理面板配置跳过本步骤
 > 如果你对凭据地域有疑惑, 请查看 [Region 配置](#region-配置)
 
 Social 认证：
+
 ```json
 {
    "refreshToken": "你的刷新token",
@@ -139,6 +143,7 @@ Social 认证：
 ```
 
 IdC 认证：
+
 ```json
 {
    "refreshToken": "你的刷新token",
@@ -177,18 +182,18 @@ curl http://127.0.0.1:8990/v1/messages \
   }'
 ```
 
-#
 ### 运行时设置（Admin）
 
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| GET/PUT | `/api/admin/settings/proxy` | 全局出站代理（热更新 + 落盘；不回传明文密码） |
-| GET/PUT | `/api/admin/settings/endpoint` | 默认 Kiro 端点（仅已注册名，当前 `ide`） |
-| GET/PUT | `/api/admin/settings/auth` | 客户端 `requireApiKey` / `apiKey`（mask 读；热更新） |
-| GET | `/api/admin/models/catalog` | 全局模型 catalog 摘要 |
-| GET | `/api/admin/public-api` | 对外 API 端点目录（只读；Base URL / 鉴权 / status / curl 示例） |
-| GET/PUT | `/api/admin/settings/websearch` | web_search 代执行开关（默认开启；仅影响 `/v1/responses`） |
-| GET | `/api/admin/credentials/{id}/balance?force=true` | 强制刷新余额（跳过 TTL 缓存） |
+| 方法    | 路径                                               | 说明                                                                          |
+| ------- | -------------------------------------------------- | ----------------------------------------------------------------------------- |
+| GET/PUT | `/api/admin/settings/proxy`                      | 全局出站代理（热更新 + 落盘；不回传明文密码）                                 |
+| GET/PUT | `/api/admin/settings/endpoint`                   | 默认 Kiro 端点（仅已注册名，当前`ide`）                                     |
+| GET/PUT | `/api/admin/settings/auth`                       | 客户端`requireApiKey` / `apiKey`（mask 读；热更新）                       |
+| GET     | `/api/admin/models/catalog`                      | 全局模型 catalog 摘要                                                         |
+| GET     | `/api/admin/public-api`                          | 对外 API 端点目录（只读；Base URL / 鉴权 / status / curl 示例）               |
+| GET/PUT | `/api/admin/settings/websearch`                  | web_search 代执行开关（默认开启；仅影响`/v1/responses`）                    |
+| GET/PUT | `/api/admin/settings/websocket`                  | WebSocket ingress 设置（enabled/mode/限额/超时；含活跃连接数；热更新 + 落盘） |
+| GET     | `/api/admin/credentials/{id}/balance?force=true` | 强制刷新余额（跳过 TTL 缓存）                                                 |
 
 > `settings/endpoint` 指的是**本代理访问上游 Kiro** 的端点（当前 `ide`）；
 > `public-api` 指的是**客户端访问本代理**的对外端点。两者不可混用。
@@ -202,14 +207,14 @@ curl http://127.0.0.1:8990/v1/messages \
 
 ### 入口
 
-| 类型 | 说明 | 链接 |
-| --- | --- | --- |
-| Releases 列表 | 所有正式版 / prerelease | <https://github.com/wtfdelphia/kiro.rs/releases> |
-| 最新正式版 | 最近一次 `v*` 自动发布 | <https://github.com/wtfdelphia/kiro.rs/releases/latest> |
-| 开发滚动包 | `dev` 分支滚动 prerelease | <https://github.com/wtfdelphia/kiro.rs/releases/tag/dev-latest> |
-| 指定正式版示例 | 如 `v2026.7.27` | <https://github.com/wtfdelphia/kiro.rs/releases/tag/v2026.7.27> |
+| 类型           | 说明                        | 链接                                                                                                                          |
+| -------------- | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| Releases 列表  | 所有正式版 / prerelease     | [https://github.com/wtfdelphia/kiro.rs/releases](https://github.com/wtfdelphia/kiro.rs/releases)                               |
+| 最新正式版     | 最近一次`v*` 自动发布     | [https://github.com/wtfdelphia/kiro.rs/releases/latest](https://github.com/wtfdelphia/kiro.rs/releases/latest)                 |
+| 开发滚动包     | `dev` 分支滚动 prerelease | [https://github.com/wtfdelphia/kiro.rs/releases/tag/dev-latest](https://github.com/wtfdelphia/kiro.rs/releases/tag/dev-latest) |
+| 指定正式版示例 | 如`v2026.7.27`            | [https://github.com/wtfdelphia/kiro.rs/releases/tag/v2026.7.27](https://github.com/wtfdelphia/kiro.rs/releases/tag/v2026.7.27) |
 
-> 说明：`push v*` 后，`build.yaml` 会在多平台构建成功后自动创建正式 Release 并挂载二进制。  
+> 说明：`push v*` 后，`build.yaml` 会在多平台构建成功后自动创建正式 Release 并挂载二进制。
 > `dev` 分支成功构建后会更新滚动 prerelease `dev-latest`（不覆盖正式 Latest）。
 > 分支 artifact、`dev-latest` 和人工 dry run 都是非正式构建：其外部标签无需等于 Cargo 版本，但 Release / Actions 元数据必须能追溯到源码 commit。
 
@@ -289,23 +294,23 @@ https://github.com/wtfdelphia/kiro.rs/releases/download/<tag>/kiro-rs-<tag>-<pla
 ### 和 Docker 镜像的关系
 
 - 二进制：GitHub Releases
-- 容器镜像：GHCR 包页 <https://github.com/wtfdelphia/kiro.rs/pkgs/container/kiro-rs>
+- 容器镜像：GHCR 包页 [https://github.com/wtfdelphia/kiro.rs/pkgs/container/kiro-rs](https://github.com/wtfdelphia/kiro.rs/pkgs/container/kiro-rs)
 - 镜像名：`ghcr.io/wtfdelphia/kiro-rs`
 
 ## Docker
 
 本仓库构建的镜像推送到 GHCR：
 
-- 包页面：<https://github.com/wtfdelphia/kiro.rs/pkgs/container/kiro-rs>
+- 包页面：[https://github.com/wtfdelphia/kiro.rs/pkgs/container/kiro-rs](https://github.com/wtfdelphia/kiro.rs/pkgs/container/kiro-rs)
 - 镜像：`ghcr.io/wtfdelphia/kiro-rs`
 
 常用 tag：
 
-| Tag | 含义 |
-| --- | --- |
-| `latest` | 最近一次正式 `v*` 构建 |
-| `v2026.7.27` 等 | 指定正式版本 |
-| `beta` | `main` 分支 beta 构建 |
+| Tag                 | 含义                                                    |
+| ------------------- | ------------------------------------------------------- |
+| `latest`          | 最近一次正式`v*` 构建                                 |
+| `v2026.7.27` 等   | 指定正式版本                                            |
+| `beta`            | `main` 分支 beta 构建                                 |
 | `dev-latest` 相关 | 仅二进制 prerelease；Docker 工作流当前不发 dev 滚动镜像 |
 
 人工触发 Docker workflow 时，`publish=false`（默认）只执行 dry run，`version` 输入仅作为本次非正式构建标签，不登录或推送 GHCR。设置 `publish=true` 时，workflow 会忽略自由 `version` 输入，并要求所选提交上恰好存在一个合法的附注 `vYYYY.MM.MICRO` tag；该 tag 通过正式版本门禁后才允许发布。
@@ -336,35 +341,35 @@ docker compose up
 
 ### config.json
 
-| 字段 | 类型 | 默认值 | 描述 |
-|------|------|--------|------|
-| `host` | string | `127.0.0.1` | 服务监听地址 |
-| `port` | number | `8080` | 服务监听端口 |
-| `apiKey` | string | - | 自定义 API Key（用于客户端认证；`requireApiKey=true` 时建议配置） |
-| `requireApiKey` | bool | `true` | 是否要求客户端 API Key。`true` 且 `apiKey` 为空时 fail-closed（一律 401）；`false` 时客户端可不带 key（Admin 仍需 `adminApiKey`） |
-| `region` | string | `us-east-1` | AWS 区域 |
-| `authRegion` | string | - | Auth Region（用于 Token 刷新），未配置时回退到 region |
-| `apiRegion` | string | - | API Region（用于 API 请求），未配置时回退到 region |
-| `kiroVersion` | string | `0.11.107` | Kiro 版本号；可在 Admin「运行时设置 / 客户端标识」热更新 |
-| `machineId` | string | - | 自定义机器码（64位十六进制），不定义则自动生成 |
-| `systemVersion` | string | 随机 | 系统版本标识；可在 Admin「运行时设置 / 客户端标识」热更新 |
-| `nodeVersion` | string | `22.22.0` | Node.js 版本标识；可在 Admin「运行时设置 / 客户端标识」热更新 |
-| `tlsBackend` | string | `rustls` | TLS 后端：`rustls` 或 `native-tls` |
-| `countTokensApiUrl` | string | - | 外部 count_tokens API 地址 |
-| `countTokensApiKey` | string | - | 外部 count_tokens API 密钥 |
-| `countTokensAuthType` | string | `x-api-key` | 外部 API 认证类型：`x-api-key` 或 `bearer` |
-| `proxyUrl` | string | - | HTTP/SOCKS5 代理地址 |
-| `proxyUsername` | string | - | 代理用户名 |
-| `proxyPassword` | string | - | 代理密码 |
-| `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
-| `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
-| `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
-| `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
-| `modelResolution.defaultChatModel` | string | `claude-sonnet-4.6` | `auto` 解析到的默认上游聊天模型 |
-| `modelResolution.allowCatalogPassthrough` | bool | `true` | 允许命中 Kiro catalog 的上游模型 ID（如 `gpt-5.6-sol`）透传 |
-| `modelResolution.exposeCompatAliasesInModels` | bool | `false` | 是否在公开 `/v1/models` 额外暴露 `auto` / `gpt-4o` / `gpt-4` 等兼容别名 |
-| `modelResolution.compatAliases` | object | `{}` | 自定义兼容别名，key 为客户端 model，value 为上游 model |
-| `webSearchEmulation` | bool | `true` | `/v1/responses` 的 web 搜索代执行开关。关闭后该端点的 `web_search` 工具走普通工具路径，不代替客户端执行搜索；不影响 Anthropic 端点。可在 Admin「运行时设置」热更新 |
+| 字段                                            | 类型    | 默认值                | 描述                                                                                                                                                                   |
+| ----------------------------------------------- | ------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `host`                                        | string  | `127.0.0.1`         | 服务监听地址                                                                                                                                                           |
+| `port`                                        | number  | `8080`              | 服务监听端口                                                                                                                                                           |
+| `apiKey`                                      | string  | -                     | 自定义 API Key（用于客户端认证；`requireApiKey=true` 时建议配置）                                                                                                    |
+| `requireApiKey`                               | bool    | `true`              | 是否要求客户端 API Key。`true` 且 `apiKey` 为空时 fail-closed（一律 401）；`false` 时客户端可不带 key（Admin 仍需 `adminApiKey`）                              |
+| `region`                                      | string  | `us-east-1`         | AWS 区域                                                                                                                                                               |
+| `authRegion`                                  | string  | -                     | Auth Region（用于 Token 刷新），未配置时回退到 region                                                                                                                  |
+| `apiRegion`                                   | string  | -                     | API Region（用于 API 请求），未配置时回退到 region                                                                                                                     |
+| `kiroVersion`                                 | string  | `0.11.107`          | Kiro 版本号；可在 Admin「运行时设置 / 客户端标识」热更新                                                                                                               |
+| `machineId`                                   | string  | -                     | 自定义机器码（64位十六进制），不定义则自动生成                                                                                                                         |
+| `systemVersion`                               | string  | 随机                  | 系统版本标识；可在 Admin「运行时设置 / 客户端标识」热更新                                                                                                              |
+| `nodeVersion`                                 | string  | `22.22.0`           | Node.js 版本标识；可在 Admin「运行时设置 / 客户端标识」热更新                                                                                                          |
+| `tlsBackend`                                  | string  | `rustls`            | TLS 后端：`rustls` 或 `native-tls`                                                                                                                                 |
+| `countTokensApiUrl`                           | string  | -                     | 外部 count_tokens API 地址                                                                                                                                             |
+| `countTokensApiKey`                           | string  | -                     | 外部 count_tokens API 密钥                                                                                                                                             |
+| `countTokensAuthType`                         | string  | `x-api-key`         | 外部 API 认证类型：`x-api-key` 或 `bearer`                                                                                                                         |
+| `proxyUrl`                                    | string  | -                     | HTTP/SOCKS5 代理地址                                                                                                                                                   |
+| `proxyUsername`                               | string  | -                     | 代理用户名                                                                                                                                                             |
+| `proxyPassword`                               | string  | -                     | 代理密码                                                                                                                                                               |
+| `adminApiKey`                                 | string  | -                     | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面                                                                                                                 |
+| `loadBalancingMode`                           | string  | `priority`          | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配）                                                                                                      |
+| `extractThinking`                             | boolean | `true`              | 非流式响应的 thinking 块提取。启用后`<thinking>` 标签会被解析为独立的 `thinking` 内容块                                                                            |
+| `defaultEndpoint`                             | string  | `ide`               | 默认 Kiro 端点。凭据未显式指定`endpoint` 时使用。当前支持：`ide`                                                                                                   |
+| `modelResolution.defaultChatModel`            | string  | `claude-sonnet-4.6` | `auto` 解析到的默认上游聊天模型                                                                                                                                      |
+| `modelResolution.allowCatalogPassthrough`     | bool    | `true`              | 允许命中 Kiro catalog 的上游模型 ID（如`gpt-5.6-sol`）透传                                                                                                           |
+| `modelResolution.exposeCompatAliasesInModels` | bool    | `false`             | 是否在公开`/v1/models` 额外暴露 `auto` / `gpt-4o` / `gpt-4` 等兼容别名                                                                                         |
+| `modelResolution.compatAliases`               | object  | `{}`                | 自定义兼容别名，key 为客户端 model，value 为上游 model                                                                                                                 |
+| `webSearchEmulation`                          | bool    | `true`              | `/v1/responses` 的 web 搜索代执行开关。关闭后该端点的 `web_search` 工具走普通工具路径，不代替客户端执行搜索；不影响 Anthropic 端点。可在 Admin「运行时设置」热更新 |
 
 完整配置示例：
 
@@ -410,32 +415,33 @@ docker compose up
 
 #### 字段说明
 
-| 字段             | 类型     | 描述                                          |
-|----------------|--------|---------------------------------------------|
-| `id`           | number | 凭据唯一 ID（可选，仅用于 Admin API 管理；手写文件可不填）        |
-| `accessToken`  | string | OAuth 访问令牌（可选，可自动刷新）                        |
-| `refreshToken` | string | OAuth 刷新令牌                                  |
-| `profileArn`   | string | AWS Profile ARN（可选，登录时返回）                   |
-| `expiresAt`    | string | Token 过期时间 (RFC3339)                        |
-| `authMethod`   | string | 认证方式：`social` / `idc` / `external_idp` / `api_key`  |
-| `provider`     | string | 身份提供方：`BuilderId` / `Github` / `Google` / `Enterprise` 等（可选，用于 profileArn 固定表） |
-| `clientId`     | string | 客户端 ID（IdC 与 external_idp 认证必填）                |
-| `clientSecret` | string | 客户端密钥（IdC 必填；external_idp 公共客户端可不填）        |
-| `tokenEndpoint`| string | external_idp 的 OAuth2 token 端点（与 `issuerUrl` 二选一必填） |
-| `issuerUrl`    | string | external_idp 的 issuer URL（未给 `tokenEndpoint` 时据此派生） |
-| `scopes`       | string | external_idp 的 OAuth2 scopes，空格分隔（可选）          |
-| `priority`     | number | 凭据优先级，数字越小越优先，默认为 0                         |
-| `region`       | string | 凭据级 Auth Region, 兼容字段                       |
-| `authRegion`   | string | 凭据级 Auth Region，用于 Token 刷新, 未配置时回退到 region |
-| `apiRegion`    | string | 凭据级 API Region，用于 API 请求                    |
-| `machineId`    | string | 凭据级机器码（64位十六进制）                             |
-| `email`        | string | 用户邮箱（可选，从 API 获取）                           |
-| `proxyUrl`     | string | 凭据级代理 URL（可选，特殊值 `direct` 表示不使用代理）       |
-| `proxyUsername`| string | 凭据级代理用户名（可选）                                |
-| `proxyPassword`| string | 凭据级代理密码（可选）                                 |
-| `endpoint`     | string | 凭据级端点名称（可选，未配置时使用 `config.defaultEndpoint`）|
+| 字段              | 类型   | 描述                                                                                                    |
+| ----------------- | ------ | ------------------------------------------------------------------------------------------------------- |
+| `id`            | number | 凭据唯一 ID（可选，仅用于 Admin API 管理；手写文件可不填）                                              |
+| `accessToken`   | string | OAuth 访问令牌（可选，可自动刷新）                                                                      |
+| `refreshToken`  | string | OAuth 刷新令牌                                                                                          |
+| `profileArn`    | string | AWS Profile ARN（可选，登录时返回）                                                                     |
+| `expiresAt`     | string | Token 过期时间 (RFC3339)                                                                                |
+| `authMethod`    | string | 认证方式：`social` / `idc` / `external_idp` / `api_key`                                         |
+| `provider`      | string | 身份提供方：`BuilderId` / `Github` / `Google` / `Enterprise` 等（可选，用于 profileArn 固定表） |
+| `clientId`      | string | 客户端 ID（IdC 与 external_idp 认证必填）                                                               |
+| `clientSecret`  | string | 客户端密钥（IdC 必填；external_idp 公共客户端可不填）                                                   |
+| `tokenEndpoint` | string | external_idp 的 OAuth2 token 端点（与`issuerUrl` 二选一必填）                                         |
+| `issuerUrl`     | string | external_idp 的 issuer URL（未给`tokenEndpoint` 时据此派生）                                          |
+| `scopes`        | string | external_idp 的 OAuth2 scopes，空格分隔（可选）                                                         |
+| `priority`      | number | 凭据优先级，数字越小越优先，默认为 0                                                                    |
+| `region`        | string | 凭据级 Auth Region, 兼容字段                                                                            |
+| `authRegion`    | string | 凭据级 Auth Region，用于 Token 刷新, 未配置时回退到 region                                              |
+| `apiRegion`     | string | 凭据级 API Region，用于 API 请求                                                                        |
+| `machineId`     | string | 凭据级机器码（64位十六进制）                                                                            |
+| `email`         | string | 用户邮箱（可选，从 API 获取）                                                                           |
+| `proxyUrl`      | string | 凭据级代理 URL（可选，特殊值`direct` 表示不使用代理）                                                 |
+| `proxyUsername` | string | 凭据级代理用户名（可选）                                                                                |
+| `proxyPassword` | string | 凭据级代理密码（可选）                                                                                  |
+| `endpoint`      | string | 凭据级端点名称（可选，未配置时使用`config.defaultEndpoint`）                                          |
 
 说明：
+
 - IdC / Builder-ID / IAM 在本项目里属于同一种登录方式，配置时统一使用 `authMethod: "idc"`
 - 为兼容旧配置，`builder-id` / `iam` 仍可被识别，但会按 `idc` 处理
 - `external_idp` 亦可写作 `external-idp` / `azure` / `azuread` / `azure_ad`（大小写不敏感）
@@ -531,6 +537,7 @@ KAM 导出文件包含明文 `refreshToken`、`clientSecret` 以及账号与代�
 ```
 
 多凭据特性：
+
 - 按 `priority` 字段排序，数字越小优先级越高（默认为 0）
 - 单凭据最多重试 3 次，单请求最多重试 9 次
 - 自动故障转移到下一个可用凭据
@@ -552,11 +559,11 @@ KAM 导出文件包含明文 `refreshToken`、`clientSecret` 以及账号与代�
 
 **代理优先级**：`凭据.proxyUrl` > `config.proxyUrl` > 无代理
 
-| 凭据 `proxyUrl` 值 | 行为 |
-|---|---|
-| 具体 URL（如 `http://proxy:8080`、`socks5://proxy:1080`） | 使用凭据指定的代理 |
-| `direct` | 显式不使用代理（即使全局配置了代理） |
-| 未配置（留空） | 回退到全局代理配置 |
+| 凭据`proxyUrl` 值                                          | 行为                                 |
+| ------------------------------------------------------------ | ------------------------------------ |
+| 具体 URL（如`http://proxy:8080`、`socks5://proxy:1080`） | 使用凭据指定的代理                   |
+| `direct`                                                   | 显式不使用代理（即使全局配置了代理） |
+| 未配置（留空）                                               | 回退到全局代理配置                   |
 
 凭据级代理示例：
 
@@ -586,11 +593,12 @@ KAM 导出文件包含明文 `refreshToken`、`clientSecret` 以及账号与代�
 客户端请求本服务时，支持两种认证方式：
 
 1. **x-api-key Header**
+
    ```
    x-api-key: sk-your-api-key
    ```
-
 2. **Authorization Bearer**
+
    ```
    Authorization: Bearer sk-your-api-key
    ```
@@ -607,25 +615,26 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 ### 标准端点 (/v1)
 
-| 端点 | 方法 | 描述 |
-|------|------|------|
-| /v1/models | GET | 获取可用模型列表（优先全局模型缓存并附 -thinking 变体；缓存为空时回退内置静态列表） |
-| `/v1/messages` | POST | 创建消息（对话） |
-| `/v1/messages/count_tokens` | POST | 估算 Token 数量 |
+| 端点                          | 方法 | 描述                                                                                |
+| ----------------------------- | ---- | ----------------------------------------------------------------------------------- |
+| /v1/models                    | GET  | 获取可用模型列表（优先全局模型缓存并附 -thinking 变体；缓存为空时回退内置静态列表） |
+| `/v1/messages`              | POST | 创建消息（对话）                                                                    |
+| `/v1/messages/count_tokens` | POST | 估算 Token 数量                                                                     |
 
 ### Claude Code 兼容端点 (/cc/v1)
 
-| 端点 | 方法 | 描述 |
-|------|------|------|
-| `/cc/v1/messages` | POST | 创建消息（缓冲模式，确保 `input_tokens` 准确） |
-| `/cc/v1/messages/count_tokens` | POST | 估算 Token 数量（与 `/v1` 相同） |
+| 端点                             | 方法 | 描述                                            |
+| -------------------------------- | ---- | ----------------------------------------------- |
+| `/cc/v1/messages`              | POST | 创建消息（缓冲模式，确保`input_tokens` 准确） |
+| `/cc/v1/messages/count_tokens` | POST | 估算 Token 数量（与`/v1` 相同）               |
 
 ### OpenAI 兼容端点
 
-| 端点 | 方法 | 描述 |
-|------|------|------|
-| `/v1/chat/completions` | POST | OpenAI Chat Completions（流式 + 非流式，含 function tools） |
-| `/v1/responses` | POST | OpenAI Responses（语义事件流 + 非流式，无状态；支持 web_search 代执行与 Codex 工具方言兼容） |
+| 端点                     | 方法 | 描述                                                                                                                                             |
+| ------------------------ | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `/v1/chat/completions` | POST | OpenAI Chat Completions（流式 + 非流式，含 function tools）                                                                                      |
+| `/v1/responses`        | POST | OpenAI Responses（语义事件流 + 非流式，无状态；支持 web_search 代执行与 Codex 工具方言兼容）                                                     |
+| `/v1/responses`        | GET  | OpenAI Responses WebSocket ingress（`Upgrade: websocket`；http_bridge：单连接多 turn，每 turn 桥接一次上游 HTTP/SSE；非 upgrade 请求返回 426） |
 
 接入注意：
 
@@ -652,14 +661,24 @@ RUST_LOG=debug ./target/release/kiro-rs
   Kiro 上游的消息上下文只有工具定义与工具结果，没有 response format 概念，无处透传；
   不做 prompt 层模拟（模拟会把 `strict: true` 降级成「尽力」，属假装支持）
 
+`GET /v1/responses`（WebSocket）额外注意：
+
+- 事件 JSON 与 `POST /v1/responses` 的 SSE `data:` 行同形（无 keepalive 对应物）
+- 单连接多 turn：`response.create` 每帧一轮；`response.cancel` 取消当前 turn；
+  `session.update` 记录会话级 `model` 覆盖（后续省略 `model` 的 create 使用它）
+- 首帧必须携带非空 `model`；`type` 缺省按 `response.create` 处理
+- 运行时开关与限额在 Admin `GET/PUT /api/admin/settings/websocket` 热加载：
+  `enabled=false` 只拦新连接、不断存量会话；`mode=passthrough` 为预留项（当前握手前返回 501）
+  （Admin UI 设置面板的 WebSocket 分区提供同样的可视化开关与调参）
+
 **客户端工具方言兼容**（面向 OpenAI Codex 等发送非标准工具形状的客户端）：
 
-| 客户端形状 | 本代理的处理 |
-| --- | --- |
-| `input[0]` 的 `additional_tools` item | 提取其 `tools[]` 并入顶层工具列表（该 item 不产生对话消息）。部分模型不发顶层 `tools` 字段，工具全在这里 |
-| `type: "custom"`（裸文本输入工具） | 降级为 schema 为 `{input: string}` 的 function；原 description 保留并在前面加调用约定说明，`format.definition`（如 lark 文法）追加到末尾 |
-| `type: "namespace"`（工具分组） | 内层工具展平为 `<namespace>__<name>` 的独立工具；响应侧还原为 `(namespace, 原名)` |
-| 历史 `custom_tool_call` / `custom_tool_call_output` | 改写为 function 调用与 tool 结果，保证上一轮的调用与结果成对存活 |
+| 客户端形状                                             | 本代理的处理                                                                                                                                                             |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `input[0]` 的 `additional_tools` item              | 提取其`tools[]` 并入顶层工具列表（该 item 不产生对话消息）。部分模型不发顶层 `tools` 字段，工具全在这里                                                              |
+| `type: "custom"`（裸文本输入工具）                   | 降级为 schema 为`{input: string}` 的 function；原 description 保留并在前面加调用约定说明，`format.definition`（如 lark 文法）追加到末尾                              |
+| `type: "namespace"`（工具分组）                      | 内层工具展平为`<namespace>__<name>` 的独立工具，内层 `custom` 同样按展平名做 freeform 降级；响应侧还原为 `(namespace, 原名)`，freeform 调用回 `custom_tool_call` |
+| 历史`custom_tool_call` / `custom_tool_call_output` | 改写为 function 调用与 tool 结果，保证上一轮的调用与结果成对存活                                                                                                         |
 
 - 由 `custom` 降级而来的工具，其调用在响应中还原为 `custom_tool_call`（带 `input` 而非
   `arguments`），流式与非流式都做。这不是可选的美化：客户端为此类工具登记的 payload
@@ -672,6 +691,7 @@ RUST_LOG=debug ./target/release/kiro-rs
   顶层 `tools` 为空。这是确定结果而非边界情况
 
 > **`/cc/v1/messages` 与 `/v1/messages` 的区别**：
+>
 > - `/v1/messages`：实时流式返回，`message_start` 中的 `input_tokens` 是估算值
 > - `/cc/v1/messages`：缓冲模式，等待上游流完成后，用从 `contextUsageEvent` 计算的准确 `input_tokens` 更正 `message_start`，然后一次性返回所有事件
 > - 等待期间会每 25 秒发送 `ping` 事件保活
@@ -743,17 +763,17 @@ Admin `GET /api/admin/public-api` 均由它派生，避免多处手写清单互�
 
 ## 模型映射
 
-| Anthropic 模型 | Kiro 模型 |
-|----------------|-----------|
-| `*sonnet-5*` | `claude-sonnet-5` |
+| Anthropic 模型             | Kiro 模型             |
+| -------------------------- | --------------------- |
+| `*sonnet-5*`             | `claude-sonnet-5`   |
 | `*sonnet*`（含 4.6/4-6） | `claude-sonnet-4.6` |
 | `*sonnet*`（含 4.5/4-5） | `claude-sonnet-4.5` |
-| `*opus-5*` | `claude-opus-5` |
-| `*opus*`（含 4.8/4-8） | `claude-opus-4.8` |
-| `*opus*`（含 4.7/4-7） | `claude-opus-4.7` |
-| `*opus*`（含 4.6/4-6） | `claude-opus-4.6` |
-| `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
-| `*haiku*` | `claude-haiku-4.5` |
+| `*opus-5*`               | `claude-opus-5`     |
+| `*opus*`（含 4.8/4-8）   | `claude-opus-4.8`   |
+| `*opus*`（含 4.7/4-7）   | `claude-opus-4.7`   |
+| `*opus*`（含 4.6/4-6）   | `claude-opus-4.6`   |
+| `*opus*`（含 4.5/4-5）   | `claude-opus-4.5`   |
+| `*haiku*`                | `claude-haiku-4.5`  |
 
 Sonnet 5 的 thinking 行为与已知限制见 [docs/claude-sonnet-5.md](docs/claude-sonnet-5.md)。
 
@@ -764,6 +784,7 @@ Sonnet 5 的 thinking 行为与已知限制见 [docs/claude-sonnet-5.md](docs/cl
 Admin API 使用**独立的** `adminApiKey` 认证（不是客户端 `apiKey`），全部接口都在鉴权中间件之内，未携带有效 key 一律 401。
 
 - **凭据管理**
+
   - `GET /api/admin/credentials` - 获取所有凭据状态
   - `POST /api/admin/credentials` - 添加新凭据
   - `DELETE /api/admin/credentials/:id` - 删除凭据
@@ -774,31 +795,31 @@ Admin API 使用**独立的** `adminApiKey` 认证（不是客户端 `apiKey`）
   - `POST /api/admin/credentials/:id/reset` - 重置失败计数
   - `GET /api/admin/credentials/:id/balance` - 获取凭据余额（`?force=true` 跳过 TTL 缓存）
   - `POST /api/admin/credentials/:id/refresh` - 强制刷新 Token
-
 - **模型目录**
+
   - `POST /api/admin/credentials/models/refresh` - 刷新全部启用凭据的模型目录
   - `POST /api/admin/credentials/:id/models/refresh` - 刷新单凭据模型目录
   - `GET /api/admin/credentials/:id/models` - 查看凭据模型缓存（`?live=true` 时先刷新）
   - `POST /api/admin/credentials/:id/test` - 对凭据做最小真实推理探测（可选 body model，默认 claude-sonnet-4.6）
   - `GET /api/admin/models/catalog` - 全局模型 catalog 摘要
-
 - **在线认证**
+
   - `POST /api/admin/auth/builderid/start` / `poll` - Builder ID 设备码流程
   - `POST /api/admin/auth/iam-sso/start` / `complete` - IAM Identity Center (SSO) 流程
   - `POST /api/admin/auth/sso-token` - 直接导入 SSO Token
-
 - **运行时设置（均为热更新 + 落盘，详见[运行时设置（Admin）](#运行时设置admin)）**
+
   - `GET/PUT /api/admin/settings/proxy` - 全局出站代理（不回传明文密码）
   - `GET/PUT /api/admin/settings/endpoint` - 默认 Kiro **上游**端点
   - `GET/PUT /api/admin/settings/auth` - 客户端 `requireApiKey` / `apiKey`（读取为掩码）
   - `GET/PUT /api/admin/settings/websearch` - web_search 代执行开关（默认开启，仅影响 `/v1/responses`）
   - `GET/PUT /api/admin/settings/client-identity` - Kiro / System / Node 版本标识
   - `GET/PUT /api/admin/config/load-balancing` - 负载均衡模式
-
 - **对外端点目录**
-  - `GET /api/admin/public-api` - 只读的对外 API 端点清单（Base URL、鉴权方式、status、curl 示例）。永不回传完整客户端 key，只给掩码
 
+  - `GET /api/admin/public-api` - 只读的对外 API 端点清单（Base URL、鉴权方式、status、curl 示例）。永不回传完整客户端 key，只给掩码
 - **Admin UI**
+
   - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）
   - 顶栏入口：「运行时设置」（代理 / 上游端点 / 客户端鉴权 / websearch 开关 / 客户端标识）、「对外 API 端点」（分组端点卡 + 客户端配方 + 一键复制）
   - 列表区「刷新全部模型」；凭据卡片「查看模型 / 刷新模型 / 测试」
@@ -810,7 +831,6 @@ Admin API 使用**独立的** `adminApiKey` 认证（不是客户端 `apiKey`）
 3. **WebSearch 工具**: 当 `tools` 列表仅包含一个 `web_search` 工具时，由本代理代执行搜索并直接构造响应（不走模型生成）。混合工具不触发。Anthropic 端点的响应形态跟随请求的 `stream` 字段；`/v1/responses` 的判定更宽且可在 Admin 关闭
 4. **Admin 密钥独立**: Admin API 用 `adminApiKey` 认证，与客户端 `apiKey` 是两把不同的钥匙
 
-
 ## SpecCoding / OpenSpec 工作流
 
 本仓库的 AI 辅助开发入口以项目内规则为准：
@@ -818,10 +838,10 @@ Admin API 使用**独立的** `adminApiKey` 认证（不是客户端 `apiKey`）
 - [AGENTS.md](AGENTS.md)：Codex / 通用 Agent 主规则，包含 OpenSpec 条件、门禁 skill、验证纪律与安全要求
 - [CLAUDE.md](CLAUDE.md)：Claude Code 最小入口，指向同一套主规则
 - [spec/](spec/)：长期需求、设计、目录归属事实
-- [openspec/changes/<change-name>/](openspec/changes/)：单次变更 proposal / design / tasks / specs / evidence
+- [openspec/changes/<change-name></change>/](openspec/changes/)：单次变更 proposal / design / tasks / specs / evidence
 - [docs/tooling-sources.md](docs/tooling-sources.md)：OpenSpec、CodeGraph、rg、Node、Rust、pnpm 等工具来源与核验版本
 - [docs/multi-protocol-api-design.md](docs/multi-protocol-api-design.md)：多协议对外 API 的设计定稿（OpenAI 兼容层的决策记录与分期落地）
-- [docs/AI 辅助开发工程化落地白皮书.md](docs/AI%20辅助开发工程化落地白皮书.md)：本次工程化落地参考
+- [docs/AI 辅助开发工程化落地白皮书.md](<docs/AI%20辅助开发工程化落地白皮书.md>)：本次工程化落地参考
 
 推荐闭环：
 
@@ -923,8 +943,9 @@ MIT
 
 ## 致谢
 
-本项目的实现离不开前辈的努力:  
- - [kiro2api](https://github.com/caidaoli/kiro2api)
- - [proxycast](https://github.com/aiclientproxy/proxycast)
+本项目的实现离不开前辈的努力:
+
+- [kiro2api](https://github.com/caidaoli/kiro2api)
+- [proxycast](https://github.com/aiclientproxy/proxycast)
 
 本项目部分逻辑参考了以上的项目, 再次由衷的感谢!

@@ -14,6 +14,8 @@ pub enum EventType {
     ToolUse,
     /// 计费事件
     Metering,
+    /// 推理内容事件
+    Reasoning,
     /// 上下文使用率事件
     ContextUsage,
     /// 未知事件类型
@@ -27,6 +29,7 @@ impl EventType {
             "assistantResponseEvent" => Self::AssistantResponse,
             "toolUseEvent" => Self::ToolUse,
             "meteringEvent" => Self::Metering,
+            "reasoningContentEvent" => Self::Reasoning,
             "contextUsageEvent" => Self::ContextUsage,
             _ => Self::Unknown,
         }
@@ -38,6 +41,7 @@ impl EventType {
             Self::AssistantResponse => "assistantResponseEvent",
             Self::ToolUse => "toolUseEvent",
             Self::Metering => "meteringEvent",
+            Self::Reasoning => "reasoningContentEvent",
             Self::ContextUsage => "contextUsageEvent",
             Self::Unknown => "unknown",
         }
@@ -68,11 +72,18 @@ pub enum Event {
     /// 工具使用
     ToolUse(super::ToolUseEvent),
     /// 计费
-    Metering(()),
+    Metering(super::MeteringEvent),
+    /// 推理内容
+    Reasoning(super::ReasoningContentEvent),
     /// 上下文使用率
     ContextUsage(super::ContextUsageEvent),
     /// 未知事件 (保留原始帧数据)
-    Unknown {},
+    Unknown {
+        /// 原始事件类型
+        event_type: String,
+        /// 原始 payload 字节
+        payload: Vec<u8>,
+    },
     /// 服务端错误
     Error {
         /// 错误代码
@@ -116,12 +127,22 @@ impl Event {
                 let payload = super::ToolUseEvent::from_frame(&frame)?;
                 Ok(Self::ToolUse(payload))
             }
-            EventType::Metering => Ok(Self::Metering(())),
+            EventType::Metering => {
+                let payload = super::MeteringEvent::from_frame(&frame)?;
+                Ok(Self::Metering(payload))
+            }
+            EventType::Reasoning => {
+                let payload = super::ReasoningContentEvent::from_frame(&frame)?;
+                Ok(Self::Reasoning(payload))
+            }
             EventType::ContextUsage => {
                 let payload = super::ContextUsageEvent::from_frame(&frame)?;
                 Ok(Self::ContextUsage(payload))
             }
-            EventType::Unknown => Ok(Self::Unknown {}),
+            EventType::Unknown => Ok(Self::Unknown {
+                event_type: event_type_str.to_string(),
+                payload: frame.payload,
+            }),
         }
     }
 
@@ -159,6 +180,23 @@ impl Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kiro::parser::header::{HeaderValue, Headers};
+
+    fn event_frame(event_type: &str, payload: &[u8]) -> Frame {
+        let mut headers = Headers::new();
+        headers.insert(
+            ":message-type".to_string(),
+            HeaderValue::String("event".to_string()),
+        );
+        headers.insert(
+            ":event-type".to_string(),
+            HeaderValue::String(event_type.to_string()),
+        );
+        Frame {
+            headers,
+            payload: payload.to_vec(),
+        }
+    }
 
     #[test]
     fn test_event_type_from_str() {
@@ -168,6 +206,10 @@ mod tests {
         );
         assert_eq!(EventType::from_str("toolUseEvent"), EventType::ToolUse);
         assert_eq!(EventType::from_str("meteringEvent"), EventType::Metering);
+        assert_eq!(
+            EventType::from_str("reasoningContentEvent"),
+            EventType::Reasoning
+        );
         assert_eq!(
             EventType::from_str("contextUsageEvent"),
             EventType::ContextUsage
@@ -182,5 +224,58 @@ mod tests {
             "assistantResponseEvent"
         );
         assert_eq!(EventType::ToolUse.as_str(), "toolUseEvent");
+        assert_eq!(EventType::Reasoning.as_str(), "reasoningContentEvent");
+    }
+
+    #[test]
+    fn test_reasoning_event_from_frame() {
+        let event = Event::from_frame(event_frame(
+            "reasoningContentEvent",
+            br#"{"text":"abc","signature":"secret"}"#,
+        ))
+        .unwrap();
+
+        match event {
+            Event::Reasoning(reasoning) => {
+                assert_eq!(reasoning.text, "abc");
+                assert_eq!(reasoning.signature, "secret");
+            }
+            other => panic!("expected reasoning event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_metering_event_from_frame() {
+        let event = Event::from_frame(event_frame(
+            "meteringEvent",
+            br#"{"unit":"request","unitPlural":"requests","usage":0.5}"#,
+        ))
+        .unwrap();
+
+        match event {
+            Event::Metering(metering) => {
+                assert_eq!(metering.unit, "request");
+                assert_eq!(metering.unit_plural, "requests");
+                assert_eq!(metering.usage, 0.5);
+            }
+            other => panic!("expected metering event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unknown_event_preserves_type_and_payload() {
+        let event =
+            Event::from_frame(event_frame("futureEvent", br#"{"secret":"value"}"#)).unwrap();
+
+        match event {
+            Event::Unknown {
+                event_type,
+                payload,
+            } => {
+                assert_eq!(event_type, "futureEvent");
+                assert_eq!(payload, br#"{"secret":"value"}"#);
+            }
+            other => panic!("expected unknown event, got {other:?}"),
+        }
     }
 }

@@ -13,7 +13,7 @@ lto = true
 strip = true
 
 [dependencies]
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1.0", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "socks", "rustls-tls-webpki-roots", "rustls-tls-native-roots", "http2", "system-proxy", "charset"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -41,3 +41,5 @@ mime_guess = "2"      # MIME 类型推断
 
 [dev-dependencies]
 tower = { version = "0.5.2", features = ["util"] }  # 测试中用 oneshot 打真实 Router
+tokio-tungstenite = "0.28"  # WS ingress 集成测试客户端
+tokio = { version = "1.0", features = ["test-util"] }  # start_paused 时间控制（仅测试目标）

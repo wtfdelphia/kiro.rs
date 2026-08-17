@@ -153,11 +153,12 @@ pub fn normalize_tools(tools: Vec<Value>) -> Result<(Vec<Value>, ToolRewriteMap)
                         continue;
                     };
                     let child_type = str_field(child_obj, "type");
-                    if !child_type.is_empty() && child_type != "function" {
+                    let is_custom_child = child_type == "custom";
+                    if !child_type.is_empty() && child_type != "function" && !is_custom_child {
                         tracing::warn!(
                             namespace = %namespace,
                             tool_type = %child_type,
-                            "namespace 内层工具形状非 function，已丢弃"
+                            "namespace 内层工具形状不受支持（仅 function / custom），已丢弃"
                         );
                         continue;
                     }
@@ -194,14 +195,26 @@ pub fn normalize_tools(tools: Vec<Value>) -> Result<(Vec<Value>, ToolRewriteMap)
                         .namespaces
                         .insert(flat.clone(), (namespace.clone(), child_name.clone()));
 
-                    let mut params = tool_parameters(child_obj).unwrap_or_else(|| json!({}));
-                    strip_encrypted(&mut params);
-                    out.push(json!({
-                        "type": "function",
-                        "name": flat,
-                        "description": str_field(child_obj, "description"),
-                        "parameters": params,
-                    }));
+                    if is_custom_child {
+                        // 内层 custom：与顶层 custom 相同的 freeform 降级，
+                        // 但以展平名注册进 freeform 集合，响应侧按两级映射还原。
+                        rewrite.freeform.insert(flat.clone());
+                        out.push(json!({
+                            "type": "function",
+                            "name": flat,
+                            "description": freeform_description(child_obj),
+                            "parameters": freeform_schema(),
+                        }));
+                    } else {
+                        let mut params = tool_parameters(child_obj).unwrap_or_else(|| json!({}));
+                        strip_encrypted(&mut params);
+                        out.push(json!({
+                            "type": "function",
+                            "name": flat,
+                            "description": str_field(child_obj, "description"),
+                            "parameters": params,
+                        }));
+                    }
                 }
             }
             "custom" => {
@@ -606,6 +619,104 @@ mod tests {
             "逆映射 key 应为展平名，实际: {:?}",
             rewrite.namespaces.keys().collect::<Vec<_>>()
         );
+    }
+
+    // === namespace 内层 custom（freeform）展平 ===
+
+    fn functions_ns_with_custom() -> Value {
+        json!({
+            "type": "namespace",
+            "name": "functions",
+            "tools": [
+                {"type":"function","name":"wait","description":"Wait","strict":false,
+                 "parameters":{"type":"object","properties":{"seconds":{"type":"integer"}}}},
+                {"type":"custom","name":"apply_patch","description":"Apply a patch to files",
+                 "format":{"type":"grammar","syntax":"lark",
+                           "definition":"start: patch\npatch: /BEGIN Patch/"}}
+            ]
+        })
+    }
+
+    #[test]
+    fn test_namespace_inner_custom_flattened_and_downgraded() {
+        let (out, _) = normalize_tools(vec![functions_ns_with_custom()]).unwrap();
+        let names: Vec<&str> = out.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["functions__wait", "functions__apply_patch"]);
+
+        let custom = &out[1];
+        assert_eq!(custom["type"], "function");
+        // freeform 降级 schema：单个必填字符串属性 input
+        assert_eq!(custom["parameters"]["type"], "object");
+        assert_eq!(custom["parameters"]["properties"]["input"]["type"], "string");
+        assert_eq!(custom["parameters"]["required"][0], "input");
+
+        // description：调用约定说明在最前，原描述与文法保留
+        let desc = custom["description"].as_str().unwrap();
+        assert!(desc.starts_with("[Invocation note:"), "调用约定说明须置于最前");
+        assert!(desc.contains("Apply a patch to files"), "原始描述须保留");
+        assert!(desc.contains("BEGIN Patch"), "文法定义须保留");
+    }
+
+    /// 锁定：展平名同时进两级映射——漏 freeform 会让调用回成 function_call，
+    /// 漏 namespaces 会让客户端按 (namespace, name) 匹配失败。
+    #[test]
+    fn test_namespace_inner_custom_registered_in_both_maps() {
+        let (_, rewrite) = normalize_tools(vec![functions_ns_with_custom()]).unwrap();
+        let flat = "functions__apply_patch";
+        assert!(rewrite.freeform.contains(flat), "展平名须记入 freeform 集合");
+        assert_eq!(
+            rewrite.namespaces.get(flat),
+            Some(&("functions".to_string(), "apply_patch".to_string())),
+            "展平名须记入 namespace 逆映射"
+        );
+    }
+
+    #[test]
+    fn test_namespace_inner_custom_conflicts_with_top_level() {
+        let err = normalize_tools(vec![
+            json!({"type":"function","name":"functions__apply_patch",
+                   "parameters":{"type":"object"}}),
+            functions_ns_with_custom(),
+        ])
+        .unwrap_err();
+
+        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+        let msg = err.message();
+        assert!(msg.contains("functions__apply_patch"), "错误须含冲突的展平名: {}", msg);
+        assert!(msg.contains("apply_patch"), "错误须含内层工具名: {}", msg);
+        assert!(msg.contains("rename"), "错误须给出处置建议: {}", msg);
+    }
+
+    #[test]
+    fn test_namespace_inner_custom_flatten_conflicts_with_other_flatten() {
+        // functions 下的 ns__x 与 functions__ns 下的 x 展平同名
+        let err = normalize_tools(vec![
+            json!({"type":"namespace","name":"functions",
+                   "tools":[{"type":"custom","name":"ns__x","description":"d"}]}),
+            json!({"type":"namespace","name":"functions__ns",
+                   "tools":[{"type":"function","name":"x","parameters":{"type":"object"}}]}),
+        ])
+        .unwrap_err();
+
+        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+        let msg = err.message();
+        assert!(msg.contains("functions__ns__x"), "错误须含冲突的展平名: {}", msg);
+        assert!(msg.contains("both flatten to"), "错误须说明冲突性质: {}", msg);
+    }
+
+    #[test]
+    fn test_namespace_inner_custom_without_name_dropped_others_unaffected() {
+        let (out, rewrite) = normalize_tools(vec![json!({
+            "type":"namespace","name":"functions","tools":[
+                {"type":"function","name":"wait","parameters":{"type":"object"}},
+                {"type":"custom","description":"no name"}
+            ]
+        })])
+        .unwrap();
+
+        assert_eq!(out.len(), 1, "缺名 custom 应被丢弃，其余内层不受影响");
+        assert_eq!(out[0]["name"], "functions__wait");
+        assert!(rewrite.freeform.is_empty(), "不得为缺名工具登记 freeform");
     }
 
     #[test]

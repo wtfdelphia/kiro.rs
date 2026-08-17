@@ -15,5 +15,14 @@
     "defaultChatModel": "claude-sonnet-4.6",
     "allowCatalogPassthrough": true,
     "exposeCompatAliasesInModels": false
+  },
+  "websocket": {
+    "enabled": true,
+    "mode": "http_bridge",
+    "maxConnections": 64,
+    "clientFirstMessageTimeoutSeconds": 30,
+    "interTurnIdleTimeoutSeconds": 1800,
+    "maxMessageBytes": 33554432,
+    "upstreamReadTimeoutSeconds": 900
   }
 }
