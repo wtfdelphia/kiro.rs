@@ -7,6 +7,7 @@ import type {
   ProxySettings,
   SuccessSettingsResponse,
   WebSearchSettings,
+  WebsocketSettings,
 } from '@/types/api'
 
 const api = axios.create({
@@ -86,5 +87,24 @@ export async function updateWebSearchSettings(body: {
   webSearchEmulation: boolean
 }): Promise<SuccessSettingsResponse> {
   const { data } = await api.put<SuccessSettingsResponse>('/settings/websearch', body)
+  return data
+}
+
+export async function getWebsocketSettings(): Promise<WebsocketSettings> {
+  const { data } = await api.get<WebsocketSettings>('/settings/websocket')
+  return data
+}
+
+/** WebSocket 设置部分更新：未携带字段保持当前值 */
+export async function updateWebsocketSettings(body: {
+  enabled?: boolean
+  mode?: string
+  maxConnections?: number
+  clientFirstMessageTimeoutSeconds?: number
+  interTurnIdleTimeoutSeconds?: number
+  maxMessageBytes?: number
+  upstreamReadTimeoutSeconds?: number
+}): Promise<SuccessSettingsResponse> {
+  const { data } = await api.put<SuccessSettingsResponse>('/settings/websocket', body)
   return data
 }
