@@ -4,12 +4,12 @@
 //! 与 Chat Completions 的差异：SSE 带 `event:` 行；输出按 output item 组织，
 //! message item 与每个 function_call item 各占一个 output_index。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 
 use crate::anthropic::get_context_window_size;
-use crate::kiro::model::events::Event;
+use crate::kiro::model::events::{Event, EventStreamDiagnostics};
 
 use super::responses_types::{
     ResponseOutputItem, ResponsesError, ResponsesObject, ResponsesUsage, output_item_id,
@@ -78,6 +78,8 @@ pub struct ResponsesStreamContext {
     finished_items: Vec<ResponseOutputItem>,
     /// 工具调用的参数累积：tool_use_id -> (item_id, name, args)
     tool_buffers: HashMap<String, (String, String, String)>,
+    /// 被判定为不完整的 tool_use_id，后续同 id 分片全部抑制公开输出
+    suppressed_tool_use_ids: HashSet<String>,
     /// 工具调用出现顺序
     tool_order: Vec<String>,
 
@@ -89,6 +91,8 @@ pub struct ResponsesStreamContext {
     /// 是否已发出任何内容（决定上游失败时走 failed 事件还是错误响应）
     pub started: bool,
     failed: bool,
+    /// Kiro EventStream 脱敏诊断摘要
+    diagnostics: EventStreamDiagnostics,
 }
 
 impl ResponsesStreamContext {
@@ -119,12 +123,14 @@ impl ResponsesStreamContext {
             text: String::new(),
             finished_items: Vec::new(),
             tool_buffers: HashMap::new(),
+            suppressed_tool_use_ids: HashSet::new(),
             tool_order: Vec::new(),
             thinking_buffer: String::new(),
             in_thinking_block: false,
             thinking_done: false,
             started: false,
             failed: false,
+            diagnostics: EventStreamDiagnostics::default(),
         }
     }
 
@@ -161,6 +167,8 @@ impl ResponsesStreamContext {
 
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<ResponsesSseEvent> {
         let mut out = Vec::new();
+        self.diagnostics.observe(event);
+
         match event {
             Event::AssistantResponse(resp) => self.process_text(&resp.content, &mut out),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use, &mut out),
@@ -316,12 +324,31 @@ impl ResponsesStreamContext {
         tool_use: &crate::kiro::model::events::ToolUseEvent,
         out: &mut Vec<ResponsesSseEvent>,
     ) {
-        // 出现工具调用前必须先关闭已开启的 message item，否则 output_index 会串
+        let id = tool_use.tool_use_id.clone();
+        if id.is_empty() {
+            tracing::warn!("跳过缺少 tool_use_id 的 toolUseEvent public 输出");
+            return;
+        }
+
+        if self.suppressed_tool_use_ids.contains(&id) {
+            return;
+        }
+
+        let is_new = !self.tool_buffers.contains_key(&id);
+        if is_new && tool_use.name.is_empty() {
+            self.suppressed_tool_use_ids.insert(id.clone());
+            tracing::warn!(
+                tool_use_id_hash = %EventStreamDiagnostics::hash_public_id(&id),
+                "跳过缺少工具名的 toolUseEvent public 输出"
+            );
+            return;
+        }
+
+        // 出现合法工具调用前必须先关闭已开启的 message item，否则 output_index 会串
         self.close_message_item(out);
         self.started = true;
 
-        let id = tool_use.tool_use_id.clone();
-        if !self.tool_buffers.contains_key(&id) {
+        if is_new {
             // 工具名还原（D8 第二项）。还原后的名字即 ToolRewriteMap 的 key（design D3.1）
             let name = self
                 .tool_name_map
@@ -491,8 +518,7 @@ impl ResponsesStreamContext {
         ));
 
         let (display_name, namespace) = self.restore_name(name);
-        let mut item =
-            ResponseOutputItem::custom_tool_call(item_id, call_id, display_name, input);
+        let mut item = ResponseOutputItem::custom_tool_call(item_id, call_id, display_name, input);
         item.namespace = namespace;
         out.push(ResponsesSseEvent::named(
             "response.output_item.done",
@@ -543,12 +569,14 @@ impl ResponsesStreamContext {
             }),
         ));
         out.push(ResponsesSseEvent::Done);
+        self.diagnostics.log_summary("openai-responses");
         out
     }
 
     /// 失败收尾（上游在已开始输出后失败）
     pub fn fail(&mut self, message: impl Into<String>) -> Vec<ResponsesSseEvent> {
         self.failed = true;
+        self.diagnostics.log_summary("openai-responses");
         let msg = message.into();
         vec![ResponsesSseEvent::named(
             "response.failed",
@@ -569,6 +597,30 @@ impl ResponsesStreamContext {
         )]
     }
 
+    /// 客户端取消收尾（WS `response.cancel`）：关闭已开启的 item，
+    /// 发出 `response.cancelled` 终态事件；已输出的部分内容保留在 response 对象里
+    pub fn cancel(&mut self) -> Vec<ResponsesSseEvent> {
+        let mut out = Vec::new();
+        if !self.in_thinking_block {
+            let leftover = std::mem::take(&mut self.thinking_buffer);
+            if !leftover.is_empty() {
+                self.emit_text(&leftover, &mut out);
+            }
+        }
+        self.close_message_item(&mut out);
+        let items = self.finished_items.clone();
+        let snap = self.snapshot("cancelled", items);
+        out.push(ResponsesSseEvent::named(
+            "response.cancelled",
+            json!({
+                "type": "response.cancelled",
+                "response": serde_json::to_value(&snap).expect("response 序列化失败"),
+            }),
+        ));
+        self.diagnostics.log_summary("openai-responses");
+        out
+    }
+
     pub fn usage(&self) -> ResponsesUsage {
         let input = self
             .context_input_tokens
@@ -586,7 +638,6 @@ impl ResponsesStreamContext {
         }
         ResponsesUsage::new(input, (((output_chars + 3) / 4) as i32).max(1))
     }
-
 }
 
 /// 保留 buf 尾部可能是 tag 前缀的那一段，其余可安全发出
@@ -607,7 +658,9 @@ fn safe_flush_len(buf: &str, tag: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kiro::model::events::{ContextUsageEvent, ToolUseEvent};
+    use crate::kiro::model::events::{
+        ContextUsageEvent, MeteringEvent, ReasoningContentEvent, ToolUseEvent,
+    };
 
     fn text_event(content: &str) -> Event {
         Event::AssistantResponse(
@@ -677,10 +730,7 @@ mod tests {
     fn test_initial_events() {
         let ctx = new_ctx(false);
         let ev = ctx.initial_events();
-        assert_eq!(
-            names(&ev),
-            vec!["response.created", "response.in_progress"]
-        );
+        assert_eq!(names(&ev), vec!["response.created", "response.in_progress"]);
         let p = payloads(&ev);
         assert_eq!(p[0]["response"]["status"], "in_progress");
         assert_eq!(p[0]["response"]["object"], "response");
@@ -806,9 +856,7 @@ mod tests {
             .unwrap();
         let fc_added = n
             .iter()
-            .position(|x| x == "response.output_item.added" && {
-                true
-            })
+            .position(|x| x == "response.output_item.added" && { true })
             .unwrap();
         // 第一个 added 是 message，msg 的 content_part.done 必须在 fc 的 added 之前
         let part_done = n
@@ -873,6 +921,56 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_use_missing_name_suppresses_entire_lifecycle() {
+        let mut ctx = new_ctx(false);
+
+        let first = ctx.process_kiro_event(&tool_event("tool_1", "", "part1", false));
+        let second = ctx.process_kiro_event(&tool_event("tool_1", "test_tool", "part2", true));
+
+        assert!(first.is_empty());
+        assert!(second.is_empty());
+        assert!(ctx.tool_buffers.is_empty());
+        assert!(ctx.suppressed_tool_use_ids.contains("tool_1"));
+        assert!(!ctx.started);
+    }
+
+    #[test]
+    fn test_reasoning_and_metering_events_are_not_public_responses_events() {
+        let mut ctx = new_ctx(true);
+        let mut all = ctx.initial_events();
+        all.extend(
+            ctx.process_kiro_event(&Event::Reasoning(ReasoningContentEvent {
+                text: "abc".to_string(),
+                signature: "fixture_signature_value".to_string(),
+                ..Default::default()
+            })),
+        );
+        all.extend(ctx.process_kiro_event(&Event::Metering(MeteringEvent {
+            unit: "request".to_string(),
+            unit_plural: "requests".to_string(),
+            usage: 1.0,
+            ..Default::default()
+        })));
+        all.extend(ctx.process_kiro_event(&Event::Unknown {
+            event_type: "futureEvent".to_string(),
+            payload: b"fixture hidden payload".to_vec(),
+        }));
+        all.extend(ctx.finish());
+
+        let event_names = names(&all);
+        let serialized =
+            serde_json::to_string(&payloads(&all)).expect("序列化 Responses payload 失败");
+
+        assert!(!event_names.iter().any(|name| name.contains("diagnostic")));
+        assert!(!event_names.iter().any(|name| name.contains("metering")));
+        assert!(!event_names.iter().any(|name| name.contains("reasoning")));
+        assert!(!serialized.contains("diagnostic"));
+        assert!(!serialized.contains("metering"));
+        assert!(!serialized.contains("fixture_signature_value"));
+        assert!(!serialized.contains("fixture hidden payload"));
+    }
+
+    #[test]
     fn test_unstopped_tool_closed_on_finish() {
         let mut ctx = new_ctx(false);
         let mut all = ctx.process_kiro_event(&tool_event("c1", "f", "{\"a\":1}", false));
@@ -914,7 +1012,10 @@ mod tests {
     #[test]
     fn test_started_false_before_output() {
         let ctx = new_ctx(false);
-        assert!(!ctx.started, "未输出前 started 应为 false（决定走错误响应）");
+        assert!(
+            !ctx.started,
+            "未输出前 started 应为 false（决定走错误响应）"
+        );
     }
 
     #[test]
@@ -1041,7 +1142,8 @@ mod tests {
 
         let n = names(&all);
         assert!(
-            !n.iter().any(|e| e == "response.function_call_arguments.delta"),
+            !n.iter()
+                .any(|e| e == "response.function_call_arguments.delta"),
             "freeform 工具不得透传上游参数增量: {:?}",
             n
         );
@@ -1135,7 +1237,8 @@ mod tests {
 
         let n = names(&all);
         assert!(
-            n.iter().any(|e| e == "response.function_call_arguments.delta"),
+            n.iter()
+                .any(|e| e == "response.function_call_arguments.delta"),
             "普通工具须继续透传参数增量: {:?}",
             n
         );
@@ -1165,12 +1268,8 @@ mod tests {
             rewrite,
         );
 
-        let mut all = ctx.process_kiro_event(&tool_event(
-            "c1",
-            "collaboration__spawn_agent",
-            "{}",
-            false,
-        ));
+        let mut all =
+            ctx.process_kiro_event(&tool_event("c1", "collaboration__spawn_agent", "{}", false));
         all.extend(ctx.process_kiro_event(&tool_event(
             "c1",
             "collaboration__spawn_agent",
@@ -1188,6 +1287,76 @@ mod tests {
                 kind
             );
         }
+    }
+
+    /// 两级映射组合：namespace 内层 custom 的展平名必须回 custom_tool_call，
+    /// 还原原名与 namespace，且 freeform 参数缓冲语义不变（增量不透传、一次性发出）。
+    #[test]
+    fn test_stream_freeform_and_namespace_combined() {
+        let mut rewrite = super::super::responses_tools::ToolRewriteMap::default();
+        rewrite.freeform.insert("functions__apply_patch".to_string());
+        rewrite.namespaces.insert(
+            "functions__apply_patch".to_string(),
+            ("functions".to_string(), "apply_patch".to_string()),
+        );
+        let mut ctx = ResponsesStreamContext::new(
+            "resp_test".to_string(),
+            "gpt-4o".to_string(),
+            None,
+            None,
+            100,
+            false,
+            HashMap::new(),
+            rewrite,
+        );
+
+        let mut all = ctx.process_kiro_event(&tool_event(
+            "c1",
+            "functions__apply_patch",
+            r#"{"input":"#,
+            false,
+        ));
+        all.extend(ctx.process_kiro_event(&tool_event(
+            "c1",
+            "functions__apply_patch",
+            r#""*** Begin Patch"}"#,
+            false,
+        )));
+        all.extend(ctx.process_kiro_event(&tool_event(
+            "c1",
+            "functions__apply_patch",
+            "",
+            true,
+        )));
+
+        let n = names(&all);
+        assert!(
+            !n.iter().any(|e| e == "response.function_call_arguments.delta"),
+            "freeform 展平名不得透传参数增量: {:?}",
+            n
+        );
+        let delta_count = n
+            .iter()
+            .filter(|e| *e == "response.custom_tool_call_input.delta")
+            .count();
+        assert_eq!(delta_count, 1, "input.delta 须只出现一次: {:?}", n);
+
+        let p = payloads(&all);
+        for kind in ["response.output_item.added", "response.output_item.done"] {
+            let e = p.iter().find(|e| e["type"] == kind).expect(kind);
+            assert_eq!(e["item"]["type"], "custom_tool_call", "{} 类型不符", kind);
+            assert_eq!(e["item"]["name"], "apply_patch", "{} 须还原原名", kind);
+            assert_eq!(
+                e["item"]["namespace"], "functions",
+                "{} 须带 namespace",
+                kind
+            );
+        }
+        let done = p
+            .iter()
+            .find(|e| e["type"] == "response.output_item.done")
+            .expect("须有 done");
+        assert_eq!(done["item"]["input"], "*** Begin Patch", "done 时填完整提取结果");
     }
 
     #[test]

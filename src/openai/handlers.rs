@@ -1,6 +1,6 @@
 //! `POST /v1/chat/completions` handler
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +23,7 @@ use crate::anthropic::{
     AppState, convert_request_with_policy, extract_thinking_from_complete_text,
     get_context_window_size, override_thinking_from_model_name, resolution_context_from_state,
 };
-use crate::kiro::model::events::Event;
+use crate::kiro::model::events::{Event, EventStreamDiagnostics};
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
@@ -59,10 +59,7 @@ struct PreparedRequest {
     tool_name_map: HashMap<String, String>,
 }
 
-pub async fn post_chat_completions(
-    State(state): State<AppState>,
-    body: Bytes,
-) -> Response {
+pub async fn post_chat_completions(State(state): State<AppState>, body: Bytes) -> Response {
     // 手动反序列化以返回 OpenAI error shape（axum 的 Json 拒绝会返回默认文本）
     let req: ChatCompletionRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -327,6 +324,9 @@ fn aggregate(body: &[u8], prepared: &PreparedRequest) -> Aggregated {
     let mut length_limited = false;
     let mut context_input_tokens = None;
     let mut buffers: HashMap<String, String> = HashMap::new();
+    let mut tool_names: HashMap<String, String> = HashMap::new();
+    let mut suppressed_tool_use_ids: HashSet<String> = HashSet::new();
+    let mut diagnostics = EventStreamDiagnostics::default();
 
     for result in decoder.decode_iter() {
         let frame = match result {
@@ -339,17 +339,60 @@ fn aggregate(body: &[u8], prepared: &PreparedRequest) -> Aggregated {
         let Ok(event) = Event::from_frame(frame) else {
             continue;
         };
+        diagnostics.observe(&event);
 
         match event {
             Event::AssistantResponse(resp) => text.push_str(&resp.content),
             Event::ToolUse(tool_use) => {
-                has_tool_use = true;
+                if tool_use.tool_use_id.is_empty() {
+                    tracing::warn!("跳过缺少 tool_use_id 的 toolUseEvent public 输出");
+                    continue;
+                }
+                if suppressed_tool_use_ids.contains(&tool_use.tool_use_id) {
+                    continue;
+                }
+
+                let is_new_tool = !buffers.contains_key(&tool_use.tool_use_id);
+                if is_new_tool && tool_use.name.is_empty() {
+                    suppressed_tool_use_ids.insert(tool_use.tool_use_id.clone());
+                    tracing::warn!(
+                        tool_use_id_hash = %EventStreamDiagnostics::hash_public_id(&tool_use.tool_use_id),
+                        "跳过缺少工具名的 toolUseEvent public 输出"
+                    );
+                    continue;
+                }
+
+                if !tool_use.name.is_empty() {
+                    tool_names
+                        .entry(tool_use.tool_use_id.clone())
+                        .or_insert_with(|| tool_use.name.clone());
+                }
                 buffers
                     .entry(tool_use.tool_use_id.clone())
                     .or_default()
                     .push_str(&tool_use.input);
 
                 if tool_use.stop {
+                    // 首帧缺名已在上方抑制；此 else 为防御兜底，正常不会命中
+                    let Some(name) = tool_names
+                        .get(&tool_use.tool_use_id)
+                        .cloned()
+                        .or_else(|| {
+                            if tool_use.name.is_empty() {
+                                None
+                            } else {
+                                Some(tool_use.name.clone())
+                            }
+                        })
+                    else {
+                        suppressed_tool_use_ids.insert(tool_use.tool_use_id.clone());
+                        tracing::warn!(
+                            tool_use_id_hash = %EventStreamDiagnostics::hash_public_id(&tool_use.tool_use_id),
+                            "跳过缺少工具名的 toolUseEvent public 输出"
+                        );
+                        continue;
+                    };
+
                     let args = buffers
                         .get(&tool_use.tool_use_id)
                         .cloned()
@@ -357,9 +400,9 @@ fn aggregate(body: &[u8], prepared: &PreparedRequest) -> Aggregated {
                     // 工具名还原（D8 第二项）
                     let name = prepared
                         .tool_name_map
-                        .get(&tool_use.name)
+                        .get(&name)
                         .cloned()
-                        .unwrap_or_else(|| tool_use.name.clone());
+                        .unwrap_or(name);
                     tool_calls.push(ResponseToolCall {
                         id: tool_use.tool_use_id.clone(),
                         call_type: "function",
@@ -372,6 +415,7 @@ fn aggregate(body: &[u8], prepared: &PreparedRequest) -> Aggregated {
                             },
                         },
                     });
+                    has_tool_use = true;
                 }
             }
             Event::ContextUsage(usage) => {
@@ -390,6 +434,7 @@ fn aggregate(body: &[u8], prepared: &PreparedRequest) -> Aggregated {
             _ => {}
         }
     }
+    diagnostics.log_summary("openai-non-stream");
 
     Aggregated {
         text,
@@ -455,6 +500,32 @@ fn build_completion(
 mod tests {
     use super::*;
     use crate::anthropic::types::ContentBlock;
+    use crate::kiro::parser::crc::crc32;
+
+    fn encode_string_header(buf: &mut Vec<u8>, name: &str, value: &str) {
+        buf.push(name.len() as u8);
+        buf.extend_from_slice(name.as_bytes());
+        buf.push(7);
+        buf.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        buf.extend_from_slice(value.as_bytes());
+    }
+
+    fn encode_event_frame(event_type: &str, payload: serde_json::Value) -> Vec<u8> {
+        let mut headers = Vec::new();
+        encode_string_header(&mut headers, ":message-type", "event");
+        encode_string_header(&mut headers, ":event-type", event_type);
+        let payload = serde_json::to_vec(&payload).expect("payload 序列化失败");
+        let total_length = 12 + headers.len() + payload.len() + 4;
+
+        let mut out = Vec::with_capacity(total_length);
+        out.extend_from_slice(&(total_length as u32).to_be_bytes());
+        out.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        out.extend_from_slice(&crc32(&out).to_be_bytes());
+        out.extend_from_slice(&headers);
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&crc32(&out).to_be_bytes());
+        out
+    }
 
     fn state() -> AppState {
         AppState::new("k", true)
@@ -563,6 +634,42 @@ mod tests {
             p.tool_name_map.values().any(|v| v == &long_name),
             "map 中必须含原始工具名以供响应还原"
         );
+    }
+
+    #[test]
+    fn test_aggregate_missing_name_suppresses_entire_lifecycle() {
+        let body = [
+            encode_event_frame(
+                "toolUseEvent",
+                serde_json::json!({
+                    "toolUseId": "tool_1",
+                    "input": "part1",
+                    "stop": false
+                }),
+            ),
+            encode_event_frame(
+                "toolUseEvent",
+                serde_json::json!({
+                    "name": "test_tool",
+                    "toolUseId": "tool_1",
+                    "input": "part2",
+                    "stop": true
+                }),
+            ),
+        ]
+        .concat();
+
+        let prepared = PreparedRequest {
+            body: String::new(),
+            echo_model: "gpt-4o".into(),
+            input_tokens: 1,
+            thinking_enabled: false,
+            tool_name_map: HashMap::new(),
+        };
+
+        let agg = aggregate(&body, &prepared);
+        assert!(agg.tool_calls.is_empty());
+        assert!(!agg.has_tool_use);
     }
 
     #[test]
@@ -719,10 +826,17 @@ mod tests {
         assert_eq!(json["choices"][0]["message"]["role"], "assistant");
         assert_eq!(json["choices"][0]["message"]["content"], "hello");
         assert_eq!(json["choices"][0]["finish_reason"], "stop");
-        assert_eq!(json["usage"]["total_tokens"], 5 + json["usage"]["completion_tokens"].as_i64().unwrap());
+        assert_eq!(
+            json["usage"]["total_tokens"],
+            5 + json["usage"]["completion_tokens"].as_i64().unwrap()
+        );
         // 无工具调用时不应出现该字段
         assert!(json["choices"][0]["message"].get("tool_calls").is_none());
-        assert!(json["choices"][0]["message"].get("reasoning_content").is_none());
+        assert!(
+            json["choices"][0]["message"]
+                .get("reasoning_content")
+                .is_none()
+        );
     }
 
     #[test]
@@ -957,9 +1071,10 @@ mod tests {
         // 展平自 namespace 的 custom 工具：两项还原同时生效
         let mut rewrite = ToolRewriteMap::default();
         rewrite.freeform.insert("ns__exec".to_string());
-        rewrite
-            .namespaces
-            .insert("ns__exec".to_string(), ("ns".to_string(), "exec".to_string()));
+        rewrite.namespaces.insert(
+            "ns__exec".to_string(),
+            ("ns".to_string(), "exec".to_string()),
+        );
 
         let item = build_tool_call_item("c1", "ns__exec", r#"{"input":"src"}"#, &rewrite);
         assert_eq!(item.item_type, "custom_tool_call");
@@ -980,7 +1095,10 @@ mod tests {
         assert_eq!(v["type"], "custom_tool_call");
         assert_eq!(v["input"], "x");
         assert!(v.get("arguments").is_none(), "不应序列化 arguments");
-        assert!(v.get("namespace").is_none(), "无 namespace 时不应出现该字段");
+        assert!(
+            v.get("namespace").is_none(),
+            "无 namespace 时不应出现该字段"
+        );
     }
 }
 
@@ -1013,6 +1131,23 @@ pub async fn post_responses(State(state): State<AppState>, body: Bytes) -> Respo
         "Received POST /v1/responses request"
     );
 
+    // 流式路径与 WS ingress 共享 turn 构建（start_responses_stream_turn，design §4.5）
+    if req.stream {
+        return match start_responses_stream_turn(&state, req).await {
+            Err(e) => e.into_response(),
+            Ok(ResponsesTurnStart::WebSearch { events }) => sse_response_from_events(events),
+            Ok(ResponsesTurnStart::Upstream {
+                source,
+                body,
+                provider,
+            }) => match provider.call_api_stream(&body).await {
+                Ok(response) => stream_responses_from_source(response, source),
+                Err(e) => map_provider_error(e).into_response(),
+            },
+        };
+    }
+
+    // 非流式路径（行为保持不变）
     // 归一（含 previous_response_id 报错 —— D2）
     // 放在 provider 检查之前：请求本身不合法时应回 400，而非被 503 掩盖
     let (chat_json, tool_rewrite) = match super::responses::to_chat_request_json(&req) {
@@ -1029,13 +1164,12 @@ pub async fn post_responses(State(state): State<AppState>, body: Bytes) -> Respo
     };
 
     // web_search 代执行分支（D10/D11）：放在转换之前，避免无谓的上游请求构造
-    let websearch_enabled = state
-        .kiro_provider
-        .as_ref()
-        .map(|p| p.token_manager().config().web_search_emulation)
-        .unwrap_or(true);
+    let websearch_enabled = provider.token_manager().config().web_search_emulation;
     if super::websearch::should_emulate(req.tools.as_deref(), websearch_enabled) {
-        let messages = chat_json["messages"].as_array().cloned().unwrap_or_default();
+        let messages = chat_json["messages"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         let Some(query) = super::websearch::extract_query(&messages) else {
             return super::websearch::missing_query_error().into_response();
         };
@@ -1070,14 +1204,10 @@ pub async fn post_responses(State(state): State<AppState>, body: Bytes) -> Respo
         tool_rewrite,
     };
 
-    if req.stream {
-        handle_responses_stream(provider, prepared, ctx).await
-    } else {
-        handle_responses_non_stream(provider, prepared, ctx).await
-    }
+    handle_responses_non_stream(provider, prepared, ctx).await
 }
 
-/// web_search 代执行：不经上游 generate
+/// web_search 代执行（非流式）：不经上游 generate
 async fn handle_websearch(
     provider: Arc<KiroProvider>,
     req: &super::responses_types::ResponsesRequest,
@@ -1095,60 +1225,6 @@ async fn handle_websearch(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-
-    if req.stream {
-        let (events, items, summary) = super::websearch::build_stream_events(&query, &results);
-        // usage 用本地估算：该路径未调用上游，没有 contextUsageEvent
-        let usage = ResponsesUsage::new(
-            estimate_chars(&query),
-            estimate_chars(&summary),
-        );
-        let final_obj = ResponsesObject {
-            id: resp_id.clone(),
-            object: "response",
-            created_at,
-            status: "completed",
-            model: model.clone(),
-            output: items,
-            usage,
-            instructions: instructions.clone(),
-            metadata: req.metadata.clone(),
-            error: None,
-        };
-
-        let in_progress = ResponsesObject {
-            output: Vec::new(),
-            status: "in_progress",
-            ..final_obj.clone()
-        };
-        let snap = |t: &str, obj: &ResponsesObject| {
-            ResponsesSseEvent::named(
-                t,
-                json!({"type": t, "response": serde_json::to_value(obj).expect("序列化失败")}),
-            )
-        };
-
-        let mut all = vec![
-            snap("response.created", &in_progress),
-            snap("response.in_progress", &in_progress),
-        ];
-        all.extend(events);
-        all.push(snap("response.completed", &final_obj));
-        all.push(ResponsesSseEvent::Done);
-
-        let bytes: Vec<Result<Bytes, Infallible>> = all
-            .into_iter()
-            .map(|e| Ok(Bytes::from(e.to_sse_string())))
-            .collect();
-
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .header(header::CONNECTION, "keep-alive")
-            .body(Body::from_stream(stream::iter(bytes)))
-            .expect("构造 SSE 响应失败");
-    }
 
     let (items, summary) = super::websearch::build_output_items(&query, &results);
     let obj = ResponsesObject {
@@ -1170,28 +1246,151 @@ fn estimate_chars(text: &str) -> i32 {
     (((text.len() + 3) / 4) as i32).max(1)
 }
 
-async fn handle_responses_stream(
-    provider: Arc<KiroProvider>,
-    prepared: PreparedRequest,
-    rctx: ResponsesContext,
-) -> Response {
-    let response = match provider.call_api_stream(&prepared.body).await {
-        Ok(r) => r,
-        Err(e) => return map_provider_error(e).into_response(),
-    };
+/// HTTP 流式 / WS ingress 共享的 turn 启动产物
+pub(super) enum ResponsesTurnStart {
+    /// 上游调用参数就绪，由调用方发起 `call_api_stream`
+    Upstream {
+        source: ResponsesEventSource,
+        body: String,
+        provider: Arc<KiroProvider>,
+    },
+    /// web_search 代执行：本地生成的完整事件序列（含终态）
+    WebSearch { events: Vec<ResponsesSseEvent> },
+}
+
+/// handler 无关的 Responses 流式 turn 构建：
+/// 归一 → provider 检查 → web_search 分支 → prepare → 事件源构建。
+///
+/// `POST /v1/responses`（stream=true）与 `GET /v1/responses` WS ingress 共用本入口
+/// （design §4.5 / tasks 3.1）。归一错误（含 previous_response_id 拒绝）在
+/// provider 检查之前，保证非法请求回 400 而非 503。
+pub(super) async fn start_responses_stream_turn(
+    state: &AppState,
+    req: super::responses_types::ResponsesRequest,
+) -> Result<ResponsesTurnStart, OpenAiError> {
+    let (chat_json, tool_rewrite) = super::responses::to_chat_request_json(&req)?;
+
+    let provider = state.kiro_provider.clone().ok_or_else(|| {
+        OpenAiError::Unavailable("Kiro API provider not configured".to_string())
+    })?;
+
+    // web_search 代执行分支（D10/D11）：放在转换之前，避免无谓的上游请求构造
+    let websearch_enabled = provider.token_manager().config().web_search_emulation;
+    if super::websearch::should_emulate(req.tools.as_deref(), websearch_enabled) {
+        let messages = chat_json["messages"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let Some(query) = super::websearch::extract_query(&messages) else {
+            return Err(super::websearch::missing_query_error());
+        };
+        let events = websearch_stream_events(&provider, &req, query).await;
+        return Ok(ResponsesTurnStart::WebSearch { events });
+    }
+
+    let chat_req: ChatCompletionRequest = serde_json::from_value(chat_json)
+        .map_err(|e| OpenAiError::Internal(format!("归一结果不可解析: {}", e)))?;
+
+    let prepared = prepare(state, &chat_req)?;
+
+    let instructions = req
+        .instructions
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
 
     let ctx = ResponsesStreamContext::new(
         super::responses_types::response_id(),
-        rctx.echo_model,
-        rctx.instructions,
-        rctx.metadata,
+        req.resolved_model(), // 模型回显用请求原值（D9）
+        instructions,
+        req.metadata,
         prepared.input_tokens,
         prepared.thinking_enabled,
         prepared.tool_name_map,
-        rctx.tool_rewrite,
+        tool_rewrite,
     );
 
-    let sse = create_responses_sse_stream(response, ctx);
+    Ok(ResponsesTurnStart::Upstream {
+        source: ResponsesEventSource::new(ctx),
+        body: prepared.body,
+        provider,
+    })
+}
+
+/// web_search 代执行的流式事件序列（HTTP SSE 与 WS 共用同一序列）
+async fn websearch_stream_events(
+    provider: &Arc<KiroProvider>,
+    req: &super::responses_types::ResponsesRequest,
+    query: String,
+) -> Vec<ResponsesSseEvent> {
+    use super::responses_types::{ResponsesObject, ResponsesUsage, response_id};
+
+    let (query, results) = super::websearch::run_search(provider, &query).await;
+    let (events, items, summary) = super::websearch::build_stream_events(&query, &results);
+    // usage 用本地估算：该路径未调用上游，没有 contextUsageEvent
+    let usage = ResponsesUsage::new(estimate_chars(&query), estimate_chars(&summary));
+    let final_obj = ResponsesObject {
+        id: response_id(),
+        object: "response",
+        created_at: chrono::Utc::now().timestamp(),
+        status: "completed",
+        model: req.resolved_model(),
+        output: items,
+        usage,
+        instructions: req
+            .instructions
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+        metadata: req.metadata.clone(),
+        error: None,
+    };
+    let in_progress = ResponsesObject {
+        output: Vec::new(),
+        status: "in_progress",
+        ..final_obj.clone()
+    };
+    let snap = |t: &str, obj: &ResponsesObject| {
+        ResponsesSseEvent::named(
+            t,
+            json!({"type": t, "response": serde_json::to_value(obj).expect("序列化失败")}),
+        )
+    };
+
+    let mut all = vec![
+        snap("response.created", &in_progress),
+        snap("response.in_progress", &in_progress),
+    ];
+    all.extend(events);
+    all.push(snap("response.completed", &final_obj));
+    all.push(ResponsesSseEvent::Done);
+    all
+}
+
+/// 固定事件序列 → SSE 响应体
+fn sse_response_from_events(all: Vec<ResponsesSseEvent>) -> Response {
+    let bytes: Vec<Result<Bytes, Infallible>> = all
+        .into_iter()
+        .map(|e| Ok(Bytes::from(e.to_sse_string())))
+        .collect();
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "keep-alive")
+        .body(Body::from_stream(stream::iter(bytes)))
+        .expect("构造 SSE 响应失败")
+}
+
+/// 上游流式响应 + 事件源 → SSE 响应体
+fn stream_responses_from_source(
+    response: reqwest::Response,
+    source: ResponsesEventSource,
+) -> Response {
+    let sse = create_responses_sse_stream(response, source);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -1202,12 +1401,68 @@ async fn handle_responses_stream(
         .expect("构造 SSE 响应失败")
 }
 
+/// 上游事件源：喂入 AWS event-stream 字节，驱动 `ResponsesStreamContext`
+/// 产出 `ResponsesSseEvent` 批次。SSE / WS 两种 sink 共用同一事件序列，
+/// 序列化差异只在 sink 层（SSE 写 `event:/data:` 行，WS 发事件 JSON 帧）。
+pub(super) struct ResponsesEventSource {
+    ctx: ResponsesStreamContext,
+    decoder: EventStreamDecoder,
+}
+
+impl ResponsesEventSource {
+    pub(super) fn new(ctx: ResponsesStreamContext) -> Self {
+        Self {
+            ctx,
+            decoder: EventStreamDecoder::new(),
+        }
+    }
+
+    /// 开场事件：created + in_progress
+    pub(super) fn initial_events(&mut self) -> Vec<ResponsesSseEvent> {
+        self.ctx.initial_events()
+    }
+
+    /// 喂入一段上游字节，返回产出的事件批次（可能为空）
+    pub(super) fn feed(&mut self, bytes: &Bytes) -> Vec<ResponsesSseEvent> {
+        if let Err(e) = self.decoder.feed(bytes) {
+            tracing::warn!("缓冲区溢出: {}", e);
+        }
+        let mut out = Vec::new();
+        for result in self.decoder.decode_iter() {
+            match result {
+                Ok(frame) => {
+                    if let Ok(event) = Event::from_frame(frame) {
+                        out.extend(self.ctx.process_kiro_event(&event));
+                    }
+                }
+                Err(e) => tracing::warn!("解码事件失败: {}", e),
+            }
+        }
+        out
+    }
+
+    /// 上游正常结束：收尾并产出终态事件
+    pub(super) fn finish(&mut self) -> Vec<ResponsesSseEvent> {
+        self.ctx.finish()
+    }
+
+    /// 上游错误结束：产出 failed 终态事件
+    pub(super) fn fail(&mut self, message: String) -> Vec<ResponsesSseEvent> {
+        self.ctx.fail(message)
+    }
+
+    /// 客户端取消：产出 cancelled 终态事件
+    pub(super) fn cancel(&mut self) -> Vec<ResponsesSseEvent> {
+        self.ctx.cancel()
+    }
+}
+
 fn create_responses_sse_stream(
     response: reqwest::Response,
-    ctx: ResponsesStreamContext,
+    mut source: ResponsesEventSource,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发 created + in_progress
-    let initial: Vec<Result<Bytes, Infallible>> = ctx
+    let initial: Vec<Result<Bytes, Infallible>> = source
         .initial_events()
         .into_iter()
         .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -1218,12 +1473,11 @@ fn create_responses_sse_stream(
     let processing = stream::unfold(
         (
             body_stream,
-            ctx,
-            EventStreamDecoder::new(),
+            source,
             false,
             interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS)),
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut keepalive)| async move {
+        |(mut body_stream, mut source, finished, mut keepalive)| async move {
             if finished {
                 return None;
             }
@@ -1234,50 +1488,39 @@ fn create_responses_sse_stream(
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(Bytes::from(
                             ResponsesSseEvent::Keepalive.to_sse_string(),
                         ))];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, keepalive)));
+                        return Some((stream::iter(bytes), (body_stream, source, false, keepalive)));
                     }
 
                     chunk = body_stream.next() => {
                         match chunk {
                             Some(Ok(bytes_in)) => {
-                                if let Err(e) = decoder.feed(&bytes_in) {
-                                    tracing::warn!("缓冲区溢出: {}", e);
-                                }
-                                let mut out: Vec<Result<Bytes, Infallible>> = Vec::new();
-                                for result in decoder.decode_iter() {
-                                    match result {
-                                        Ok(frame) => {
-                                            if let Ok(event) = Event::from_frame(frame) {
-                                                for e in ctx.process_kiro_event(&event) {
-                                                    out.push(Ok(Bytes::from(e.to_sse_string())));
-                                                }
-                                            }
-                                        }
-                                        Err(e) => tracing::warn!("解码事件失败: {}", e),
-                                    }
-                                }
-                                if out.is_empty() {
+                                let events = source.feed(&bytes_in);
+                                if events.is_empty() {
                                     continue;
                                 }
-                                return Some((stream::iter(out), (body_stream, ctx, decoder, false, keepalive)));
-                            }
-                            Some(Err(e)) => {
-                                tracing::error!("读取响应流失败: {}", e);
-                                // 已开始输出则走 failed 事件，否则也只能在流中报错
-                                let events = ctx.fail(format!("upstream stream error: {}", e));
                                 let out: Vec<Result<Bytes, Infallible>> = events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(out), (body_stream, ctx, decoder, true, keepalive)));
+                                return Some((stream::iter(out), (body_stream, source, false, keepalive)));
+                            }
+                            Some(Err(e)) => {
+                                tracing::error!("读取响应流失败: {}", e);
+                                // 已开始输出则走 failed 事件，否则也只能在流中报错
+                                let events = source.fail(format!("upstream stream error: {}", e));
+                                let out: Vec<Result<Bytes, Infallible>> = events
+                                    .into_iter()
+                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                    .collect();
+                                return Some((stream::iter(out), (body_stream, source, true, keepalive)));
                             }
                             None => {
-                                let out: Vec<Result<Bytes, Infallible>> = ctx
+                                let out: Vec<Result<Bytes, Infallible>> = source
                                     .finish()
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(out), (body_stream, ctx, decoder, true, keepalive)));
+                                return Some((stream::iter(out), (body_stream, source, true, keepalive)));
                             }
                         }
                     }
@@ -1427,4 +1670,120 @@ fn estimate_completion_tokens(
         }));
     }
     token::estimate_output_tokens(&blocks).max(1)
+}
+
+#[cfg(test)]
+mod ws_parity_tests {
+    //! 任务 2.3：SSE / WS 事件 parity
+    //!
+    //! 不变式：同一事件源输出下，WS 帧 JSON 序列 == SSE data 行 JSON 序列
+    //! （Keepalive 是 SSE 注释、Done 是 SSE 终止符，二者无 WS 对应物）。
+
+    use super::*;
+    use crate::kiro::parser::crc::crc32;
+
+    /// 构造合法的 AWS event-stream 帧（测试专用编码器）
+    fn encode_frame(event_type: &str, payload_json: &str) -> Bytes {
+        fn push_str_header(buf: &mut Vec<u8>, name: &str, value: &str) {
+            buf.push(name.len() as u8);
+            buf.extend_from_slice(name.as_bytes());
+            buf.push(7); // HeaderValueType::String
+            buf.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            buf.extend_from_slice(value.as_bytes());
+        }
+
+        let mut headers = Vec::new();
+        push_str_header(&mut headers, ":message-type", "event");
+        push_str_header(&mut headers, ":event-type", event_type);
+        push_str_header(&mut headers, ":content-type", "application/json");
+
+        let payload = payload_json.as_bytes();
+        let total = 12 + headers.len() + payload.len() + 4;
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&(total as u32).to_be_bytes());
+        msg.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        let prelude_crc = crc32(&msg[..8]);
+        msg.extend_from_slice(&prelude_crc.to_be_bytes());
+        msg.extend_from_slice(&headers);
+        msg.extend_from_slice(payload);
+        let message_crc = crc32(&msg);
+        msg.extend_from_slice(&message_crc.to_be_bytes());
+        Bytes::from(msg)
+    }
+
+    fn test_source() -> ResponsesEventSource {
+        let ctx = ResponsesStreamContext::new(
+            "resp_parity".to_string(),
+            "test-model".to_string(),
+            None,
+            None,
+            10,
+            false,
+            HashMap::new(),
+            super::super::responses_tools::ToolRewriteMap::default(),
+        );
+        ResponsesEventSource::new(ctx)
+    }
+
+    /// WS 帧 JSON 序列必须与 SSE data 行 JSON 序列逐项一致
+    #[test]
+    fn ws_frames_match_sse_data_lines() {
+        let mut source = test_source();
+        let mut events = source.initial_events();
+        events.extend(source.feed(&encode_frame(
+            "assistantResponseEvent",
+            r#"{"content":"Hello "}"#,
+        )));
+        events.extend(source.feed(&encode_frame(
+            "assistantResponseEvent",
+            r#"{"content":"world"}"#,
+        )));
+        events.extend(source.finish());
+
+        // 事件序列必须含开场与终态
+        let names: Vec<Option<&str>> = events.iter().map(|e| e.event_name()).collect();
+        assert!(names.contains(&Some("response.created")));
+        assert!(names.contains(&Some("response.in_progress")));
+        assert!(names.contains(&Some("response.completed")));
+
+        // SSE 侧：to_sse_string 的 data 行
+        let sse_data_json: Vec<serde_json::Value> = events
+            .iter()
+            .filter_map(|e| match e {
+                ResponsesSseEvent::Named { data, .. } => Some(data.clone()),
+                _ => None, // Done / Keepalive 无 WS 对应物
+            })
+            .collect();
+
+        // WS 侧：Named 事件的 data JSON 直接作为 text 帧
+        let ws_frame_json: Vec<serde_json::Value> = events
+            .iter()
+            .filter_map(|e| match e {
+                ResponsesSseEvent::Named { data, .. } => {
+                    serde_json::from_str(&data.to_string()).ok()
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert!(!ws_frame_json.is_empty());
+        assert_eq!(sse_data_json, ws_frame_json, "WS 帧序列必须与 SSE data 序列一致");
+    }
+
+    /// 上游中途失败：fail 事件同时服务 SSE 与 WS（不依赖 sink）
+    #[test]
+    fn fail_events_are_sink_agnostic() {
+        let mut source = test_source();
+        let _ = source.initial_events();
+        let events = source.fail("upstream stream error: boom".to_string());
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ResponsesSseEvent::Named { event, data } => {
+                assert_eq!(event, "response.failed");
+                assert_eq!(data["type"], "response.failed");
+                assert_eq!(data["response"]["status"], "failed");
+            }
+            other => panic!("fail 应为 Named 事件，实际: {:?}", other),
+        }
+    }
 }

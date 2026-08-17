@@ -18,6 +18,7 @@ use super::{
         set_credential_priority, set_load_balancing_mode, start_builder_id, start_iam_sso,
         test_credential, update_auth_settings, update_client_identity_settings,
         get_websearch_settings, update_websearch_settings,
+        get_ws_settings, update_ws_settings,
         update_endpoint_settings, update_proxy_settings,
     },
     middleware::{AdminState, admin_auth_middleware},
@@ -74,6 +75,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/settings/websearch",
             get(get_websearch_settings).put(update_websearch_settings),
+        )
+        .route(
+            "/settings/websocket",
+            get(get_ws_settings).put(update_ws_settings),
         )
         .route(
             "/settings/client-identity",

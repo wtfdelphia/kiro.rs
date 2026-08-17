@@ -15,6 +15,9 @@ pub mod responses_types;
 pub mod stream;
 pub mod types;
 pub mod websearch;
+pub mod ws_error;
+pub mod ws_ingress;
+pub mod ws_transport;
 
 use axum::{Router, extract::DefaultBodyLimit, middleware, routing::post};
 
@@ -28,7 +31,10 @@ use crate::anthropic::{AppState, MAX_BODY_SIZE, auth_middleware, cors_layer};
 pub fn create_openai_routes(state: AppState) -> Router {
     let v1_routes = Router::new()
         .route("/chat/completions", post(handlers::post_chat_completions))
-        .route("/responses", post(handlers::post_responses))
+        .route(
+            "/responses",
+            post(handlers::post_responses).get(ws_ingress::get_responses_ws),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -210,7 +216,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_responses_get_method_not_allowed() {
+    async fn test_responses_get_without_upgrade_gets_426() {
+        // GET /v1/responses 现为 WS ingress：非 upgrade 请求按契约回 426（不再是 405）
         let status = router(false, "k")
             .oneshot(
                 Request::builder()
@@ -223,7 +230,29 @@ mod tests {
             .expect("路由调用失败")
             .status()
             .as_u16();
-        assert_eq!(status, 405);
+        assert_eq!(status, 426, "非 upgrade 的 GET 必须 426，且不得升级为 WS");
+    }
+
+    #[tokio::test]
+    async fn test_responses_get_requires_auth_before_upgrade() {
+        // requireApiKey 开启时，未带 key 的 upgrade 请求在升级前 401
+        let status = router(true, "secret")
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(RESPONSES_PATH)
+                    .header("connection", "upgrade")
+                    .header("upgrade", "websocket")
+                    .header("sec-websocket-version", "13")
+                    .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                    .body(Body::empty())
+                    .expect("构造请求失败"),
+            )
+            .await
+            .expect("路由调用失败")
+            .status()
+            .as_u16();
+        assert_eq!(status, 401, "鉴权失败必须在 upgrade 之前");
     }
 
     #[tokio::test]

@@ -365,6 +365,26 @@ pub async fn update_websearch_settings(
     }
 }
 
+/// GET /api/admin/settings/websocket
+///
+/// 返回 WebSocket ingress 当前设置与活跃连接数。
+pub async fn get_ws_settings(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_ws_settings())
+}
+
+/// PUT /api/admin/settings/websocket
+///
+/// 部分更新 WebSocket 设置；未携带字段保持当前值；写内存立即生效并落盘。
+pub async fn update_ws_settings(
+    State(state): State<AdminState>,
+    Json(payload): Json<crate::admin::types::UpdateWsSettingsRequest>,
+) -> impl IntoResponse {
+    match state.service.update_ws_settings(payload) {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/public-api
 ///
 /// 只读返回对外 Public API 目录（路径 / 鉴权 / status / 示例）。
