@@ -2,7 +2,7 @@
 
 use std::convert::Infallible;
 
-use crate::kiro::model::events::Event;
+use crate::kiro::model::events::{Event, EventStreamDiagnostics};
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
@@ -703,21 +703,51 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
+    let mut diagnostics = EventStreamDiagnostics::default();
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    let mut tool_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut suppressed_tool_use_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for result in decoder.decode_iter() {
         match result {
             Ok(frame) => {
                 if let Ok(event) = Event::from_frame(frame) {
+                    diagnostics.observe(&event);
+
                     match event {
                         Event::AssistantResponse(resp) => {
                             text_content.push_str(&resp.content);
                         }
                         Event::ToolUse(tool_use) => {
-                            has_tool_use = true;
+                            if tool_use.tool_use_id.is_empty() {
+                                tracing::warn!("跳过缺少 tool_use_id 的 toolUseEvent public 输出");
+                                continue;
+                            }
+                            if suppressed_tool_use_ids.contains(&tool_use.tool_use_id) {
+                                continue;
+                            }
+
+                            let is_new_tool =
+                                !tool_json_buffers.contains_key(&tool_use.tool_use_id);
+                            if is_new_tool && tool_use.name.is_empty() {
+                                suppressed_tool_use_ids.insert(tool_use.tool_use_id.clone());
+                                tracing::warn!(
+                                    tool_use_id_hash = %EventStreamDiagnostics::hash_public_id(&tool_use.tool_use_id),
+                                    "跳过缺少工具名的 toolUseEvent public 输出"
+                                );
+                                continue;
+                            }
+
+                            if !tool_use.name.is_empty() {
+                                tool_names
+                                    .entry(tool_use.tool_use_id.clone())
+                                    .or_insert_with(|| tool_use.name.clone());
+                            }
 
                             // 累积工具的 JSON 输入
                             let buffer = tool_json_buffers
@@ -727,6 +757,26 @@ async fn handle_non_stream_request(
 
                             // 如果是完整的工具调用，添加到列表
                             if tool_use.stop {
+                                // 首帧缺名已在上方抑制；此 else 为防御兜底，正常不会命中
+                                let Some(name) = tool_names
+                                    .get(&tool_use.tool_use_id)
+                                    .cloned()
+                                    .or_else(|| {
+                                        if tool_use.name.is_empty() {
+                                            None
+                                        } else {
+                                            Some(tool_use.name.clone())
+                                        }
+                                    })
+                                else {
+                                    suppressed_tool_use_ids.insert(tool_use.tool_use_id.clone());
+                                    tracing::warn!(
+                                        tool_use_id_hash = %EventStreamDiagnostics::hash_public_id(&tool_use.tool_use_id),
+                                        "跳过缺少工具名的 toolUseEvent public 输出"
+                                    );
+                                    continue;
+                                };
+
                                 let input: serde_json::Value = if buffer.is_empty() {
                                     serde_json::json!({})
                                 } else {
@@ -741,9 +791,9 @@ async fn handle_non_stream_request(
                                 };
 
                                 let original_name = tool_name_map
-                                    .get(&tool_use.name)
+                                    .get(&name)
                                     .cloned()
-                                    .unwrap_or_else(|| tool_use.name.clone());
+                                    .unwrap_or(name);
 
                                 tool_uses.push(json!({
                                     "type": "tool_use",
@@ -751,6 +801,7 @@ async fn handle_non_stream_request(
                                     "name": original_name,
                                     "input": input
                                 }));
+                                has_tool_use = true;
                             }
                         }
                         Event::ContextUsage(context_usage) => {
@@ -784,6 +835,7 @@ async fn handle_non_stream_request(
             }
         }
     }
+    diagnostics.log_summary("anthropic-non-stream");
 
     // 确定 stop_reason
     if has_tool_use && stop_reason == "end_turn" {
@@ -1180,8 +1232,8 @@ fn create_buffered_sse_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::converter::map_model;
+    use super::*;
     use crate::kiro::model::available_models::{TokenLimits, UpstreamModelInfo};
 
     #[test]
