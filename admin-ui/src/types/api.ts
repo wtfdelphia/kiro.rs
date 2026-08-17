@@ -199,6 +199,19 @@ export interface WebSearchSettings {
   webSearchEmulation: boolean
 }
 
+export interface WebsocketSettings {
+  enabled: boolean
+  /** http_bridge / passthrough（预留） */
+  mode: string
+  maxConnections: number
+  clientFirstMessageTimeoutSeconds: number
+  interTurnIdleTimeoutSeconds: number
+  maxMessageBytes: number
+  upstreamReadTimeoutSeconds: number
+  /** 当前活跃 WS 连接数（只读） */
+  activeConnections: number
+}
+
 export interface SuccessSettingsResponse {
   success: boolean
   message: string

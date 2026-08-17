@@ -124,6 +124,10 @@ pub struct Config {
     #[serde(default = "default_web_search_emulation")]
     pub web_search_emulation: bool,
 
+    /// WebSocket ingress（`GET /v1/responses`）运行时设置（默认启用，可热加载）
+    #[serde(default)]
+    pub websocket: WsSettings,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -160,6 +164,119 @@ impl Default for ModelResolutionConfig {
             compat_aliases: HashMap::new(),
         }
     }
+}
+
+/// WebSocket 传输模式
+///
+/// - `http_bridge`：客户端保持 WS，每个 turn 翻译为一次上游 HTTP/SSE 调用
+///   （当前唯一实现的模式）
+/// - `passthrough`：WS→WS 帧中继，**预留未实现**；选中时握手前返回 501
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WsTransportMode {
+    HttpBridge,
+    Passthrough,
+}
+
+impl Default for WsTransportMode {
+    fn default() -> Self {
+        Self::HttpBridge
+    }
+}
+
+/// 未知 mode 值回落 http_bridge 并告警（防御配置笔误），不阻断启动
+impl<'de> Deserialize<'de> for WsTransportMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        match raw.trim() {
+            "http_bridge" => Ok(Self::HttpBridge),
+            "passthrough" => Ok(Self::Passthrough),
+            other => {
+                tracing::warn!(
+                    mode = %other,
+                    "websocket.mode 无法识别，回落为 http_bridge"
+                );
+                Ok(Self::HttpBridge)
+            }
+        }
+    }
+}
+
+/// WebSocket ingress 运行时设置
+///
+/// JSON 字段名为 camelCase（与 `Config` 一致）；全部字段支持 Admin API 热加载，
+/// 语义见 `docs/websocket-support-optimization-design.md` §4.7。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsSettings {
+    /// 总开关；关闭时新 upgrade 被 503 拒绝，存量会话自然终态
+    #[serde(default = "default_ws_enabled")]
+    pub enabled: bool,
+
+    /// 传输模式：http_bridge（默认）/ passthrough（预留）
+    #[serde(default)]
+    pub mode: WsTransportMode,
+
+    /// 全局最大并发 WS 连接数
+    #[serde(default = "default_ws_max_connections")]
+    pub max_connections: usize,
+
+    /// 升级后首帧等待上限（秒）
+    #[serde(default = "default_ws_first_message_timeout")]
+    pub client_first_message_timeout_seconds: u64,
+
+    /// turn 间空闲上限（秒），0 表示关闭
+    #[serde(default = "default_ws_idle_timeout")]
+    pub inter_turn_idle_timeout_seconds: u64,
+
+    /// 单条 WS 消息上限（字节）
+    #[serde(default = "default_ws_max_message_bytes")]
+    pub max_message_bytes: usize,
+
+    /// 单个 turn 的上游读取超时（秒）
+    #[serde(default = "default_ws_upstream_read_timeout")]
+    pub upstream_read_timeout_seconds: u64,
+}
+
+impl Default for WsSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_ws_enabled(),
+            mode: WsTransportMode::HttpBridge,
+            max_connections: default_ws_max_connections(),
+            client_first_message_timeout_seconds: default_ws_first_message_timeout(),
+            inter_turn_idle_timeout_seconds: default_ws_idle_timeout(),
+            max_message_bytes: default_ws_max_message_bytes(),
+            upstream_read_timeout_seconds: default_ws_upstream_read_timeout(),
+        }
+    }
+}
+
+fn default_ws_enabled() -> bool {
+    true
+}
+
+fn default_ws_max_connections() -> usize {
+    64
+}
+
+fn default_ws_first_message_timeout() -> u64 {
+    30
+}
+
+fn default_ws_idle_timeout() -> u64 {
+    1800
+}
+
+fn default_ws_max_message_bytes() -> usize {
+    32 * 1024 * 1024
+}
+
+fn default_ws_upstream_read_timeout() -> u64 {
+    900
 }
 
 fn default_chat_model() -> String {
@@ -251,6 +368,7 @@ impl Default for Config {
             endpoints: HashMap::new(),
             model_resolution: ModelResolutionConfig::default(),
             web_search_emulation: default_web_search_emulation(),
+            websocket: WsSettings::default(),
             config_path: None,
         }
     }
@@ -306,5 +424,87 @@ impl Config {
         fs::write(path, content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 任务 1.2：旧 config.json（无 websocket 块）加载成功并取默认值
+    #[test]
+    fn old_config_without_websocket_block_loads_defaults() {
+        let cfg: Config = serde_json::from_str(r#"{"host":"0.0.0.0","port":9000}"#)
+            .expect("旧配置（无 websocket 块）应可加载");
+        assert!(cfg.websocket.enabled);
+        assert_eq!(cfg.websocket.mode, WsTransportMode::HttpBridge);
+        assert_eq!(cfg.websocket.max_connections, 64);
+        assert_eq!(cfg.websocket.client_first_message_timeout_seconds, 30);
+        assert_eq!(cfg.websocket.inter_turn_idle_timeout_seconds, 1800);
+        assert_eq!(cfg.websocket.max_message_bytes, 32 * 1024 * 1024);
+        assert_eq!(cfg.websocket.upstream_read_timeout_seconds, 900);
+    }
+
+    /// 任务 1.2：websocket 块按 camelCase 解析
+    #[test]
+    fn websocket_block_parses_camel_case() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"websocket":{"enabled":false,"mode":"http_bridge","maxConnections":8,
+                "clientFirstMessageTimeoutSeconds":5,"interTurnIdleTimeoutSeconds":0,
+                "maxMessageBytes":1024,"upstreamReadTimeoutSeconds":60}}"#,
+        )
+        .expect("websocket 块应可解析");
+        assert!(!cfg.websocket.enabled);
+        assert_eq!(cfg.websocket.max_connections, 8);
+        assert_eq!(cfg.websocket.client_first_message_timeout_seconds, 5);
+        assert_eq!(cfg.websocket.inter_turn_idle_timeout_seconds, 0);
+        assert_eq!(cfg.websocket.max_message_bytes, 1024);
+        assert_eq!(cfg.websocket.upstream_read_timeout_seconds, 60);
+    }
+
+    /// 任务 1.3：未知 mode 值回落 http_bridge（warn 由 tracing 输出，此处断言结果）
+    #[test]
+    fn unknown_ws_mode_falls_back_to_http_bridge() {
+        let mode: WsTransportMode =
+            serde_json::from_str(r#""weird_mode""#).expect("未知 mode 不应导致解析失败");
+        assert_eq!(mode, WsTransportMode::HttpBridge);
+
+        let passthrough: WsTransportMode =
+            serde_json::from_str(r#""passthrough""#).expect("passthrough 应可解析");
+        assert_eq!(passthrough, WsTransportMode::Passthrough);
+
+        let serialized = serde_json::to_string(&WsTransportMode::HttpBridge).unwrap();
+        assert_eq!(serialized, r#""http_bridge""#);
+    }
+
+    /// 任务 7.5：重启恢复——落盘值重新加载为启动值（序列化→写盘→读回往返一致）
+    #[test]
+    fn ws_settings_roundtrip_restart_recovery() {
+        let mut cfg = Config::default();
+        cfg.websocket.enabled = false;
+        cfg.websocket.mode = WsTransportMode::Passthrough;
+        cfg.websocket.max_connections = 7;
+        cfg.websocket.client_first_message_timeout_seconds = 11;
+        cfg.websocket.inter_turn_idle_timeout_seconds = 22;
+        cfg.websocket.max_message_bytes = 33;
+        cfg.websocket.upstream_read_timeout_seconds = 44;
+
+        let path = std::env::temp_dir().join(format!(
+            "kiro-rs-ws-roundtrip-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        cfg.config_path = Some(path.clone());
+        cfg.save().expect("落盘失败");
+
+        let reloaded = Config::load(&path).expect("重载失败");
+        assert!(!reloaded.websocket.enabled, "重启后必须恢复落盘的 enabled");
+        assert_eq!(reloaded.websocket.mode, WsTransportMode::Passthrough);
+        assert_eq!(reloaded.websocket.max_connections, 7);
+        assert_eq!(reloaded.websocket.client_first_message_timeout_seconds, 11);
+        assert_eq!(reloaded.websocket.inter_turn_idle_timeout_seconds, 22);
+        assert_eq!(reloaded.websocket.max_message_bytes, 33);
+        assert_eq!(reloaded.websocket.upstream_read_timeout_seconds, 44);
+
+        let _ = std::fs::remove_file(path);
     }
 }

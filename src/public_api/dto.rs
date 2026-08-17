@@ -129,6 +129,14 @@ fn endpoint_dto(e: &PublicEndpoint, base_url: &str) -> EndpointDto {
 fn build_curl(e: &PublicEndpoint, base_url: &str) -> String {
     let url = format!("{}{}", base_url.trim_end_matches('/'), e.path);
     if e.method == "GET" {
+        // Responses WebSocket ingress：示例用 wscat（transport 为 upgrade websocket）
+        if e.path == "/v1/responses" {
+            let ws_url = url.replacen("http://", "ws://", 1).replacen("https://", "wss://", 1);
+            return format!(
+                "wscat -c {} \\\n  -H \"x-api-key: {}\"",
+                ws_url, API_KEY_PLACEHOLDER
+            );
+        }
         return format!(
             "curl {} \\\n  -H \"x-api-key: {}\"",
             url, API_KEY_PLACEHOLDER

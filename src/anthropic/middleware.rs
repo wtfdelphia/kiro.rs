@@ -10,9 +10,12 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use parking_lot::RwLock;
+use tokio::sync::broadcast;
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
+use crate::model::config::WsSettings;
+use crate::openai::ws_transport::WsAdmission;
 
 use super::types::ErrorResponse;
 
@@ -33,6 +36,12 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// WebSocket ingress 运行时设置（可热加载，Admin `PUT /api/admin/settings/websocket`）
+    pub ws_settings: Arc<RwLock<WsSettings>>,
+    /// WS 准入计数器（`max_connections` 热改只影响新连接）
+    pub ws_admission: Arc<WsAdmission>,
+    /// 优雅 shutdown 广播：活跃 WS 会话收到后以 1001 关闭
+    pub ws_shutdown: broadcast::Sender<()>,
 }
 
 impl AppState {
@@ -45,6 +54,9 @@ impl AppState {
             })),
             kiro_provider: None,
             extract_thinking,
+            ws_settings: Arc::new(RwLock::new(WsSettings::default())),
+            ws_admission: Arc::new(WsAdmission::new()),
+            ws_shutdown: broadcast::channel(1).0,
         }
     }
 
@@ -59,6 +71,24 @@ impl AppState {
     pub fn with_kiro_provider_arc(mut self, provider: Arc<KiroProvider>) -> Self {
         self.kiro_provider = Some(provider);
         self
+    }
+
+    /// 读取最新 WS 设置快照
+    pub fn ws_settings_snapshot(&self) -> WsSettings {
+        self.ws_settings.read().clone()
+    }
+
+    /// 以启动配置覆盖 WS 设置（Router 已克隆共享同一 `Arc`，写穿即生效）
+    pub fn set_ws_settings(&self, settings: WsSettings) {
+        *self.ws_settings.write() = settings;
+    }
+
+    /// 尝试占用一个 WS 准入名额
+    pub fn ws_admission_guard(
+        &self,
+        max_connections: usize,
+    ) -> Option<crate::openai::ws_transport::WsAdmissionGuard> {
+        self.ws_admission.try_acquire(max_connections)
     }
 
     #[cfg(test)]

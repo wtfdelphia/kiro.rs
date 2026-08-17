@@ -972,6 +972,36 @@ pub struct UpdateWebSearchSettingsRequest {
     pub web_search_emulation: bool,
 }
 
+/// WebSocket ingress 运行时设置（含活跃连接数）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsSettingsResponse {
+    pub enabled: bool,
+    /// `http_bridge` / `passthrough`（预留）
+    pub mode: String,
+    pub max_connections: usize,
+    pub client_first_message_timeout_seconds: u64,
+    pub inter_turn_idle_timeout_seconds: u64,
+    pub max_message_bytes: usize,
+    pub upstream_read_timeout_seconds: u64,
+    /// 当前活跃 WS 连接数（准入计数器实时值）
+    pub active_connections: usize,
+}
+
+/// WebSocket 设置部分更新请求：未携带字段保持当前值
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateWsSettingsRequest {
+    pub enabled: Option<bool>,
+    /// `http_bridge` / `passthrough`；未知值返回 400
+    pub mode: Option<String>,
+    pub max_connections: Option<usize>,
+    pub client_first_message_timeout_seconds: Option<u64>,
+    pub inter_turn_idle_timeout_seconds: Option<u64>,
+    pub max_message_bytes: Option<usize>,
+    pub upstream_read_timeout_seconds: Option<u64>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateAuthSettingsRequest {

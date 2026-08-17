@@ -16,8 +16,10 @@ use super::base::EventPayload;
 #[serde(rename_all = "camelCase")]
 pub struct ToolUseEvent {
     /// 工具名称
+    #[serde(default)]
     pub name: String,
     /// 工具调用 ID
+    #[serde(default)]
     pub tool_use_id: String,
     /// 工具输入数据 (JSON 字符串，可能是流式的部分数据)
     #[serde(default)]
