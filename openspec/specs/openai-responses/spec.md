@@ -212,6 +212,11 @@ A streaming request MUST respond with `text/event-stream` using named SSE events
 - **WHEN** 上游在已经发出内容之后失败
 - **THEN** MUST 发出失败事件，其中携带状态为 failed 的响应与错误信息，MUST NOT 伪装成正常完成
 
+#### Scenario: 流内错误事件构成上游失败
+
+- **WHEN** 上游生成流中发出 Kiro 错误事件（error 事件或无语义映射的异常事件）
+- **THEN** 系统 MUST 将其视为上游失败并按失败路径收尾，MUST NOT 发出完成事件
+
 #### Scenario: 流以 DONE 结束
 
 - **WHEN** 流式响应正常结束
