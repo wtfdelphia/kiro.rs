@@ -9,6 +9,7 @@ pub mod models_api;
 pub mod parser;
 pub mod profile;
 pub mod provider;
+pub mod stream_fault;
 pub mod token_manager;
 pub mod online_auth;
 pub mod user_info;

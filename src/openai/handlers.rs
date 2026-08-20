@@ -295,6 +295,10 @@ async fn handle_non_stream(
     };
 
     let aggregated = aggregate(&body_bytes, &prepared);
+    // 流内硬错误：返回 502 错误信封，替代截断的 200 成功
+    if let Some(fault) = &aggregated.fault {
+        return OpenAiError::Upstream(fault.client_message()).into_response();
+    }
     let completion = build_completion(
         aggregated,
         &prepared,
@@ -310,6 +314,8 @@ struct Aggregated {
     has_tool_use: bool,
     length_limited: bool,
     context_input_tokens: Option<i32>,
+    /// 流内硬错误（首个生效）：存在时调用方 MUST 返回协议错误信封
+    fault: Option<crate::kiro::stream_fault::StreamFault>,
 }
 
 fn aggregate(body: &[u8], prepared: &PreparedRequest) -> Aggregated {
@@ -340,6 +346,18 @@ fn aggregate(body: &[u8], prepared: &PreparedRequest) -> Aggregated {
             continue;
         };
         diagnostics.observe(&event);
+
+        // 首个硬错误生效：立即结束聚合，由调用方返回协议错误信封
+        if let Some(fault) = crate::kiro::stream_fault::classify_stream_fault(&event) {
+            return Aggregated {
+                text,
+                tool_calls,
+                has_tool_use,
+                length_limited,
+                context_input_tokens,
+                fault: Some(fault),
+            };
+        }
 
         match event {
             Event::AssistantResponse(resp) => text.push_str(&resp.content),
@@ -442,6 +460,7 @@ fn aggregate(body: &[u8], prepared: &PreparedRequest) -> Aggregated {
         has_tool_use,
         length_limited,
         context_input_tokens,
+        fault: None,
     }
 }
 
@@ -736,6 +755,7 @@ mod tests {
             has_tool_use: true,
             length_limited: true,
             context_input_tokens: None,
+            fault: None,
         };
         let prepared = PreparedRequest {
             body: String::new(),
@@ -763,6 +783,7 @@ mod tests {
             has_tool_use: false,
             length_limited: false,
             context_input_tokens: Some(42),
+            fault: None,
         };
         let c = build_completion(agg, &prepared, false);
         assert_eq!(c.usage.prompt_tokens, 42, "应优先使用上游反算值");
@@ -773,6 +794,7 @@ mod tests {
             has_tool_use: false,
             length_limited: false,
             context_input_tokens: None,
+            fault: None,
         };
         let c2 = build_completion(agg2, &prepared, false);
         assert_eq!(c2.usage.prompt_tokens, 999, "无上游信号时回落估算值");
@@ -793,6 +815,7 @@ mod tests {
             has_tool_use: false,
             length_limited: false,
             context_input_tokens: None,
+            fault: None,
         };
         let c = build_completion(agg, &prepared, true);
         let msg = &c.choices[0].message;
@@ -817,6 +840,7 @@ mod tests {
             has_tool_use: false,
             length_limited: false,
             context_input_tokens: None,
+            fault: None,
         };
         let json = serde_json::to_value(build_completion(agg, &prepared, false)).unwrap();
         assert_eq!(json["object"], "chat.completion");
@@ -1099,6 +1123,90 @@ mod tests {
             v.get("namespace").is_none(),
             "无 namespace 时不应出现该字段"
         );
+    }
+
+    // === aggregate 的流内硬错误检测（add-stream-error-propagation） ===
+
+    fn encode_raw_frame(message_type: &str, extra_headers: &[(&str, &str)], payload: &[u8]) -> Vec<u8> {
+        let mut headers = Vec::new();
+        encode_string_header(&mut headers, ":message-type", message_type);
+        for (name, value) in extra_headers {
+            encode_string_header(&mut headers, name, value);
+        }
+        let total_length = 12 + headers.len() + payload.len() + 4;
+
+        let mut out = Vec::with_capacity(total_length);
+        out.extend_from_slice(&(total_length as u32).to_be_bytes());
+        out.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        out.extend_from_slice(&crc32(&out).to_be_bytes());
+        out.extend_from_slice(&headers);
+        out.extend_from_slice(payload);
+        out.extend_from_slice(&crc32(&out).to_be_bytes());
+        out
+    }
+
+    fn encode_error_frame(error_code: &str, message: &str) -> Vec<u8> {
+        encode_raw_frame("error", &[(":error-code", error_code)], message.as_bytes())
+    }
+
+    fn encode_exception_frame(exception_type: &str, message: &str) -> Vec<u8> {
+        encode_raw_frame(
+            "exception",
+            &[(":exception-type", exception_type)],
+            message.as_bytes(),
+        )
+    }
+
+    fn aggregate_prepared() -> PreparedRequest {
+        PreparedRequest {
+            body: String::new(),
+            echo_model: "gpt-4o".into(),
+            input_tokens: 1,
+            thinking_enabled: false,
+            tool_name_map: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_aggregate_detects_hard_fault() {
+        let body = [
+            encode_event_frame(
+                "assistantResponseEvent",
+                serde_json::json!({ "content": "partial" }),
+            ),
+            encode_error_frame("InternalServerException", "upstream exploded"),
+        ]
+        .concat();
+
+        let agg = aggregate(&body, &aggregate_prepared());
+        let fault = agg.fault.expect("应检测到流内硬错误");
+        assert_eq!(fault.code, "InternalServerException");
+        assert_eq!(fault.message, "upstream exploded");
+        assert_eq!(agg.text, "partial");
+    }
+
+    #[test]
+    fn test_aggregate_content_length_is_not_fault() {
+        let body = encode_exception_frame("ContentLengthExceededException", "too long");
+
+        let agg = aggregate(&body, &aggregate_prepared());
+        assert!(
+            agg.fault.is_none(),
+            "ContentLengthExceededException 保留 length 语义，不是硬错误"
+        );
+        assert!(agg.length_limited);
+    }
+
+    #[test]
+    fn test_aggregate_without_fault_keeps_success() {
+        let body = encode_event_frame(
+            "assistantResponseEvent",
+            serde_json::json!({ "content": "hello" }),
+        );
+
+        let agg = aggregate(&body, &aggregate_prepared());
+        assert!(agg.fault.is_none());
+        assert_eq!(agg.text, "hello");
     }
 }
 
@@ -1555,6 +1663,10 @@ async fn handle_responses_non_stream(
     };
 
     let agg = aggregate(&body_bytes, &prepared);
+    // 流内硬错误：返回 502 错误信封，替代截断的 200 成功
+    if let Some(fault) = &agg.fault {
+        return OpenAiError::Upstream(fault.client_message()).into_response();
+    }
 
     // thinking 内容不进 output（Responses 无稳定的 reasoning part 契约）
     let text = if prepared.thinking_enabled {
@@ -1672,6 +1784,7 @@ fn estimate_completion_tokens(
     token::estimate_output_tokens(&blocks).max(1)
 }
 
+
 #[cfg(test)]
 mod ws_parity_tests {
     //! 任务 2.3：SSE / WS 事件 parity
@@ -1785,5 +1898,79 @@ mod ws_parity_tests {
             }
             other => panic!("fail 应为 Named 事件，实际: {:?}", other),
         }
+    }
+
+    /// 构造 AWS event-stream 错误/异常帧（测试专用编码器）
+    fn encode_fault_frame(
+        message_type: &str,
+        code_header: &str,
+        code: &str,
+        message: &str,
+    ) -> Bytes {
+        fn push_str_header(buf: &mut Vec<u8>, name: &str, value: &str) {
+            buf.push(name.len() as u8);
+            buf.extend_from_slice(name.as_bytes());
+            buf.push(7); // HeaderValueType::String
+            buf.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            buf.extend_from_slice(value.as_bytes());
+        }
+
+        let mut headers = Vec::new();
+        push_str_header(&mut headers, ":message-type", message_type);
+        push_str_header(&mut headers, code_header, code);
+
+        let payload = message.as_bytes();
+        let total = 12 + headers.len() + payload.len() + 4;
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&(total as u32).to_be_bytes());
+        msg.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        let prelude_crc = crc32(&msg[..8]);
+        msg.extend_from_slice(&prelude_crc.to_be_bytes());
+        msg.extend_from_slice(&headers);
+        msg.extend_from_slice(payload);
+        let message_crc = crc32(&msg);
+        msg.extend_from_slice(&message_crc.to_be_bytes());
+        Bytes::from(msg)
+    }
+
+    /// 流内硬错误经共用事件源产出 response.failed（SSE 与 WS ingress 同路径），
+    /// 且 finish 不再补发 completed（任务 4.2）
+    #[test]
+    fn in_stream_fault_propagates_through_shared_source() {
+        let mut source = test_source();
+        let mut events = source.initial_events();
+        events.extend(source.feed(&encode_frame(
+            "assistantResponseEvent",
+            r#"{"content":"partial"}"#,
+        )));
+        events.extend(source.feed(&encode_fault_frame(
+            "error",
+            ":error-code",
+            "InternalServerException",
+            "upstream exploded",
+        )));
+        events.extend(source.finish());
+
+        let names: Vec<Option<&str>> = events.iter().map(|e| e.event_name()).collect();
+        assert!(names.contains(&Some("response.failed")));
+        assert!(
+            !names.contains(&Some("response.completed")),
+            "硬错误后不得包装成成功终态"
+        );
+
+        let failed = events
+            .iter()
+            .find_map(|e| match e {
+                ResponsesSseEvent::Named { event, data } if event == "response.failed" => {
+                    Some(data.clone())
+                }
+                _ => None,
+            })
+            .expect("应含 response.failed");
+        assert_eq!(failed["response"]["status"], "failed");
+        assert_eq!(
+            failed["response"]["error"]["message"],
+            "Kiro upstream error (InternalServerException): upstream exploded"
+        );
     }
 }

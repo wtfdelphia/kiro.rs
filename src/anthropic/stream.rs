@@ -8,6 +8,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::kiro::model::events::{Event, EventStreamDiagnostics};
+use crate::kiro::stream_fault::{classify_stream_fault, StreamFault, CONTENT_LENGTH_EXCEEDED};
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
@@ -325,6 +326,24 @@ impl SseStateManager {
         self.has_tool_use = has;
     }
 
+    /// 关闭所有已开启未关闭的内容块，返回对应 content_block_stop 事件。
+    pub fn close_open_blocks(&mut self) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        for (index, block) in self.active_blocks.iter_mut() {
+            if block.started && !block.stopped {
+                events.push(SseEvent::new(
+                    "content_block_stop",
+                    json!({
+                        "type": "content_block_stop",
+                        "index": index
+                    }),
+                ));
+                block.stopped = true;
+            }
+        }
+        events
+    }
+
     /// 设置 stop_reason
     pub fn set_stop_reason(&mut self, reason: impl Into<String>) {
         self.stop_reason = Some(reason.into());
@@ -453,21 +472,8 @@ impl SseStateManager {
         input_tokens: i32,
         output_tokens: i32,
     ) -> Vec<SseEvent> {
-        let mut events = Vec::new();
-
         // 关闭所有未关闭的块
-        for (index, block) in self.active_blocks.iter_mut() {
-            if block.started && !block.stopped {
-                events.push(SseEvent::new(
-                    "content_block_stop",
-                    json!({
-                        "type": "content_block_stop",
-                        "index": index
-                    }),
-                ));
-                block.stopped = true;
-            }
-        }
+        let mut events = self.close_open_blocks();
 
         // 发送 message_delta
         if !self.message_delta_sent {
@@ -538,6 +544,8 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// 上游流内硬错误已渲染：抑制后续输出与正常终态事件
+    stream_failed: bool,
     /// Kiro EventStream 脱敏诊断摘要
     diagnostics: EventStreamDiagnostics,
 }
@@ -567,6 +575,7 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            stream_failed: false,
             diagnostics: EventStreamDiagnostics::default(),
         }
     }
@@ -634,6 +643,11 @@ impl StreamContext {
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
         self.diagnostics.observe(event);
 
+        // 硬错误已渲染：后续事件不再产出客户端可见内容
+        if self.stream_failed {
+            return Vec::new();
+        }
+
         match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
@@ -655,26 +669,49 @@ impl StreamContext {
                 );
                 Vec::new()
             }
-            Event::Error {
-                error_code,
-                error_message,
-            } => {
-                tracing::error!("收到错误事件: {} - {}", error_code, error_message);
-                Vec::new()
-            }
             Event::Exception {
                 exception_type,
-                message,
-            } => {
-                // 处理 ContentLengthExceededException
-                if exception_type == "ContentLengthExceededException" {
-                    self.state_manager.set_stop_reason("max_tokens");
-                }
-                tracing::warn!("收到异常事件: {} - {}", exception_type, message);
+                ..
+            } if exception_type == CONTENT_LENGTH_EXCEEDED => {
+                // 保留既有语义：内容超长 → max_tokens，不作为硬错误
+                tracing::warn!("收到异常事件: {}（按 max_tokens 语义处理）", exception_type);
+                self.state_manager.set_stop_reason("max_tokens");
                 Vec::new()
             }
-            _ => Vec::new(),
+            _ => {
+                if let Some(fault) = classify_stream_fault(event) {
+                    self.emit_stream_fault(&fault)
+                } else {
+                    Vec::new()
+                }
+            }
         }
+    }
+
+    /// 渲染流内硬错误：先关闭未闭合内容块，再产出 SSE `error` 事件。
+    ///
+    /// 置位 `stream_failed` 后，后续事件不再产出客户端可见输出，
+    /// `generate_final_events` 也不再产出 `end_turn`/`message_stop` 正常终态，
+    /// 避免把上游错误包装成假成功。
+    fn emit_stream_fault(&mut self, fault: &StreamFault) -> Vec<SseEvent> {
+        self.stream_failed = true;
+        tracing::error!(
+            code = %fault.code,
+            "收到上游流内硬错误，产出协议错误事件: {}",
+            fault.message
+        );
+        let mut events = self.state_manager.close_open_blocks();
+        events.push(SseEvent::new(
+            "error",
+            json!({
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": fault.client_message()
+                }
+            }),
+        ));
+        events
     }
 
     /// 处理助手响应事件
@@ -1063,6 +1100,11 @@ impl StreamContext {
 
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
+        // 硬错误已渲染：不再产出 end_turn/message_stop 正常终态序列
+        if self.stream_failed {
+            self.diagnostics.log_summary("anthropic");
+            return Vec::new();
+        }
         let mut events = Vec::new();
 
         // Flush thinking_buffer 中的剩余内容
@@ -2100,6 +2142,150 @@ mod tests {
         assert_eq!(
             message_delta.data["delta"]["stop_reason"], "tool_use",
             "stop_reason should be tool_use when tool_use is present"
+        );
+    }
+
+    // === 流内硬错误传播（add-stream-error-propagation） ===
+
+    fn kiro_text_event(content: &str) -> Event {
+        let mut payload = crate::kiro::model::events::AssistantResponseEvent::default();
+        payload.content = content.to_string();
+        Event::AssistantResponse(payload)
+    }
+
+    fn kiro_error_event(code: &str, message: &str) -> Event {
+        Event::Error {
+            error_code: code.to_string(),
+            error_message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_stream_fault_after_content_emits_error_and_suppresses_final() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let mut all_events = ctx.generate_initial_events();
+
+        all_events.extend(ctx.process_kiro_event(&kiro_text_event("partial answer")));
+        all_events.extend(ctx.process_kiro_event(&kiro_error_event(
+            "InternalServerException",
+            "upstream exploded",
+        )));
+
+        let err_pos = all_events
+            .iter()
+            .position(|e| e.event == "error")
+            .expect("硬错误应产出 SSE error 事件");
+        let err = &all_events[err_pos];
+        assert_eq!(err.data["error"]["type"], "api_error");
+        assert_eq!(
+            err.data["error"]["message"],
+            "Kiro upstream error (InternalServerException): upstream exploded"
+        );
+        assert!(
+            all_events[..err_pos]
+                .iter()
+                .any(|e| e.event == "content_block_stop"),
+            "error 事件前应先关闭未闭合内容块"
+        );
+
+        let final_events = ctx.generate_final_events();
+        assert!(
+            final_events.is_empty(),
+            "硬错误后 MUST NOT 再产出 end_turn/message_stop 终态"
+        );
+    }
+
+    #[test]
+    fn test_stream_fault_before_any_content() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let mut all_events = ctx.generate_initial_events();
+
+        all_events.extend(ctx.process_kiro_event(&kiro_error_event("BadThing", "boom")));
+
+        assert!(
+            all_events.iter().any(|e| e.event == "error"),
+            "内容前出错也应产出 error 事件"
+        );
+        assert!(ctx.generate_final_events().is_empty());
+    }
+
+    #[test]
+    fn test_stream_fault_first_wins_and_suppresses_later_events() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let first = ctx.process_kiro_event(&kiro_error_event("First", "one"));
+        assert_eq!(first.iter().filter(|e| e.event == "error").count(), 1);
+
+        // 错误后的正常内容与第二个错误都不再产出客户端可见事件
+        assert!(ctx.process_kiro_event(&kiro_text_event("late content")).is_empty());
+        assert!(ctx.process_kiro_event(&kiro_error_event("Second", "two")).is_empty());
+    }
+
+    #[test]
+    fn test_content_length_exception_keeps_max_tokens_semantics() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let mut all_events = ctx.generate_initial_events();
+
+        all_events.extend(ctx.process_kiro_event(&kiro_text_event("x")));
+        all_events.extend(ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ContentLengthExceededException".to_string(),
+            message: "too long".to_string(),
+        }));
+
+        assert!(
+            all_events.iter().all(|e| e.event != "error"),
+            "ContentLengthExceededException 保留 length 语义，不产出 error 事件"
+        );
+        let finals = ctx.generate_final_events();
+        let delta = finals
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("正常终态应保留");
+        assert_eq!(delta.data["delta"]["stop_reason"], "max_tokens");
+    }
+
+    #[test]
+    fn test_buffered_stream_fault_suppresses_final() {
+        let mut ctx = BufferedStreamContext::new("test-model", 1, false, HashMap::new());
+        ctx.process_and_buffer(&kiro_text_event("partial"));
+        ctx.process_and_buffer(&kiro_error_event("ThrottlingException", "slow down"));
+
+        let all = ctx.finish_and_get_all_events();
+        assert!(
+            all.iter().any(|e| e.event == "error"),
+            "缓冲路径同样应产出 error 事件"
+        );
+        assert!(
+            all.iter()
+                .all(|e| e.event != "message_delta" && e.event != "message_stop"),
+            "缓冲路径硬错误后 MUST NOT 产出正常终态"
+        );
+    }
+
+    #[test]
+    fn test_fault_rendering_is_determined_by_code_and_message_only() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let events = ctx.process_kiro_event(&kiro_error_event(
+            "CodeX",
+            "sensitive arn:aws:iam::secret",
+        ));
+        let err = events
+            .iter()
+            .find(|e| e.event == "error")
+            .expect("应产出 error 事件");
+        assert_eq!(
+            err.data,
+            json!({
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": "Kiro upstream error (CodeX): sensitive arn:aws:iam::secret"
+                }
+            }),
+            "错误渲染应完全由上游 code+message 决定，不附带其他上下文"
         );
     }
 }
