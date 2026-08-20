@@ -6,6 +6,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::base::Event;
+use crate::kiro::stream_fault::classify_stream_fault;
 
 /// 请求级事件流诊断聚合器。
 #[derive(Debug, Clone, Default)]
@@ -18,6 +19,8 @@ pub struct EventStreamDiagnostics {
     metering: Option<MeteringDiagnostic>,
     reasoning: ReasoningDiagnostic,
     tool_uses: BTreeMap<String, ToolUseDiagnostic>,
+    /// 流内硬错误按上游 code 计数（不含原始消息）。
+    stream_error_codes: BTreeMap<String, usize>,
 }
 
 /// 可安全序列化/打印的诊断摘要。
@@ -32,6 +35,8 @@ pub struct DiagnosticSummary {
     pub reasoning: ReasoningDiagnostic,
     pub tool_uses: Vec<ToolUseDiagnostic>,
     pub anomalies: Vec<DiagnosticAnomaly>,
+    /// 流内硬错误按上游 code 计数（不含原始消息）。
+    pub stream_error_codes: BTreeMap<String, usize>,
 }
 
 /// 计量诊断元数据。
@@ -134,7 +139,14 @@ impl EventStreamDiagnostics {
                     .or_insert(0) += 1;
                 self.unknown_payload_bytes += payload.len();
             }
-            Event::AssistantResponse(_) | Event::Error { .. } | Event::Exception { .. } => {}
+            Event::Error { .. } | Event::Exception { .. } => {
+                // 只记硬错误 code 与次数；ContentLengthExceededException 保留
+                // length 语义不计数；原始消息不入摘要（安全边界）
+                if let Some(fault) = classify_stream_fault(event) {
+                    *self.stream_error_codes.entry(fault.code).or_insert(0) += 1;
+                }
+            }
+            Event::AssistantResponse(_) => {}
         }
     }
 
@@ -180,6 +192,7 @@ impl EventStreamDiagnostics {
             reasoning: self.reasoning.clone(),
             tool_uses,
             anomalies,
+            stream_error_codes: self.stream_error_codes.clone(),
         }
     }
 
@@ -215,6 +228,7 @@ impl DiagnosticSummary {
             && self.context_usage_percentage.is_none()
             && self.unknown_event_count == 0
             && self.unknown_payload_bytes == 0
+            && self.stream_error_codes.is_empty()
     }
 }
 
@@ -454,5 +468,46 @@ mod tests {
 
         let serialized = serde_json::to_string(&summary).unwrap();
         assert!(!serialized.contains("fixture future payload"));
+    }
+
+    #[test]
+    fn counts_stream_error_codes_without_messages() {
+        let mut diagnostics = EventStreamDiagnostics::default();
+        diagnostics.observe(&Event::Error {
+            error_code: "InternalServerException".to_string(),
+            error_message: "fixture secret message".to_string(),
+        });
+        diagnostics.observe(&Event::Error {
+            error_code: "InternalServerException".to_string(),
+            error_message: "another message".to_string(),
+        });
+        diagnostics.observe(&Event::Exception {
+            exception_type: "ValidationException".to_string(),
+            message: "fixture exception detail".to_string(),
+        });
+
+        let summary = diagnostics.summary();
+        assert_eq!(summary.stream_error_codes["InternalServerException"], 2);
+        assert_eq!(summary.stream_error_codes["ValidationException"], 1);
+
+        let serialized = serde_json::to_string(&summary).unwrap();
+        assert!(!serialized.contains("fixture secret message"));
+        assert!(!serialized.contains("another message"));
+        assert!(!serialized.contains("fixture exception detail"));
+    }
+
+    #[test]
+    fn content_length_exception_not_counted_as_stream_error() {
+        let mut diagnostics = EventStreamDiagnostics::default();
+        diagnostics.observe(&Event::Exception {
+            exception_type: "ContentLengthExceededException".to_string(),
+            message: "too long".to_string(),
+        });
+
+        let summary = diagnostics.summary();
+        assert!(
+            summary.stream_error_codes.is_empty(),
+            "保留 length 语义的异常不是硬错误"
+        );
     }
 }

@@ -75,6 +75,8 @@ pub struct OpenAiStreamContext {
     thinking_done: bool,
     /// 输出文本累计（用于估算 completion_tokens）
     output_text_len: usize,
+    /// 上游流内硬错误已渲染：抑制后续输出与正常收尾序列
+    stream_failed: bool,
     /// Kiro EventStream 脱敏诊断摘要
     diagnostics: EventStreamDiagnostics,
 }
@@ -106,6 +108,7 @@ impl OpenAiStreamContext {
             in_thinking_block: false,
             thinking_done: false,
             output_text_len: 0,
+            stream_failed: false,
             diagnostics: EventStreamDiagnostics::default(),
         }
     }
@@ -144,6 +147,11 @@ impl OpenAiStreamContext {
         let mut out = Vec::new();
         self.diagnostics.observe(event);
 
+        // 硬错误已渲染：后续事件不再产出客户端可见内容
+        if self.stream_failed {
+            return out;
+        }
+
         match event {
             Event::AssistantResponse(resp) => {
                 self.ensure_role(&mut out);
@@ -160,14 +168,37 @@ impl OpenAiStreamContext {
                     self.finish_reason = Some("length".to_string());
                 }
             }
-            Event::Exception { exception_type, .. } => {
-                if exception_type == "ContentLengthExceededException" {
-                    self.finish_reason = Some("length".to_string());
+            Event::Exception { exception_type, .. }
+                if exception_type == crate::kiro::stream_fault::CONTENT_LENGTH_EXCEEDED =>
+            {
+                // 保留既有语义：内容超长 → length，不作为硬错误
+                self.finish_reason = Some("length".to_string());
+            }
+            _ => {
+                if let Some(fault) = crate::kiro::stream_fault::classify_stream_fault(event) {
+                    self.stream_failed = true;
+                    tracing::error!(
+                        code = %fault.code,
+                        "收到上游流内硬错误，产出协议错误 chunk: {}",
+                        fault.message
+                    );
+                    out.push(OpenAiSseChunk::Data(self.error_chunk(&fault)));
+                    out.push(OpenAiSseChunk::Done);
                 }
             }
-            _ => {}
         }
         out
+    }
+
+    /// 硬错误 chunk：空 choices + error 对象（OpenAI 流式错误惯例）
+    fn error_chunk(&self, fault: &crate::kiro::stream_fault::StreamFault) -> Value {
+        let mut chunk = self.envelope(json!([]));
+        chunk["error"] = json!({
+            "message": fault.client_message(),
+            "type": "server_error",
+            "code": fault.code,
+        });
+        chunk
     }
 
     /// 文本增量：分离 thinking 与正文
@@ -324,6 +355,11 @@ impl OpenAiStreamContext {
 
     /// 收尾：finish_reason chunk -> 可选 usage chunk -> [DONE]
     pub fn finish(&mut self) -> Vec<OpenAiSseChunk> {
+        // 硬错误已渲染：错误 chunk 与 [DONE] 已发出，不再产出正常收尾序列
+        if self.stream_failed {
+            self.diagnostics.log_summary("openai-chat");
+            return Vec::new();
+        }
         let mut out = Vec::new();
         self.ensure_role(&mut out);
 
@@ -794,5 +830,118 @@ mod tests {
         let buf = "答案是中文";
         let cut = safe_flush_len(buf, THINKING_OPEN);
         assert!(buf.is_char_boundary(cut));
+    }
+
+    // === 流内硬错误传播（add-stream-error-propagation） ===
+
+    fn kiro_error_event(code: &str, message: &str) -> Event {
+        Event::Error {
+            error_code: code.to_string(),
+            error_message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_fault_emits_error_chunk_then_done() {
+        let mut ctx = new_ctx(false, false);
+        let mut all = ctx.process_kiro_event(&text_event("partial"));
+        all.extend(ctx.process_kiro_event(&kiro_error_event(
+            "InternalServerException",
+            "upstream exploded",
+        )));
+
+        // 错误 chunk：空 choices + error 对象
+        let ds = datas(&all);
+        let err = ds
+            .iter()
+            .find(|d| d.get("error").is_some())
+            .expect("应产出错误 chunk");
+        assert_eq!(err["choices"], json!([]));
+        assert_eq!(err["error"]["type"], "server_error");
+        assert_eq!(err["error"]["code"], "InternalServerException");
+        assert_eq!(
+            err["error"]["message"],
+            "Kiro upstream error (InternalServerException): upstream exploded"
+        );
+        // 错误 chunk 之后紧跟 [DONE]
+        let done_pos = all.iter().position(|c| matches!(c, OpenAiSseChunk::Done));
+        assert!(done_pos.is_some(), "错误 chunk 后应有 [DONE]");
+    }
+
+    #[test]
+    fn test_fault_suppresses_normal_finish() {
+        let mut ctx = new_ctx(false, false);
+        let _ = ctx.process_kiro_event(&kiro_error_event("BadThing", "boom"));
+
+        // finish 不再产出 finish_reason chunk（错误 chunk + DONE 已在 process 时发出）
+        let fin = ctx.finish();
+        assert!(
+            fin.is_empty(),
+            "硬错误后 finish() MUST NOT 产出正常 finish_reason chunk"
+        );
+    }
+
+    #[test]
+    fn test_fault_first_wins_and_suppresses_later_content() {
+        let mut ctx = new_ctx(false, false);
+        let first = ctx.process_kiro_event(&kiro_error_event("First", "one"));
+        let err_count = datas(&first).iter().filter(|d| d.get("error").is_some()).count();
+        assert_eq!(err_count, 1);
+
+        // 错误后的内容与第二个错误都不再产出 chunk
+        assert!(datas(&ctx.process_kiro_event(&text_event("late"))).is_empty());
+        assert!(datas(&ctx.process_kiro_event(&kiro_error_event("Second", "two"))).is_empty());
+    }
+
+    #[test]
+    fn test_content_length_exception_keeps_length_semantics() {
+        let mut ctx = new_ctx(false, false);
+        let mut all = ctx.process_kiro_event(&text_event("x"));
+        all.extend(ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ContentLengthExceededException".to_string(),
+            message: "too long".to_string(),
+        }));
+
+        assert!(
+            datas(&all).iter().all(|d| d.get("error").is_none()),
+            "ContentLengthExceededException 保留 length 语义，不产出错误 chunk"
+        );
+        let fin = ctx.finish();
+        let ds = datas(&fin);
+        let last_data = ds
+            .iter()
+            .find(|d| d["choices"][0].get("finish_reason").is_some())
+            .expect("正常收尾应保留");
+        assert_eq!(last_data["choices"][0]["finish_reason"], "length");
+    }
+
+    /// 任务 5.2：错误渲染只含上游 code+message 与固定文案，
+    /// error 对象不附带任何额外字段（凭据/ARN/请求细节无从注入）
+    #[test]
+    fn test_fault_rendering_exposes_only_code_and_message() {
+        let sensitive = "profile arn:aws:security-profile:::SECRET token=leak";
+        let mut ctx = new_ctx(false, false);
+        let all = ctx.process_kiro_event(&kiro_error_event("AccessDeniedException", sensitive));
+
+        let ds = datas(&all);
+        let err = ds
+            .iter()
+            .find(|d| d.get("error").is_some())
+            .expect("应产出错误 chunk");
+        let error_obj = err["error"].as_object().expect("error 应为对象");
+        let keys: Vec<&String> = error_obj.keys().collect();
+        assert_eq!(
+            keys.len(),
+            3,
+            "error 对象只允许 message/type/code 三个字段，实际: {:?}",
+            keys
+        );
+        assert_eq!(error_obj["type"], "server_error");
+        assert_eq!(error_obj["code"], "AccessDeniedException");
+        // 消息为固定前缀 + 上游 code/message 的精确拼接，无其他拼接物
+        assert_eq!(
+            error_obj["message"],
+            format!("Kiro upstream error (AccessDeniedException): {}", sensitive)
+        );
     }
 }

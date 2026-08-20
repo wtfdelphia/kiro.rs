@@ -691,9 +691,149 @@ async fn handle_non_stream_request(
         }
     };
 
-    // 解析事件流
+    // 解析并聚合事件流（含流内硬错误检测）
+    let aggregation = aggregate_non_stream_events(&body_bytes, model, &tool_name_map);
+
+    // 流内硬错误：返回 502 错误信封，替代截断的 200 成功
+    if let Some(fault) = &aggregation.fault {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new("api_error", fault.client_message())),
+        )
+            .into_response();
+    }
+
+    let NonStreamAggregation {
+        text_content,
+        tool_uses,
+        has_tool_use,
+        mut stop_reason,
+        context_input_tokens,
+        fault: _,
+    } = aggregation;
+
+    // 确定 stop_reason
+    if has_tool_use && stop_reason == "end_turn" {
+        stop_reason = "tool_use".to_string();
+    }
+
+    // 构建响应内容
+    let mut content: Vec<serde_json::Value> = Vec::new();
+
+    if thinking_enabled {
+        // 从完整文本中提取 thinking 块
+        let (thinking, remaining_text) =
+            super::stream::extract_thinking_from_complete_text(&text_content);
+
+        if let Some(thinking_text) = thinking {
+            content.push(json!({
+                "type": "thinking",
+                "thinking": thinking_text
+            }));
+        }
+
+        if !remaining_text.is_empty() {
+            content.push(json!({
+                "type": "text",
+                "text": remaining_text
+            }));
+        }
+    } else if !text_content.is_empty() {
+        content.push(json!({
+            "type": "text",
+            "text": text_content
+        }));
+    }
+
+    content.extend(tool_uses);
+
+    // 估算输出 tokens
+    let output_tokens = token::estimate_output_tokens(&content);
+
+    // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
+    let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+
+    // 构建 Anthropic 响应
+    let response_body = json!({
+        "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+        "type": "message",
+        "role": "assistant",
+        "content": content,
+        "model": model,
+        "stop_reason": stop_reason,
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": final_input_tokens,
+            "output_tokens": output_tokens
+        }
+    });
+
+    (StatusCode::OK, Json(response_body)).into_response()
+}
+
+/// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+///
+/// - Opus 4.6：覆写为 adaptive 类型
+/// - 其他模型：覆写为 enabled 类型
+/// - budget_tokens 固定为 20000
+pub(crate) fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
+    let model_lower = payload.model.to_lowercase();
+    if !model_lower.contains("thinking") {
+        return;
+    }
+
+    let is_adaptive_thinking = (model_lower.contains("opus")
+        && (model_lower.contains("4-6") || model_lower.contains("4.6")))
+        || model_lower.contains("sonnet-5")
+        || model_lower.contains("opus-5");
+
+    let thinking_type = if is_adaptive_thinking {
+        "adaptive"
+    } else {
+        "enabled"
+    };
+
+    tracing::info!(
+        model = %payload.model,
+        thinking_type = thinking_type,
+        "模型名包含 thinking 后缀，覆写 thinking 配置"
+    );
+
+    payload.thinking = Some(Thinking {
+        thinking_type: thinking_type.to_string(),
+        budget_tokens: 20000,
+    });
+
+    if is_adaptive_thinking {
+        payload.output_config = Some(OutputConfig {
+            effort: "high".to_string(),
+        });
+    }
+}
+
+/// 非流式请求的事件流聚合结果
+struct NonStreamAggregation {
+    text_content: String,
+    tool_uses: Vec<serde_json::Value>,
+    has_tool_use: bool,
+    stop_reason: String,
+    /// 从 contextUsageEvent 反算的实际输入 tokens
+    context_input_tokens: Option<i32>,
+    /// 流内硬错误（首个生效）
+    fault: Option<crate::kiro::stream_fault::StreamFault>,
+}
+
+/// 聚合非流式请求的上游事件流，并检测流内硬错误。
+///
+/// 出现硬错误时立即停止聚合：调用方 MUST 返回协议错误信封，
+/// 而不是把截断内容当作成功响应。
+fn aggregate_non_stream_events(
+    body: &[u8],
+    model: &str,
+    tool_name_map: &std::collections::HashMap<String, String>,
+) -> NonStreamAggregation {
     let mut decoder = EventStreamDecoder::new();
-    if let Err(e) = decoder.feed(&body_bytes) {
+    if let Err(e) = decoder.feed(body) {
         tracing::warn!("缓冲区溢出: {}", e);
     }
 
@@ -701,7 +841,6 @@ async fn handle_non_stream_request(
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
-    // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
     let mut diagnostics = EventStreamDiagnostics::default();
 
@@ -712,12 +851,18 @@ async fn handle_non_stream_request(
         std::collections::HashMap::new();
     let mut suppressed_tool_use_ids: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    let mut fault: Option<crate::kiro::stream_fault::StreamFault> = None;
 
     for result in decoder.decode_iter() {
         match result {
             Ok(frame) => {
                 if let Ok(event) = Event::from_frame(frame) {
                     diagnostics.observe(&event);
+
+                    if let Some(f) = crate::kiro::stream_fault::classify_stream_fault(&event) {
+                        fault = Some(f);
+                        break;
+                    }
 
                     match event {
                         Event::AssistantResponse(resp) => {
@@ -821,10 +966,12 @@ async fn handle_non_stream_request(
                                 actual_input_tokens
                             );
                         }
-                        Event::Exception { exception_type, .. } => {
-                            if exception_type == "ContentLengthExceededException" {
-                                stop_reason = "max_tokens".to_string();
-                            }
+                        Event::Exception { exception_type, .. }
+                            if exception_type
+                                == crate::kiro::stream_fault::CONTENT_LENGTH_EXCEEDED =>
+                        {
+                            // 保留既有语义：内容超长 → max_tokens，不作为硬错误
+                            stop_reason = "max_tokens".to_string();
                         }
                         _ => {}
                     }
@@ -837,102 +984,13 @@ async fn handle_non_stream_request(
     }
     diagnostics.log_summary("anthropic-non-stream");
 
-    // 确定 stop_reason
-    if has_tool_use && stop_reason == "end_turn" {
-        stop_reason = "tool_use".to_string();
-    }
-
-    // 构建响应内容
-    let mut content: Vec<serde_json::Value> = Vec::new();
-
-    if thinking_enabled {
-        // 从完整文本中提取 thinking 块
-        let (thinking, remaining_text) =
-            super::stream::extract_thinking_from_complete_text(&text_content);
-
-        if let Some(thinking_text) = thinking {
-            content.push(json!({
-                "type": "thinking",
-                "thinking": thinking_text
-            }));
-        }
-
-        if !remaining_text.is_empty() {
-            content.push(json!({
-                "type": "text",
-                "text": remaining_text
-            }));
-        }
-    } else if !text_content.is_empty() {
-        content.push(json!({
-            "type": "text",
-            "text": text_content
-        }));
-    }
-
-    content.extend(tool_uses);
-
-    // 估算输出 tokens
-    let output_tokens = token::estimate_output_tokens(&content);
-
-    // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-    let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
-
-    // 构建 Anthropic 响应
-    let response_body = json!({
-        "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
-        "type": "message",
-        "role": "assistant",
-        "content": content,
-        "model": model,
-        "stop_reason": stop_reason,
-        "stop_sequence": null,
-        "usage": {
-            "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
-        }
-    });
-
-    (StatusCode::OK, Json(response_body)).into_response()
-}
-
-/// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-///
-/// - Opus 4.6：覆写为 adaptive 类型
-/// - 其他模型：覆写为 enabled 类型
-/// - budget_tokens 固定为 20000
-pub(crate) fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
-    let model_lower = payload.model.to_lowercase();
-    if !model_lower.contains("thinking") {
-        return;
-    }
-
-    let is_adaptive_thinking = (model_lower.contains("opus")
-        && (model_lower.contains("4-6") || model_lower.contains("4.6")))
-        || model_lower.contains("sonnet-5")
-        || model_lower.contains("opus-5");
-
-    let thinking_type = if is_adaptive_thinking {
-        "adaptive"
-    } else {
-        "enabled"
-    };
-
-    tracing::info!(
-        model = %payload.model,
-        thinking_type = thinking_type,
-        "模型名包含 thinking 后缀，覆写 thinking 配置"
-    );
-
-    payload.thinking = Some(Thinking {
-        thinking_type: thinking_type.to_string(),
-        budget_tokens: 20000,
-    });
-
-    if is_adaptive_thinking {
-        payload.output_config = Some(OutputConfig {
-            effort: "high".to_string(),
-        });
+    NonStreamAggregation {
+        text_content,
+        tool_uses,
+        has_tool_use,
+        stop_reason,
+        context_input_tokens,
+        fault,
     }
 }
 
@@ -1235,6 +1293,8 @@ mod tests {
     use super::super::converter::map_model;
     use super::*;
     use crate::kiro::model::available_models::{TokenLimits, UpstreamModelInfo};
+    use crate::kiro::parser::crc::crc32;
+    use std::collections::HashMap;
 
     #[test]
     fn static_fallback_models_has_core_ids() {
@@ -1382,5 +1442,93 @@ mod tests {
     fn models_from_catalog_empty() {
         let policy = ModelResolutionConfig::default();
         assert!(models_from_catalog(&[], &policy).is_empty());
+    }
+
+    // === 非流式聚合的流内硬错误检测（add-stream-error-propagation） ===
+
+    fn encode_string_header(buf: &mut Vec<u8>, name: &str, value: &str) {
+        buf.push(name.len() as u8);
+        buf.extend_from_slice(name.as_bytes());
+        buf.push(7);
+        buf.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        buf.extend_from_slice(value.as_bytes());
+    }
+
+    fn encode_message_frame(message_type: &str, extra_headers: &[(&str, &str)], payload: &[u8]) -> Vec<u8> {
+        let mut headers = Vec::new();
+        encode_string_header(&mut headers, ":message-type", message_type);
+        for (name, value) in extra_headers {
+            encode_string_header(&mut headers, name, value);
+        }
+        let total_length = 12 + headers.len() + payload.len() + 4;
+
+        let mut out = Vec::with_capacity(total_length);
+        out.extend_from_slice(&(total_length as u32).to_be_bytes());
+        out.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        out.extend_from_slice(&crc32(&out).to_be_bytes());
+        out.extend_from_slice(&headers);
+        out.extend_from_slice(payload);
+        out.extend_from_slice(&crc32(&out).to_be_bytes());
+        out
+    }
+
+    fn encode_event_frame(event_type: &str, payload: serde_json::Value) -> Vec<u8> {
+        let payload = serde_json::to_vec(&payload).expect("payload 序列化失败");
+        encode_message_frame("event", &[(":event-type", event_type)], &payload)
+    }
+
+    fn encode_error_frame(error_code: &str, message: &str) -> Vec<u8> {
+        encode_message_frame("error", &[(":error-code", error_code)], message.as_bytes())
+    }
+
+    fn encode_exception_frame(exception_type: &str, message: &str) -> Vec<u8> {
+        encode_message_frame(
+            "exception",
+            &[(":exception-type", exception_type)],
+            message.as_bytes(),
+        )
+    }
+
+    #[test]
+    fn non_stream_aggregation_detects_hard_fault() {
+        let body = [
+            encode_event_frame(
+                "assistantResponseEvent",
+                serde_json::json!({ "content": "partial" }),
+            ),
+            encode_error_frame("InternalServerException", "upstream exploded"),
+        ]
+        .concat();
+
+        let agg = aggregate_non_stream_events(&body, "claude-sonnet-5", &HashMap::new());
+        let fault = agg.fault.expect("应检测到流内硬错误");
+        assert_eq!(fault.code, "InternalServerException");
+        assert_eq!(fault.message, "upstream exploded");
+        assert_eq!(agg.text_content, "partial");
+    }
+
+    #[test]
+    fn non_stream_aggregation_content_length_is_not_fault() {
+        let body = encode_exception_frame("ContentLengthExceededException", "too long");
+
+        let agg = aggregate_non_stream_events(&body, "claude-sonnet-5", &HashMap::new());
+        assert!(
+            agg.fault.is_none(),
+            "ContentLengthExceededException 保留 length 语义，不是硬错误"
+        );
+        assert_eq!(agg.stop_reason, "max_tokens");
+    }
+
+    #[test]
+    fn non_stream_aggregation_without_fault_keeps_success() {
+        let body = encode_event_frame(
+            "assistantResponseEvent",
+            serde_json::json!({ "content": "hello" }),
+        );
+
+        let agg = aggregate_non_stream_events(&body, "claude-sonnet-5", &HashMap::new());
+        assert!(agg.fault.is_none());
+        assert_eq!(agg.text_content, "hello");
+        assert_eq!(agg.stop_reason, "end_turn");
     }
 }

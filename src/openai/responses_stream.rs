@@ -169,6 +169,11 @@ impl ResponsesStreamContext {
         let mut out = Vec::new();
         self.diagnostics.observe(event);
 
+        // 硬错误已渲染：后续事件不再产出客户端可见内容
+        if self.failed {
+            return out;
+        }
+
         match event {
             Event::AssistantResponse(resp) => self.process_text(&resp.content, &mut out),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use, &mut out),
@@ -177,7 +182,16 @@ impl ResponsesStreamContext {
                 self.context_input_tokens =
                     Some((usage.context_usage_percentage * (window as f64) / 100.0) as i32);
             }
-            _ => {}
+            _ => {
+                if let Some(fault) = crate::kiro::stream_fault::classify_stream_fault(event) {
+                    tracing::error!(
+                        code = %fault.code,
+                        "收到上游流内硬错误，产出 response.failed: {}",
+                        fault.message
+                    );
+                    out.extend(self.fail(fault.client_message()));
+                }
+            }
         }
         out
     }
@@ -536,6 +550,10 @@ impl ResponsesStreamContext {
 
     /// 正常收尾：关闭未完成的 item -> completed -> [DONE]
     pub fn finish(&mut self) -> Vec<ResponsesSseEvent> {
+        // 硬错误已渲染：不再补发 completed，避免把失败包装成成功终态
+        if self.failed {
+            return Vec::new();
+        }
         let mut out = Vec::new();
 
         // thinking 缓冲里的正文残留
@@ -1007,6 +1025,149 @@ mod tests {
         assert_eq!(p[0]["response"]["status"], "failed");
         assert_eq!(p[0]["response"]["error"]["type"], "server_error");
         assert_eq!(p[0]["response"]["error"]["message"], "upstream exploded");
+    }
+
+    // === 流内硬错误传播（add-stream-error-propagation） ===
+
+    fn kiro_error_event(code: &str, message: &str) -> Event {
+        Event::Error {
+            error_code: code.to_string(),
+            error_message: message.to_string(),
+        }
+    }
+
+    fn kiro_exception_event(exception_type: &str, message: &str) -> Event {
+        Event::Exception {
+            exception_type: exception_type.to_string(),
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_hard_error_after_content_emits_failed_without_completed() {
+        let mut ctx = new_ctx(false);
+        let mut all = ctx.process_kiro_event(&text_event("partial"));
+        all.extend(ctx.process_kiro_event(&kiro_error_event(
+            "InternalServerException",
+            "upstream exploded",
+        )));
+        let n = names(&all);
+        assert_eq!(
+            n.last().map(String::as_str),
+            Some("response.failed"),
+            "硬错误必须是最后一个事件"
+        );
+        assert!(
+            n.iter().any(|x| x == "response.output_text.delta"),
+            "错误前已产出的内容不被回收"
+        );
+        let failed = payloads(&all)
+            .into_iter()
+            .find(|d| d["type"] == "response.failed")
+            .expect("应含 response.failed");
+        assert_eq!(failed["response"]["status"], "failed");
+        assert_eq!(
+            failed["response"]["error"]["message"],
+            "Kiro upstream error (InternalServerException): upstream exploded"
+        );
+
+        // finish 不再补发 completed，避免把失败包装成成功终态
+        let fin = ctx.finish();
+        assert!(
+            names(&fin).is_empty(),
+            "failed 后 finish 不应产出任何事件，实际: {:?}",
+            names(&fin)
+        );
+    }
+
+    #[test]
+    fn test_hard_error_before_content_emits_failed() {
+        let mut ctx = new_ctx(false);
+        let ev = ctx.process_kiro_event(&kiro_error_event("ThrottlingException", "slow down"));
+        assert_eq!(names(&ev), vec!["response.failed"]);
+        let fin = ctx.finish();
+        assert!(
+            !names(&fin).iter().any(|n| n == "response.completed"),
+            "硬错误后不得出现 response.completed"
+        );
+    }
+
+    #[test]
+    fn test_unmapped_exception_is_hard_error() {
+        let mut ctx = new_ctx(false);
+        let ev =
+            ctx.process_kiro_event(&kiro_exception_event("ValidationException", "bad request"));
+        assert_eq!(names(&ev), vec!["response.failed"]);
+        let p = payloads(&ev);
+        assert_eq!(
+            p[0]["response"]["error"]["message"],
+            "Kiro upstream error (ValidationException): bad request"
+        );
+    }
+
+    #[test]
+    fn test_content_length_exception_keeps_completed_semantics() {
+        let mut ctx = new_ctx(false);
+        let mut all = ctx.process_kiro_event(&text_event("partial"));
+        all.extend(ctx.process_kiro_event(&kiro_exception_event(
+            "ContentLengthExceededException",
+            "too long",
+        )));
+        assert!(
+            names(&all).iter().all(|n| n != "response.failed"),
+            "ContentLengthExceededException 保留 length 语义，不是硬错误"
+        );
+        all.extend(ctx.finish());
+        assert!(
+            names(&all).iter().any(|n| n == "response.completed"),
+            "无硬错误时正常收尾不变"
+        );
+    }
+
+    #[test]
+    fn test_first_fault_wins_subsequent_faults_suppressed() {
+        let mut ctx = new_ctx(false);
+        let first = ctx.process_kiro_event(&kiro_error_event("FirstException", "one"));
+        let second = ctx.process_kiro_event(&kiro_error_event("SecondException", "two"));
+        let late_text = ctx.process_kiro_event(&text_event("late"));
+        assert_eq!(names(&first), vec!["response.failed"]);
+        assert!(second.is_empty(), "后续硬错误仅记录，不再产出事件");
+        assert!(late_text.is_empty(), "失败后内容事件不再产出");
+        let p = payloads(&first);
+        assert!(p[0]["response"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("FirstException"));
+    }
+
+    /// 任务 5.2：failed 事件的 error 对象只含 type/message 两字段，
+    /// message 为固定前缀 + 上游 code/message 的精确拼接，无额外上下文
+    #[test]
+    fn test_fault_rendering_exposes_only_code_and_message() {
+        let sensitive = "profile arn:aws:security-profile:::SECRET cookie=session=leak";
+        let mut ctx = new_ctx(false);
+        let ev =
+            ctx.process_kiro_event(&kiro_error_event("AccessDeniedException", sensitive));
+
+        let failed = payloads(&ev)
+            .into_iter()
+            .find(|d| d["type"] == "response.failed")
+            .expect("应含 response.failed");
+        let error_obj = failed["response"]["error"]
+            .as_object()
+            .expect("error 应为对象");
+        let keys: Vec<&String> = error_obj.keys().collect();
+        assert_eq!(
+            keys.len(),
+            2,
+            "error 对象只允许 type/message 两个字段，实际: {:?}",
+            keys
+        );
+        assert_eq!(error_obj["type"], "server_error");
+        assert_eq!(
+            error_obj["message"],
+            format!("Kiro upstream error (AccessDeniedException): {}", sensitive)
+        );
     }
 
     #[test]
