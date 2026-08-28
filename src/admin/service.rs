@@ -14,11 +14,12 @@ use crate::kiro::token_manager::MultiTokenManager;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, ClientIdentitySettingsResponse,
-    CredentialModelsResponse, CredentialStatusItem, CredentialsStatusResponse,
-    GlobalModelsCatalogResponse, LoadBalancingModeResponse, ModelCatalogItem,
-    ModelsRefreshAllResponse, ModelsRefreshErrorItem, ModelsRefreshResponse,
-    SetLoadBalancingModeRequest, TestCredentialRequest, TestCredentialResponse,
-    UpdateClientIdentitySettingsRequest,
+    CredentialBalanceSnapshot, CredentialFacetsResponse, CredentialModelsResponse,
+    CredentialStatusItem, CredentialsQuery, CredentialsStatusResponse, GlobalModelsCatalogResponse,
+    LoadBalancingModeResponse, ModelCatalogItem, ModelsRefreshAllResponse, ModelsRefreshErrorItem,
+    ModelsRefreshResponse, PageInfo, SetLoadBalancingModeRequest, TestCredentialRequest,
+    TestCredentialResponse, UpdateClientIdentitySettingsRequest, DEFAULT_PER_PAGE, MAX_PER_PAGE,
+    SUBSCRIPTION_TITLE_UNKNOWN,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -96,10 +97,44 @@ impl AdminService {
         self
     }
 
-    /// 获取所有凭据状态
-    pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
+    /// 凭据筛选的可选值
+    ///
+    /// 纯内存聚合，覆盖全量凭据，不受任何筛选参数影响：当前页看不到的取值
+    /// 也要能在筛选栏里选出来。
+    pub fn get_credential_facets(&self) -> CredentialFacetsResponse {
+        let snapshot = self.token_manager.snapshot();
+
+        let mut titles: Vec<String> = snapshot
+            .entries
+            .iter()
+            .filter_map(|e| e.subscription_title.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        titles.sort_unstable();
+
+        let mut methods: Vec<String> = snapshot
+            .entries
+            .iter()
+            .filter_map(|e| e.auth_method.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        methods.sort_unstable();
+
+        CredentialFacetsResponse {
+            subscription_titles: titles,
+            auth_methods: methods,
+        }
+    }
+
+    /// 按筛选条件查询凭据状态
+    pub fn query_credentials(&self, query: &CredentialsQuery) -> CredentialsStatusResponse {
         let snapshot = self.token_manager.snapshot();
         let default_endpoint = self.token_manager.config().default_endpoint.clone();
+        // 一次性取整张余额表，避免逐条加锁；只读缓存，不触发上游查询
+        let balance_cache = self.balance_cache.lock().clone();
+        let now = Utc::now().timestamp() as f64;
 
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
@@ -138,18 +173,30 @@ impl AdminService {
                         .unwrap_or(0),
                     models_updated_at: model_meta.as_ref().and_then(|m| m.updated_at.clone()),
                     models_last_error: model_meta.as_ref().and_then(|m| m.last_error.clone()),
+                    subscription_title: entry.subscription_title,
+                    balance: balance_cache
+                        .get(&entry.id)
+                        .map(|cached| balance_snapshot_from_cache(cached, now)),
                 }
             })
             .collect();
 
-        // 按优先级排序（数字越小优先级越高）
-        credentials.sort_by_key(|c| c.priority);
+        // 严格按「筛选 → 排序 → 切页」处理：先切页会让每页条数与页边界随内容漂移
+        credentials.retain(|c| matches_query(c, query));
+
+        // 按 (优先级, id) 排序：优先级数字越小越优先，同优先级按 id 升序。
+        // id 是分页正确性的前提——只按 priority 排序时同优先级凭据的相对顺序不稳定，
+        // 逐页取回会漏项或重复。
+        credentials.sort_by_key(|c| (c.priority, c.id));
+
+        let page_info = paginate(&mut credentials, query);
 
         CredentialsStatusResponse {
             total: snapshot.total,
             available: snapshot.available,
             current_id: snapshot.current_id,
             credentials,
+            page_info,
         }
     }
 
@@ -1808,12 +1855,137 @@ impl AdminService {
     }
 }
 
+/// 把余额缓存条目转成列表项快照，附带新鲜度信息
+fn balance_snapshot_from_cache(cached: &CachedBalance, now: f64) -> CredentialBalanceSnapshot {
+    let age_secs = (now - cached.cached_at).max(0.0);
+    CredentialBalanceSnapshot {
+        subscription_title: cached.data.subscription_title.clone(),
+        current_usage: cached.data.current_usage,
+        usage_limit: cached.data.usage_limit,
+        remaining: cached.data.remaining,
+        usage_percentage: cached.data.usage_percentage,
+        next_reset_at: cached.data.next_reset_at,
+        cached_at: cached.cached_at,
+        age_secs,
+        stale: age_secs > BALANCE_CACHE_TTL_SECS as f64,
+    }
+}
+
+/// 原地切出请求页，返回分页信息
+///
+/// clamp 只覆盖「类型正确但取值越界」：`page` 小于 1 归 1，`per_page` 非正取默认、
+/// 超上限归 100。`page` 超过末页不算错误，返回空数组即可，客户端据回显的
+/// `page_info` 纠正自身状态。`page` 无上界，偏移量的乘法用 `checked_mul` 兜住溢出。
+fn paginate(credentials: &mut Vec<CredentialStatusItem>, query: &CredentialsQuery) -> PageInfo {
+    let filtered_total = credentials.len();
+
+    let per_page = match query.per_page {
+        Some(v) if v > 0 => v.min(MAX_PER_PAGE),
+        _ => DEFAULT_PER_PAGE,
+    };
+    let page = query.page.unwrap_or(1).max(1);
+
+    // 向上取整；两个操作数都为正，无需处理负数取整方向
+    let total_pages = (filtered_total as i64 + per_page - 1) / per_page;
+    // page 无上界，溢出时取 usize::MAX 让下面走清空分支，而非 wrap 回小偏移量
+    let offset = (page - 1)
+        .checked_mul(per_page)
+        .map_or(usize::MAX, |v| v as usize);
+
+    if offset >= filtered_total {
+        credentials.clear();
+    } else {
+        credentials.drain(..offset);
+        credentials.truncate(per_page as usize);
+    }
+
+    PageInfo {
+        page,
+        per_page,
+        filtered_total,
+        total_pages,
+        has_prev: page > 1,
+        has_next: page < total_pages,
+    }
+}
+
+/// 列表项是否满足筛选条件，各维度之间 AND 组合，缺省维度不参与筛选
+fn matches_query(item: &CredentialStatusItem, query: &CredentialsQuery) -> bool {
+    if let Some(want) = &query.subscription_title {
+        // 哨兵值匹配「未落盘订阅等级」；其余取值精确匹配且大小写不敏感
+        if want == SUBSCRIPTION_TITLE_UNKNOWN {
+            if item.subscription_title.is_some() {
+                return false;
+            }
+        } else {
+            match &item.subscription_title {
+                Some(actual) if actual.eq_ignore_ascii_case(want) => {}
+                _ => return false,
+            }
+        }
+    }
+
+    if let Some(want) = query.disabled {
+        if item.disabled != want {
+            return false;
+        }
+    }
+
+    if let Some(want) = &query.auth_method {
+        match &item.auth_method {
+            Some(actual) if actual.eq_ignore_ascii_case(want) => {}
+            _ => return false,
+        }
+    }
+
+    if let Some(min) = query.priority_min {
+        if item.priority < min {
+            return false;
+        }
+    }
+
+    if let Some(max) = query.priority_max {
+        if item.priority > max {
+            return false;
+        }
+    }
+
+    if let Some(want) = &query.email {
+        let needle = want.to_lowercase();
+        match &item.email {
+            Some(actual) if actual.to_lowercase().contains(&needle) => {}
+            _ => return false,
+        }
+    }
+
+    if let Some(want) = query.has_profile_arn {
+        if item.has_profile_arn != want {
+            return false;
+        }
+    }
+
+    if let Some(want) = &query.id {
+        if !item.id.to_string().contains(want.trim()) {
+            return false;
+        }
+    }
+
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::admin::types::TestCredentialRequest;
     use crate::kiro::model::credentials::KiroCredentials;
     use crate::model::config::Config;
+
+    impl AdminService {
+        /// 不带任何筛选与分页参数的查询（等价于生产上 `GET /credentials` 的裸调用）
+        fn get_all_credentials(&self) -> CredentialsStatusResponse {
+            self.query_credentials(&CredentialsQuery::default())
+        }
+    }
 
     fn manager_with_one() -> Arc<MultiTokenManager> {
         manager_with_config(Config::default())
@@ -1996,6 +2168,681 @@ mod tests {
         assert_eq!(
             status.credentials[0].models_updated_at.as_deref(),
             Some("2026-07-24T00:00:00Z")
+        );
+    }
+
+    /// 往余额缓存里塞一条，`age_secs` 为距今秒数
+    fn seed_balance_cache(service: &AdminService, id: u64, age_secs: f64) {
+        let mut cache = service.balance_cache.lock();
+        cache.insert(
+            id,
+            CachedBalance {
+                cached_at: Utc::now().timestamp() as f64 - age_secs,
+                data: BalanceResponse {
+                    id,
+                    subscription_title: Some("KIRO PRO+".into()),
+                    current_usage: 25.0,
+                    usage_limit: 100.0,
+                    remaining: 75.0,
+                    usage_percentage: 25.0,
+                    next_reset_at: Some(1_800_000_000.0),
+                },
+            },
+        );
+    }
+
+    #[test]
+    fn balance_snapshot_serializes_timestamps_as_numbers() {
+        let service = AdminService::new(manager_with_one(), Vec::<String>::new());
+        seed_balance_cache(&service, 1, 0.0);
+
+        let status = service.get_all_credentials();
+        let json = serde_json::to_value(&status.credentials[0]).unwrap();
+        let balance = json.get("balance").unwrap();
+
+        assert!(balance.get("cachedAt").unwrap().is_number());
+        assert!(balance.get("nextResetAt").unwrap().is_number());
+        assert!(balance.get("ageSecs").unwrap().is_number());
+    }
+
+    #[test]
+    fn credentials_status_omits_balance_without_cache() {
+        let service = AdminService::new(manager_with_one(), Vec::<String>::new());
+        let status = service.get_all_credentials();
+
+        assert!(status.credentials[0].balance.is_none());
+        let json = serde_json::to_string(&status.credentials[0]).unwrap();
+        assert!(!json.contains("balance"));
+    }
+
+    #[test]
+    fn balance_snapshot_stale_flag_follows_ttl() {
+        let fresh = AdminService::new(manager_with_one(), Vec::<String>::new());
+        seed_balance_cache(&fresh, 1, 10.0);
+        let fresh_balance = fresh.get_all_credentials().credentials[0]
+            .balance
+            .clone()
+            .unwrap();
+        assert!(!fresh_balance.stale, "TTL 内不应标记过期");
+        assert!(fresh_balance.age_secs >= 10.0);
+
+        let expired = AdminService::new(manager_with_one(), Vec::<String>::new());
+        seed_balance_cache(&expired, 1, BALANCE_CACHE_TTL_SECS as f64 + 60.0);
+        let expired_balance = expired.get_all_credentials().credentials[0]
+            .balance
+            .clone()
+            .unwrap();
+        assert!(expired_balance.stale, "超过 TTL 应标记过期");
+    }
+
+    #[test]
+    fn credentials_status_does_not_touch_upstream_or_refresh_ttl() {
+        let service = AdminService::new(manager_with_one(), Vec::<String>::new());
+        seed_balance_cache(&service, 1, 120.0);
+        let before = service.balance_cache.lock().get(&1).unwrap().cached_at;
+
+        let first = service.get_all_credentials().credentials[0]
+            .balance
+            .clone()
+            .unwrap();
+        let second = service.get_all_credentials().credentials[0]
+            .balance
+            .clone()
+            .unwrap();
+
+        // 缓存时间戳不被列表请求改写，即列表未走上游刷新路径
+        let after = service.balance_cache.lock().get(&1).unwrap().cached_at;
+        assert_eq!(before, after, "列表请求不得刷新缓存 TTL");
+        assert_eq!(first.cached_at, second.cached_at);
+        assert_eq!(first.current_usage, 25.0);
+        assert!(first.age_secs >= 120.0, "缓存年龄应按真实时间推进");
+    }
+
+    #[test]
+    fn credentials_status_writes_no_disk_and_refreshes_no_token() {
+        // 上游调用会改写 access_token / expires_at 并触发回写，用这两个可观测信号
+        // 替代对 HTTP 层打桩：文件字节与 token 字段都不动，即没走刷新路径。
+        let path =
+            std::env::temp_dir().join(format!("kiro-rs-list-io-{}.json", uuid::Uuid::new_v4()));
+        let mut cred = KiroCredentials::default();
+        cred.refresh_token = Some("a".repeat(150));
+        cred.access_token = Some("stale-access-token".into());
+        // 已过期，正常刷新路径会立刻续期
+        cred.expires_at = Some("2000-01-01T00:00:00Z".into());
+        std::fs::write(&path, "[]").unwrap();
+
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![cred],
+                None,
+                Some(path.clone()),
+                true,
+            )
+            .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::<String>::new());
+        seed_balance_cache(&service, 1, 30.0);
+
+        // 构造阶段补写 id/machineId 时会回写一次，之后把文件改成哨兵内容：
+        // 再比对「字节未变」才有判别力，否则内容相同的二次回写查不出来
+        const SENTINEL: &str = "sentinel-not-valid-json";
+        std::fs::write(&path, SENTINEL).unwrap();
+        let before_expiry = manager.snapshot().entries[0].expires_at.clone();
+
+        for _ in 0..3 {
+            let _ = service.query_credentials(&CredentialsQuery::default());
+        }
+
+        assert_eq!(
+            SENTINEL,
+            std::fs::read_to_string(&path).unwrap(),
+            "列表请求不得回写凭据文件"
+        );
+        assert_eq!(
+            before_expiry,
+            manager.snapshot().entries[0].expires_at,
+            "列表请求不得刷新 token"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 构造 n 条同优先级凭据的 manager（refresh_token 各不相同以通过去重校验）
+    fn manager_with_same_priority(n: usize, priority: u32) -> Arc<MultiTokenManager> {
+        let creds: Vec<KiroCredentials> = (0..n)
+            .map(|i| {
+                let mut c = KiroCredentials::default();
+                c.priority = priority;
+                c.refresh_token = Some(format!("{}{:03}", "a".repeat(147), i));
+                c
+            })
+            .collect();
+        Arc::new(MultiTokenManager::new(Config::default(), creds, None, None, false).unwrap())
+    }
+
+    #[test]
+    fn pagination_stable_across_duplicate_priority() {
+        let service = AdminService::new(manager_with_same_priority(10, 5), Vec::<String>::new());
+        let credentials = service.get_all_credentials().credentials;
+        assert_eq!(credentials.len(), 10);
+
+        // 同优先级下 id 严格升序，即排序是全序而非偏序
+        let ids: Vec<u64> = credentials.iter().map(|c| c.id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted, "同优先级凭据必须按 id 升序");
+
+        // 依次请求全部页，各页 id 集合两两不相交、并集等于全集
+        let per_page = 3;
+        let mut seen = std::collections::HashSet::new();
+        let mut concatenated = Vec::new();
+        let total_pages = service
+            .query_credentials(&page_query(1, per_page))
+            .page_info
+            .total_pages;
+        assert_eq!(total_pages, 4, "10 条按每页 3 条应为 4 页");
+
+        for page in 1..=total_pages {
+            let status = service.query_credentials(&page_query(page, per_page));
+            for id in ids_of(&status) {
+                assert!(seen.insert(id), "id {id} 在多页中重复出现");
+                concatenated.push(id);
+            }
+        }
+
+        assert_eq!(
+            seen,
+            ids.iter().copied().collect::<std::collections::HashSet<_>>(),
+            "逐页取回的并集必须等于全集"
+        );
+        assert_eq!(concatenated, ids, "逐页拼接的顺序必须与全序一致");
+    }
+
+    #[test]
+    fn credential_order_independent_of_request_count() {
+        let service = AdminService::new(manager_with_same_priority(8, 0), Vec::<String>::new());
+
+        let first: Vec<u64> = service
+            .get_all_credentials()
+            .credentials
+            .iter()
+            .map(|c| c.id)
+            .collect();
+        for _ in 0..5 {
+            let again: Vec<u64> = service
+                .get_all_credentials()
+                .credentials
+                .iter()
+                .map(|c| c.id)
+                .collect();
+            assert_eq!(first, again, "同一页重复请求的返回顺序必须完全一致");
+        }
+    }
+
+    /// 构造一条可辨识的凭据；`tag` 只用于让 refresh_token 各不相同以通过去重校验
+    fn cred(
+        id: u64,
+        priority: u32,
+        auth_method: &str,
+        email: Option<&str>,
+        subscription_title: Option<&str>,
+    ) -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.id = Some(id);
+        c.priority = priority;
+        c.auth_method = Some(auth_method.to_string());
+        c.email = email.map(|s| s.to_string());
+        c.subscription_title = subscription_title.map(|s| s.to_string());
+        if auth_method == "api_key" {
+            // 缺 kiroApiKey 的 api_key 凭据会被 manager 自动禁用，会污染 disabled 维度的断言
+            c.kiro_api_key = Some(format!("kiro-test-key-{id}"));
+        } else {
+            c.refresh_token = Some(format!("{}{:03}", "a".repeat(147), id));
+        }
+        c
+    }
+
+    fn service_with(creds: Vec<KiroCredentials>) -> AdminService {
+        let mgr =
+            Arc::new(MultiTokenManager::new(Config::default(), creds, None, None, false).unwrap());
+        AdminService::new(mgr, Vec::<String>::new())
+    }
+
+    /// 混合数据集：覆盖四种 authMethod、禁用与否、有无订阅等级、优先级跨度
+    fn filter_fixture() -> AdminService {
+        let mut disabled = cred(1, 1, "social", Some("Alice@Example.com"), Some("Pro"));
+        disabled.disabled = true;
+        service_with(vec![
+            disabled,
+            cred(2, 3, "idc", Some("bob@example.com"), Some("pro")),
+            cred(12, 5, "external_idp", Some("carol@corp.io"), None),
+            cred(120, 9, "api_key", None, Some("Free")),
+        ])
+    }
+
+    fn ids_of(status: &CredentialsStatusResponse) -> Vec<u64> {
+        status.credentials.iter().map(|c| c.id).collect()
+    }
+
+    #[test]
+    fn filter_by_disabled_only_returns_disabled() {
+        let status = filter_fixture().query_credentials(&CredentialsQuery {
+            disabled: Some(true),
+            ..Default::default()
+        });
+        assert_eq!(ids_of(&status), vec![1]);
+        assert!(status.credentials.iter().all(|c| c.disabled));
+    }
+
+    #[test]
+    fn filter_combines_conditions_with_and() {
+        let status = filter_fixture().query_credentials(&CredentialsQuery {
+            auth_method: Some("idc".into()),
+            disabled: Some(false),
+            priority_min: Some(1),
+            priority_max: Some(5),
+            ..Default::default()
+        });
+        assert_eq!(ids_of(&status), vec![2]);
+    }
+
+    #[test]
+    fn filter_email_is_case_insensitive_substring() {
+        let status = filter_fixture().query_credentials(&CredentialsQuery {
+            email: Some("alice@ex".into()),
+            ..Default::default()
+        });
+        assert_eq!(ids_of(&status), vec![1]);
+    }
+
+    #[test]
+    fn filter_subscription_title_unknown_sentinel() {
+        let status = filter_fixture().query_credentials(&CredentialsQuery {
+            subscription_title: Some(SUBSCRIPTION_TITLE_UNKNOWN.into()),
+            ..Default::default()
+        });
+        assert_eq!(ids_of(&status), vec![12]);
+        assert!(status
+            .credentials
+            .iter()
+            .all(|c| c.subscription_title.is_none()));
+    }
+
+    #[test]
+    fn filter_subscription_title_is_case_insensitive_exact() {
+        let status = filter_fixture().query_credentials(&CredentialsQuery {
+            subscription_title: Some("PRO".into()),
+            ..Default::default()
+        });
+        // 「Pro」与「pro」都命中，「Free」不命中，且不是子串匹配
+        assert_eq!(ids_of(&status), vec![1, 2]);
+    }
+
+    #[test]
+    fn filter_priority_min_leaves_upper_bound_open() {
+        let status = filter_fixture().query_credentials(&CredentialsQuery {
+            priority_min: Some(3),
+            ..Default::default()
+        });
+        assert_eq!(ids_of(&status), vec![2, 12, 120]);
+    }
+
+    #[test]
+    fn filter_id_matches_decimal_substring() {
+        let status = filter_fixture().query_credentials(&CredentialsQuery {
+            id: Some("12".into()),
+            ..Default::default()
+        });
+        assert_eq!(ids_of(&status), vec![12, 120]);
+    }
+
+    #[test]
+    fn filter_external_idp_excludes_idc() {
+        let status = filter_fixture().query_credentials(&CredentialsQuery {
+            auth_method: Some("external_idp".into()),
+            ..Default::default()
+        });
+        assert_eq!(ids_of(&status), vec![12]);
+        assert_eq!(
+            status.credentials[0].auth_method.as_deref(),
+            Some("external_idp")
+        );
+    }
+
+    #[test]
+    fn filter_covers_all_four_auth_methods() {
+        let service = filter_fixture();
+        for (method, want_id) in [
+            ("social", 1),
+            ("idc", 2),
+            ("external_idp", 12),
+            ("api_key", 120),
+        ] {
+            let status = service.query_credentials(&CredentialsQuery {
+                auth_method: Some(method.into()),
+                ..Default::default()
+            });
+            assert_eq!(ids_of(&status), vec![want_id], "authMethod={method}");
+        }
+    }
+
+    #[test]
+    fn filter_has_profile_arn_both_directions() {
+        let mut with_arn = cred(1, 1, "social", None, None);
+        with_arn.profile_arn = Some("arn:aws:codewhisperer:::profile/TEST".into());
+        let service = service_with(vec![with_arn, cred(2, 2, "social", None, None)]);
+
+        let yes = service.query_credentials(&CredentialsQuery {
+            has_profile_arn: Some(true),
+            ..Default::default()
+        });
+        assert_eq!(ids_of(&yes), vec![1]);
+
+        let no = service.query_credentials(&CredentialsQuery {
+            has_profile_arn: Some(false),
+            ..Default::default()
+        });
+        assert_eq!(ids_of(&no), vec![2]);
+    }
+
+    #[test]
+    fn filter_no_match_returns_empty_list() {
+        let status = filter_fixture().query_credentials(&CredentialsQuery {
+            email: Some("nobody@nowhere".into()),
+            ..Default::default()
+        });
+        assert!(status.credentials.is_empty());
+        // total 与 available 是全量口径，不随筛选变化
+        assert_eq!(status.total, 4);
+        assert_eq!(status.available, 3);
+        // filteredTotal 是筛选后口径，无匹配时为 0
+        assert_eq!(status.page_info.filtered_total, 0);
+        assert_eq!(status.page_info.total_pages, 0);
+    }
+
+    #[test]
+    fn facets_dedupe_subscription_titles() {
+        let facets = service_with(vec![
+            cred(1, 1, "social", None, Some("Pro")),
+            cred(2, 2, "social", None, Some("Pro")),
+            cred(3, 3, "social", None, Some("Free")),
+        ])
+        .get_credential_facets();
+        assert_eq!(facets.subscription_titles, vec!["Free", "Pro"]);
+    }
+
+    #[test]
+    fn facets_cover_full_set_not_current_page() {
+        // 当前页（perPage=1）只有 idc，facets 仍需列出全部三种类型
+        let service = service_with(vec![
+            cred(1, 1, "idc", None, None),
+            cred(2, 2, "social", None, None),
+            cred(3, 3, "external_idp", None, None),
+        ]);
+        let page = service.query_credentials(&page_query(1, 1));
+        assert_eq!(
+            page.credentials
+                .iter()
+                .map(|c| c.auth_method.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["idc"]
+        );
+
+        let facets = service.get_credential_facets();
+        assert_eq!(
+            facets.auth_methods,
+            vec!["external_idp", "idc", "social"],
+            "facets 必须覆盖全集"
+        );
+    }
+
+    #[test]
+    fn facets_ignore_credentials_without_subscription_title() {
+        let facets = service_with(vec![
+            cred(1, 1, "social", None, None),
+            cred(2, 2, "social", None, Some("Pro")),
+        ])
+        .get_credential_facets();
+        assert_eq!(facets.subscription_titles, vec!["Pro"]);
+    }
+
+    /// 构造 n 条凭据的 service，priority 依次递增以保证顺序确定
+    fn service_with_n(n: u64) -> AdminService {
+        service_with(
+            (1..=n)
+                .map(|i| cred(i, i as u32, "social", None, None))
+                .collect(),
+        )
+    }
+
+    fn page_query(page: i64, per_page: i64) -> CredentialsQuery {
+        CredentialsQuery {
+            page: Some(page),
+            per_page: Some(per_page),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pagination_defaults_to_first_twelve() {
+        let status = service_with_n(30).query_credentials(&CredentialsQuery::default());
+        assert_eq!(status.credentials.len(), 12);
+        assert_eq!(ids_of(&status), (1..=12).collect::<Vec<u64>>());
+        let p = &status.page_info;
+        assert_eq!((p.page, p.per_page, p.filtered_total, p.total_pages), (1, 12, 30, 3));
+        assert!(!p.has_prev);
+        assert!(p.has_next);
+    }
+
+    #[test]
+    fn pagination_last_page_returns_remainder() {
+        let status = service_with_n(30).query_credentials(&page_query(3, 12));
+        assert_eq!(ids_of(&status), (25..=30).collect::<Vec<u64>>());
+        assert!(status.page_info.has_prev);
+        assert!(!status.page_info.has_next);
+    }
+
+    #[test]
+    fn pagination_middle_page_has_both_neighbours() {
+        // 共 9 页时第 3 页两侧都有邻居，客户端据 totalPages 得出末页为 9
+        let status = service_with_n(108).query_credentials(&page_query(3, 12));
+        let p = &status.page_info;
+        assert_eq!((p.page, p.total_pages), (3, 9));
+        assert!(p.has_prev);
+        assert!(p.has_next);
+    }
+
+    #[test]
+    fn pagination_single_page_has_no_neighbours() {
+        let status = service_with_n(5).query_credentials(&page_query(1, 12));
+        let p = &status.page_info;
+        assert_eq!((p.total_pages, p.filtered_total), (1, 5));
+        assert!(!p.has_prev);
+        assert!(!p.has_next);
+    }
+
+    #[test]
+    fn pagination_per_page_clamped_to_max() {
+        let status = service_with_n(120).query_credentials(&page_query(1, 500));
+        assert_eq!(status.page_info.per_page, MAX_PER_PAGE);
+        assert_eq!(status.credentials.len(), 100);
+    }
+
+    #[test]
+    fn pagination_per_page_zero_falls_back_to_default() {
+        let status = service_with_n(30).query_credentials(&page_query(1, 0));
+        assert_eq!(status.page_info.per_page, DEFAULT_PER_PAGE);
+        assert_eq!(status.credentials.len(), 12);
+
+        // 负值同样取默认，而不是在提取阶段被拒
+        let negative = service_with_n(30).query_credentials(&page_query(1, -5));
+        assert_eq!(negative.page_info.per_page, DEFAULT_PER_PAGE);
+    }
+
+    #[test]
+    fn pagination_page_beyond_last_returns_empty() {
+        let status = service_with_n(30).query_credentials(&page_query(99, 12));
+        assert!(status.credentials.is_empty());
+        let p = &status.page_info;
+        // page 回显请求值 99（它本身合法，只是越界），totalPages 仍为 3
+        assert_eq!((p.page, p.total_pages), (99, 3));
+        assert!(p.has_prev);
+        assert!(!p.has_next);
+    }
+
+    #[test]
+    fn pagination_extreme_page_returns_empty_without_overflow() {
+        // (page - 1) * per_page 会溢出 i64。i64::MAX 在 debug 下曾 panic；
+        // 2^62 + 1 的乘积对 2^64 取模后归零，曾让偏移量 wrap 回 0 而返回满页数据。
+        for page in [i64::MAX, (1i64 << 62) + 1] {
+            let status = service_with_n(30).query_credentials(&page_query(page, 12));
+            assert!(
+                status.credentials.is_empty(),
+                "page={page} 应返回空数组，实得 {} 条",
+                status.credentials.len()
+            );
+            let p = &status.page_info;
+            assert_eq!((p.page, p.total_pages, p.filtered_total), (page, 3, 30));
+            assert!(!p.has_next);
+        }
+    }
+
+    #[test]
+    fn pagination_negative_page_clamped_to_first() {
+        let status = service_with_n(30).query_credentials(&page_query(-1, 12));
+        assert_eq!(status.page_info.page, 1);
+        assert_eq!(ids_of(&status), (1..=12).collect::<Vec<u64>>());
+
+        let zero = service_with_n(30).query_credentials(&page_query(0, 12));
+        assert_eq!(zero.page_info.page, 1);
+    }
+
+    #[test]
+    fn pagination_applies_after_filtering() {
+        // 40 条中 25 条未禁用：筛选后切页，第 2 页取未禁用凭据中的第 11 至 20 条
+        let creds: Vec<KiroCredentials> = (1..=40)
+            .map(|i| {
+                let mut c = cred(i, i as u32, "social", None, None);
+                c.disabled = i > 25;
+                c
+            })
+            .collect();
+        let status = service_with(creds).query_credentials(&CredentialsQuery {
+            disabled: Some(false),
+            page: Some(2),
+            per_page: Some(10),
+            ..Default::default()
+        });
+        assert_eq!(ids_of(&status), (11..=20).collect::<Vec<u64>>());
+        assert_eq!(status.page_info.filtered_total, 25);
+        assert_eq!(status.page_info.total_pages, 3);
+    }
+
+    #[test]
+    fn pagination_zero_credentials() {
+        let status = service_with(vec![]).query_credentials(&CredentialsQuery::default());
+        assert!(status.credentials.is_empty());
+        let p = &status.page_info;
+        assert_eq!((p.filtered_total, p.total_pages), (0, 0));
+        assert!(!p.has_prev);
+        assert!(!p.has_next);
+    }
+
+    #[test]
+    fn filtering_does_not_change_total_or_available() {
+        // 40 条中 25 条未禁用，其中 8 条为 idc
+        let creds: Vec<KiroCredentials> = (1..=40)
+            .map(|i| {
+                let method = if (1..=8).contains(&i) { "idc" } else { "social" };
+                let mut c = cred(i, i as u32, method, None, None);
+                c.disabled = i > 25;
+                c
+            })
+            .collect();
+        let status = service_with(creds).query_credentials(&CredentialsQuery {
+            auth_method: Some("idc".into()),
+            ..Default::default()
+        });
+        assert_eq!(status.total, 40);
+        assert_eq!(status.available, 25);
+        assert_eq!(status.page_info.filtered_total, 8);
+    }
+
+    #[test]
+    fn available_ignores_exhausted_quota() {
+        let service = service_with(vec![cred(1, 1, "social", None, None)]);
+        // 余额缓存显示额度耗尽
+        {
+            let mut cache = service.balance_cache.lock();
+            cache.insert(
+                1,
+                CachedBalance {
+                    cached_at: Utc::now().timestamp() as f64,
+                    data: BalanceResponse {
+                        id: 1,
+                        subscription_title: None,
+                        current_usage: 100.0,
+                        usage_limit: 100.0,
+                        remaining: 0.0,
+                        usage_percentage: 100.0,
+                        next_reset_at: None,
+                    },
+                },
+            );
+        }
+        let status = service.query_credentials(&CredentialsQuery::default());
+        assert_eq!(status.available, 1, "available 只看禁用状态，不看额度");
+    }
+
+    #[test]
+    fn pagination_preserves_item_field_contract() {
+        use crate::kiro::model::available_models::UpstreamModelInfo;
+        let creds: Vec<KiroCredentials> = (1..=5)
+            .map(|i| cred(i, i as u32, "social", None, Some("Pro")))
+            .collect();
+        let mgr =
+            Arc::new(MultiTokenManager::new(Config::default(), creds, None, None, false).unwrap());
+        mgr.test_seed_model_cache(
+            3,
+            vec![UpstreamModelInfo {
+                model_id: "claude-sonnet-4.6".into(),
+                model_name: None,
+                description: None,
+                input_types: vec![],
+                rate_multiplier: None,
+                token_limits: None,
+            }],
+            Some("2026-07-24T00:00:00Z".into()),
+        );
+        let service = AdminService::new(mgr, Vec::<String>::new());
+        seed_balance_cache(&service, 3, 10.0);
+
+        // 第 3 条落在第 2 页（perPage=2 时第 2 页含 id 3、4）
+        let status = service.query_credentials(&page_query(2, 2));
+        let item = status
+            .credentials
+            .iter()
+            .find(|c| c.id == 3)
+            .expect("id 3 应落在第 2 页");
+        assert_eq!(item.model_count, 1);
+        assert_eq!(item.models_updated_at.as_deref(), Some("2026-07-24T00:00:00Z"));
+        assert_eq!(item.subscription_title.as_deref(), Some("Pro"));
+        assert!(item.balance.is_some(), "命中缓存的凭据切页后仍带 balance");
+    }
+
+    #[test]
+    fn credentials_status_carries_subscription_title() {
+        let mut c = KiroCredentials::default();
+        c.refresh_token = Some("a".repeat(150));
+        c.subscription_title = Some("KIRO FREE".into());
+        let mgr =
+            Arc::new(MultiTokenManager::new(Config::default(), vec![c], None, None, false).unwrap());
+        let service = AdminService::new(mgr, Vec::<String>::new());
+
+        let status = service.get_all_credentials();
+        assert_eq!(
+            status.credentials[0].subscription_title.as_deref(),
+            Some("KIRO FREE")
         );
     }
 

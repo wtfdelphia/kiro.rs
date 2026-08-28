@@ -17,11 +17,21 @@ import {
 } from '@/components/ui/dialog'
 import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
 import {
+  formatAuthMethod,
+  formatCacheAge,
+  isProviderRedundant,
+  resolveBalanceView,
+  resolveIdentityName,
+  resolveSubscriptionTitle,
+  shouldShowEndpointBadge,
+} from '@/lib/credential-view'
+import {
   useSetDisabled,
   useSetPriority,
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
+  useDefaultEndpoint,
 } from '@/hooks/use-credentials'
 import { getCredentialBalance, refreshCredentialModels } from '@/api/credentials'
 import { useQueryClient } from '@tanstack/react-query'
@@ -73,6 +83,19 @@ export function CredentialCard({
   const [refreshingModels, setRefreshingModels] = useState(false)
   const [refreshingBalance, setRefreshingBalance] = useState(false)
   const queryClient = useQueryClient()
+
+  const defaultEndpoint = useDefaultEndpoint()
+
+  // 实时查询结果优先于列表内联的余额缓存快照
+  const balanceView = resolveBalanceView(balance, credential.balance)
+  const subscriptionTitle = resolveSubscriptionTitle(
+    balance,
+    credential.subscriptionTitle,
+    credential.balance?.subscriptionTitle
+  )
+  const identityName = resolveIdentityName(credential)
+  const providerRedundant = isProviderRedundant(credential.authMethod, credential.provider)
+  const showEndpointBadge = shouldShowEndpointBadge(credential.endpoint, defaultEndpoint)
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
@@ -205,14 +228,17 @@ export function CredentialCard({
               className="mt-1 shrink-0"
               checked={selected}
               onCheckedChange={onToggleSelect}
+              aria-label={`选择凭据 #${credential.id}`}
             />
             <div className="min-w-0 flex-1 overflow-hidden space-y-1.5">
               <div className="flex items-start gap-2 min-w-0">
-                <CardTitle
-                  className="text-base sm:text-lg font-semibold leading-snug tracking-normal break-all min-w-0 flex-1 overflow-hidden"
-                  title={credential.email || `凭据 #${credential.id}`}
-                >
-                  {credential.email || `凭据 #${credential.id}`}
+                <CardTitle className="text-base sm:text-lg font-semibold leading-snug tracking-normal min-w-0 flex-1 overflow-hidden flex items-baseline gap-1.5">
+                  <span className="min-w-0 truncate" title={identityName}>
+                    {identityName}
+                  </span>
+                  <span className="shrink-0 text-sm font-normal text-muted-foreground">
+                    #{credential.id}
+                  </span>
                 </CardTitle>
                 <div className="flex items-center gap-1.5 shrink-0 pt-0.5">
                   <span className="text-sm text-muted-foreground whitespace-nowrap">启用</span>
@@ -236,13 +262,10 @@ export function CredentialCard({
                 )}
                 {credential.authMethod && (
                   <Badge variant="secondary" className="shrink-0">
-                    {credential.authMethod === 'api_key' ? 'API Key' :
-                     credential.authMethod === 'idc' ? 'IdC' :
-                     credential.authMethod === 'social' ? 'Social' :
-                     credential.authMethod}
+                    {formatAuthMethod(credential.authMethod)}
                   </Badge>
                 )}
-                {credential.provider && (
+                {credential.provider && !providerRedundant && (
                   <Badge
                     variant="outline"
                     className="max-w-full min-w-0 truncate"
@@ -251,7 +274,7 @@ export function CredentialCard({
                     {credential.provider}
                   </Badge>
                 )}
-                {credential.endpoint && (
+                {showEndpointBadge && (
                   <Badge
                     variant="outline"
                     className="max-w-full min-w-0 truncate"
@@ -332,9 +355,11 @@ export function CredentialCard({
             <div>
               <span className="text-muted-foreground">订阅等级：</span>
               <span className="font-medium">
-                {loadingBalance ? (
+                {loadingBalance && !subscriptionTitle ? (
                   <Loader2 className="inline w-3 h-3 animate-spin" />
-                ) : balance?.subscriptionTitle || '未知'}
+                ) : (
+                  subscriptionTitle || '未知等级'
+                )}
               </span>
             </div>
             <div>
@@ -353,19 +378,32 @@ export function CredentialCard({
             )}
             <div className="col-span-2">
               <span className="text-muted-foreground">剩余用量：</span>
-              {loadingBalance ? (
+              {loadingBalance && balanceView.source === 'none' ? (
                 <span className="text-sm ml-1">
                   <Loader2 className="inline w-3 h-3 animate-spin" /> 加载中...
                 </span>
-              ) : balance ? (
-                <span className="font-medium ml-1">
-                  {balance.remaining.toFixed(2)} / {balance.usageLimit.toFixed(2)}
-                  <span className="text-xs text-muted-foreground ml-1">
-                    ({(100 - balance.usagePercentage).toFixed(1)}% 剩余)
-                  </span>
-                </span>
+              ) : balanceView.source === 'none' ? (
+                <span className="text-sm text-muted-foreground ml-1">未查询</span>
               ) : (
-                <span className="text-sm text-muted-foreground ml-1">未知</span>
+                <span
+                  className={
+                    balanceView.source === 'cached' && balanceView.stale
+                      ? 'font-medium ml-1 text-muted-foreground'
+                      : 'font-medium ml-1'
+                  }
+                >
+                  {balanceView.remaining.toFixed(2)} / {balanceView.usageLimit.toFixed(2)}
+                  <span className="text-xs text-muted-foreground ml-1">
+                    ({(100 - balanceView.usagePercentage).toFixed(1)}% 剩余)
+                  </span>
+                  {balanceView.source === 'cached' && (
+                    <span className="text-xs text-muted-foreground ml-1">
+                      {balanceView.stale
+                        ? `· 缓存已过期（${formatCacheAge(balanceView.ageSecs)}）`
+                        : `· 缓存于 ${formatCacheAge(balanceView.ageSecs)}`}
+                    </span>
+                  )}
+                </span>
               )}
             </div>
             {credential.hasProxy && (

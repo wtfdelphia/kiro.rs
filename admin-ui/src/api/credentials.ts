@@ -1,6 +1,8 @@
 import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
+  CredentialFacetsResponse,
+  CredentialsQuery,
   CredentialsStatusResponse,
   BalanceResponse,
   SuccessResponse,
@@ -31,10 +33,44 @@ api.interceptors.request.use((config) => {
   return config
 })
 
-// 获取所有凭据状态
-export async function getCredentials(): Promise<CredentialsStatusResponse> {
-  const { data } = await api.get<CredentialsStatusResponse>('/credentials')
+/**
+ * 获取一页凭据状态。空串与 undefined 一律不下发，避免把「不筛选」表达成
+ * 「筛选空值」。
+ */
+export async function getCredentials(
+  query: CredentialsQuery = {}
+): Promise<CredentialsStatusResponse> {
+  const params: Record<string, string | number | boolean> = {}
+  for (const [key, value] of Object.entries(query)) {
+    if (value === undefined || value === null || value === '') continue
+    params[key] = value as string | number | boolean
+  }
+  const { data } = await api.get<CredentialsStatusResponse>('/credentials', { params })
   return data
+}
+
+/** 筛选可选值（全集去重，纯内存聚合） */
+export async function getCredentialFacets(): Promise<CredentialFacetsResponse> {
+  const { data } = await api.get<CredentialFacetsResponse>('/credentials/facets')
+  return data
+}
+
+/**
+ * 取回全量已禁用凭据的 id，按 `pageInfo.hasNext` 逐页续取。
+ *
+ * 只在执行「清除全部已禁用」时调用：那个操作的语义是全量，靠当前页的
+ * 列表响应会静默退化成只删当页。
+ */
+export async function fetchAllDisabledIds(): Promise<number[]> {
+  const ids: number[] = []
+  let page = 1
+  for (;;) {
+    const data = await getCredentials({ disabled: true, page, perPage: 100 })
+    ids.push(...data.credentials.map((c) => c.id))
+    if (!data.pageInfo.hasNext) break
+    page += 1
+  }
+  return ids
 }
 
 // 设置凭据禁用状态

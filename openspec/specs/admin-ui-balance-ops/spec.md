@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Define how the Admin UI reads credential balance/usage: which paths MUST bypass the Admin balance TTL cache and which MAY read it, how those paths present themselves so operators are not misled about data freshness, and how an optional interval-based refresh polls the current page without stacking rounds or flooding the upstream. Consumes the existing Admin balance endpoint (`GET /api/admin/credentials/{id}/balance`, with `force=true` bypassing the cache). Complements `admin-ui-model-ops`, which owns the per-card balance refresh control.
+Define how the Admin UI reads credential balance/usage: which paths MUST bypass the Admin balance TTL cache and which MAY read it, how those paths present themselves so operators are not misled about data freshness, and how an optional interval-based refresh polls the current page without stacking rounds or flooding the upstream. Also covers the read-only cache snapshot inlined into the credentials list response — a third path that serves first paint without any upstream call — and the lifetime of live query results held by the frontend across pagination. Consumes the existing Admin balance endpoint (`GET /api/admin/credentials/{id}/balance`, with `force=true` bypassing the cache). Complements `admin-ui-model-ops`, which owns the per-card balance refresh control.
 
 ## Requirements
 
@@ -136,3 +136,64 @@ The feature MUST default to off. Every round issues one upstream request per ena
 - **GIVEN** 当前页没有启用状态的凭据
 - **WHEN** 定时刷新的间隔到达
 - **THEN** 本轮 MUST 静默跳过，MUST NOT 报错提示（周期性错误提示无操作价值）
+
+### Requirement: 列表内联余额为只读缓存快照
+
+凭据列表响应中内联的余额信息 SHALL 是余额缓存的只读快照，与操作者主动触发的余额查询是两条独立路径。
+
+- 快照 SHALL 携带 `cachedAt`、`ageSecs`、`stale` 三个字段，使调用方能自行判断新鲜度
+- `cachedAt` SHALL 是 Unix 秒时间戳，与同一结构体内的 `nextResetAt` 采用同一种时间表示。缓存本身以 Unix 秒记录写入时刻，快照不做格式转换
+- 缓存未命中的凭据 SHALL 省略该字段，MUST NOT 用零值或占位数值填充
+- 生成快照 MUST NOT 触发任何上游余额查询，也 MUST NOT 刷新缓存的 TTL
+- 该快照 MUST NOT 参与批量验活的成功判定。验活的口径仍是每个凭据一次带 `force` 的额度查询，缓存命中不得计为验活成功
+- UI 展示快照时 SHALL 显式标注数据来自缓存及其新鲜度，MUST NOT 让操作者把缓存值误认为实时值
+
+这条要求不改变既有的「批量验活必须绕过余额缓存」与「批量余额查询入口不得暗示强制刷新」：内联快照只服务于首屏展示，两处批量操作的请求行为一概不变。
+
+#### Scenario: 列表内联快照不触发上游
+
+- **WHEN** 请求凭据列表且部分凭据有余额缓存
+- **THEN** 响应中带出这些凭据的余额快照，期间不产生任何上游额度查询请求
+
+#### Scenario: 快照携带新鲜度字段
+
+- **WHEN** 某凭据的余额缓存写入于 120 秒前
+- **THEN** 该凭据的快照中 `cachedAt` 为写入时刻的 Unix 秒、`ageSecs` 约为 120、`stale` 为 `false`
+
+#### Scenario: 超过 TTL 的快照标记为过期
+
+- **WHEN** 某凭据的余额缓存年龄超过缓存 TTL
+- **THEN** 快照的 `stale` 为 `true`，数值仍然带出
+
+#### Scenario: 缓存未命中时省略字段
+
+- **WHEN** 某凭据无余额缓存
+- **THEN** 该凭据的响应对象不含余额快照字段，UI 显示「未查询」
+
+#### Scenario: 内联快照不得替代验活
+
+- **WHEN** 操作者对一个有新鲜缓存快照的凭据发起批量验活
+- **THEN** 仍然发出一次带 `force` 的额度查询，验活结论以该请求结果为准
+
+#### Scenario: UI 区分缓存值与实时值
+
+- **WHEN** 卡片展示的用量数值来自内联快照
+- **THEN** 数值旁标注缓存新鲜度；操作者主动查询成功后该标注消失
+
+### Requirement: 前端实时余额结果不因翻页丢弃
+
+前端持有的实时余额查询结果 SHALL 按凭据 id 保留，其存活范围 MUST NOT 被当前页的凭据集合限定。
+
+清理该缓存的判据 SHALL 是「凭据已从系统中删除」，MUST NOT 是「凭据不在当前页响应中」。服务端分页后这两个条件不再等价：翻页会让其他页的凭据暂时不出现在响应里，按后者清理等于每次翻页都丢掉已查到的实时值。
+
+丢弃实时值会让卡片从实时态退回缓存态，与「实时查询成功后新鲜度标注消失」的要求直接冲突：操作者翻页往返一次，刚查到的实时值就变回带新鲜度标注的缓存值。
+
+#### Scenario: 翻页往返后实时值仍在
+
+- **WHEN** 操作者在第 1 页查询某凭据余额成功，翻到第 2 页后翻回第 1 页
+- **THEN** 该凭据仍展示实时结果，MUST NOT 退回缓存态或显示新鲜度标注
+
+#### Scenario: 凭据删除后清理实时值
+
+- **WHEN** 某凭据被删除，后续列表响应中系统内已无该 id
+- **THEN** 其实时余额结果被清理，MUST NOT 残留于界面

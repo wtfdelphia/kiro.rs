@@ -1,5 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
+  getCredentialFacets,
   getCredentials,
   setCredentialDisabled,
   setCredentialPriority,
@@ -11,14 +12,27 @@ import {
   getLoadBalancingMode,
   setLoadBalancingMode,
 } from '@/api/credentials'
-import type { AddCredentialRequest } from '@/types/api'
+import { getEndpointSettings } from '@/api/settings'
+import type { AddCredentialRequest, CredentialsQuery } from '@/types/api'
 
-// 查询凭据列表
-export function useCredentials() {
+/**
+ * 查询一页凭据。`placeholderData` 保留上一次的结果，翻页请求进行中时列表不闪空，
+ * 只是内容暂时还是上一页的。
+ */
+export function useCredentials(query: CredentialsQuery = {}) {
   return useQuery({
-    queryKey: ['credentials'],
-    queryFn: getCredentials,
+    queryKey: ['credentials', query],
+    queryFn: () => getCredentials(query),
     refetchInterval: 30000, // 每 30 秒刷新一次
+    placeholderData: (prev) => prev,
+  })
+}
+
+/** 筛选下拉的可选值，取自全集；取值随凭据增删变化，故不设长 staleTime */
+export function useCredentialFacets() {
+  return useQuery({
+    queryKey: ['credentialFacets'],
+    queryFn: getCredentialFacets,
   })
 }
 
@@ -117,4 +131,19 @@ export function useSetLoadBalancingMode() {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
     },
   })
+}
+
+/**
+ * 当前生效的默认 endpoint，供卡片判断是否渲染 endpoint 徽章。
+ * 每张卡片各调一次，靠 queryKey 去重；取值几乎不变，故长 staleTime。
+ * 请求失败时返回 undefined，调用方据此保守渲染徽章。
+ */
+export function useDefaultEndpoint() {
+  const { data } = useQuery({
+    queryKey: ['endpointSettings'],
+    queryFn: getEndpointSettings,
+    staleTime: 5 * 60 * 1000,
+    retry: false,
+  })
+  return data?.defaultEndpoint
 }

@@ -6,6 +6,39 @@ use crate::kiro::model::credentials::{parse_auth_method, AuthMethod};
 
 // ============ 凭据状态 ============
 
+/// 凭据列表的筛选与分页参数
+///
+/// 各筛选维度之间按 AND 组合，缺省的维度不参与筛选。
+/// `page` 与 `per_page` 用 `i64` 反序列化，让负值能进入 clamp 逻辑，
+/// 而不是在 `Query` 提取阶段就被拒成 400。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialsQuery {
+    /// 订阅等级，精确匹配且大小写不敏感；哨兵值 `__unknown__` 匹配无订阅等级的凭据
+    pub subscription_title: Option<String>,
+    /// 禁用状态，精确匹配
+    pub disabled: Option<bool>,
+    /// 认证方式，精确匹配且大小写不敏感
+    pub auth_method: Option<String>,
+    /// 优先级闭区间下界
+    pub priority_min: Option<u32>,
+    /// 优先级闭区间上界
+    pub priority_max: Option<u32>,
+    /// email 子串，大小写不敏感
+    pub email: Option<String>,
+    /// 是否已解析出 Profile ARN
+    pub has_profile_arn: Option<bool>,
+    /// 对 id 的十进制字符串形式做子串匹配
+    pub id: Option<String>,
+    /// 页码，缺省 1，小于 1 时 clamp 为 1
+    pub page: Option<i64>,
+    /// 每页条数，缺省 12，非正取默认，上限 100
+    pub per_page: Option<i64>,
+}
+
+/// 无订阅等级的哨兵筛选值
+pub const SUBSCRIPTION_TITLE_UNKNOWN: &str = "__unknown__";
+
 /// 所有凭据状态响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -16,9 +49,48 @@ pub struct CredentialsStatusResponse {
     pub available: usize,
     /// 当前活跃凭据 ID
     pub current_id: u64,
-    /// 各凭据状态列表
+    /// 当前页的凭据状态列表
     pub credentials: Vec<CredentialStatusItem>,
+    /// 分页信息，客户端据此导航
+    pub page_info: PageInfo,
 }
+
+/// 分页导航信息
+///
+/// 分页导航所需的全部事实只由这里提供，不额外写 RFC 8288 `Link` 头：
+/// 同一事实两个来源，一旦不一致就无从判断哪个为准。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageInfo {
+    /// 当前页码。小于 1 时回显 clamp 后的 1；越过末页时 clamp 不生效，原样回显请求值
+    pub page: i64,
+    /// 每页条数，回显 clamp 之后的实际取值
+    pub per_page: i64,
+    /// 应用筛选后、切页前的条数
+    pub filtered_total: usize,
+    /// 总页数，筛选后无结果时为 0
+    pub total_pages: i64,
+    /// 是否存在上一页
+    pub has_prev: bool,
+    /// 是否存在下一页
+    pub has_next: bool,
+}
+
+/// 凭据筛选可选值（全集去重，不受任何筛选参数影响）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialFacetsResponse {
+    /// 全量凭据出现过的订阅等级，无订阅等级的凭据不贡献取值
+    pub subscription_titles: Vec<String>,
+    /// 全量凭据出现过的认证方式
+    pub auth_methods: Vec<String>,
+}
+
+/// 分页默认每页条数
+pub const DEFAULT_PER_PAGE: i64 = 12;
+
+/// 分页每页条数上限
+pub const MAX_PER_PAGE: i64 = 100;
 
 /// 单个凭据的状态信息
 #[derive(Debug, Serialize)]
@@ -82,6 +154,40 @@ pub struct CredentialStatusItem {
     /// 最近一次模型刷新错误
     #[serde(skip_serializing_if = "Option::is_none")]
     pub models_last_error: Option<String>,
+    /// 订阅等级（来自凭据落盘值，未知时省略）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_title: Option<String>,
+    /// 余额缓存快照（缓存未命中时省略）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance: Option<CredentialBalanceSnapshot>,
+}
+
+/// 列表项内嵌的余额缓存快照
+///
+/// 只读缓存，不触发上游查询。`cached_at` 与 `next_reset_at` 同为 Unix 秒。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialBalanceSnapshot {
+    /// 缓存写入时附带的订阅等级（可能滞后于凭据落盘值）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_title: Option<String>,
+    /// 已用量
+    pub current_usage: f64,
+    /// 用量上限
+    pub usage_limit: f64,
+    /// 剩余量
+    pub remaining: f64,
+    /// 使用百分比
+    pub usage_percentage: f64,
+    /// 下次重置时间（Unix 秒，未知时省略）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_reset_at: Option<f64>,
+    /// 缓存写入时间（Unix 秒）
+    pub cached_at: f64,
+    /// 缓存年龄（秒）
+    pub age_secs: f64,
+    /// 是否已超过缓存 TTL
+    pub stale: bool,
 }
 
 /// 全局模型 catalog 摘要（Admin）

@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, KeyRound, Boxes, Settings, Plug, Wallet, Timer } from 'lucide-react'
+import { useState, useEffect, useMemo, useRef } from 'react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, KeyRound, Boxes, Settings, Plug, Wallet, Timer, ListChecks } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -16,9 +16,24 @@ import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { OnlineAuthDialog } from '@/components/online-auth-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
-import { getCredentialBalance, forceRefreshToken, refreshAllModels } from '@/api/credentials'
+import { CredentialFilterBar } from '@/components/credential-filter-bar'
+import { PaginationBar } from '@/components/pagination-bar'
+import { useCredentialFacets, useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
+import { getCredentialBalance, forceRefreshToken, refreshAllModels, fetchAllDisabledIds } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
+import {
+  pageSelectionState,
+  toggleCurrentPage,
+  toSelection,
+  type CredentialSelection,
+} from '@/lib/credential-selection'
+import {
+  queryToSearchParams,
+  searchParamsToFilters,
+  searchParamsToPage,
+  searchParamsToPerPage,
+  type CredentialFilters,
+} from '@/lib/credential-query-url'
 import type { BalanceResponse, ModelsRefreshAllResponse } from '@/types/api'
 import { ModelsRefreshResultDialog } from '@/components/models-refresh-result-dialog'
 import { SettingsPanel } from '@/components/settings-panel'
@@ -40,7 +55,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
   const [onlineAuthDialogOpen, setOnlineAuthDialogOpen] = useState(false)
-  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
+  // 选中项携带勾选那一刻的属性快照，跨页仍可判断禁用状态与失败次数
+  const [selected, setSelected] = useState<Map<number, CredentialSelection>>(new Map())
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
   const [verifyProgress, setVerifyProgress] = useState({ current: 0, total: 0 })
@@ -62,8 +78,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [publicApiOpen, setPublicApiOpen] = useState(false)
   const cancelVerifyRef = useRef(false)
-  const [currentPage, setCurrentPage] = useState(1)
-  const itemsPerPage = 12
+  const [clearingAll, setClearingAll] = useState(false)
+  // 筛选与分页状态从 URL 查询串恢复，每页条数缺省时回落本地存储
+  const [filters, setFilters] = useState<CredentialFilters>(() =>
+    searchParamsToFilters(window.location.search)
+  )
+  const [page, setPage] = useState(() => searchParamsToPage(window.location.search))
+  const [perPage, setPerPage] = useState(
+    () => searchParamsToPerPage(window.location.search) ?? storage.getPerPage()
+  )
   const [darkMode, setDarkMode] = useState(() => {
     if (typeof window !== 'undefined') {
       return document.documentElement.classList.contains('dark')
@@ -72,61 +95,60 @@ export function Dashboard({ onLogout }: DashboardProps) {
   })
 
   const queryClient = useQueryClient()
-  const { data, isLoading, error, refetch } = useCredentials()
+  const query = useMemo(() => ({ ...filters, page, perPage }), [filters, page, perPage])
+  const { data, isLoading, isFetching, error, refetch } = useCredentials(query)
+  const { data: facets } = useCredentialFacets()
   const { mutate: deleteCredential } = useDeleteCredential()
   const { mutate: resetFailure } = useResetFailure()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
 
-  // 计算分页
-  const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
-  const startIndex = (currentPage - 1) * itemsPerPage
-  const endIndex = startIndex + itemsPerPage
-  const currentCredentials = data?.credentials.slice(startIndex, endIndex) || []
-  const disabledCredentialCount = data?.credentials.filter(credential => credential.disabled).length || 0
-  const selectedDisabledCount = Array.from(selectedIds).filter(id => {
-    const credential = data?.credentials.find(c => c.id === id)
-    return Boolean(credential?.disabled)
-  }).length
+  // 服务端已切页，这里拿到的就是当前页
+  const currentCredentials = data?.credentials ?? []
+  const pageInfo = data?.pageInfo
+  // 全量已禁用数：两个基数都不受筛选与分页影响，相减即得，不必额外请求
+  const disabledCredentialCount = data ? data.total - data.available : 0
+  const selectedDisabledCount = Array.from(selected.values()).filter(item => item.disabled).length
+  const pageSelection = pageSelectionState(
+    currentCredentials.map(credential => credential.id),
+    selected
+  )
 
-  // 当凭据列表变化时重置到第一页
+  // 筛选与分页状态同步到 URL：用 replaceState，防抖后的连续筛选不该塞满历史栈
   useEffect(() => {
-    setCurrentPage(1)
-  }, [data?.credentials.length])
+    const search = queryToSearchParams(filters, page, perPage)
+    window.history.replaceState(null, '', `${window.location.pathname}?${search}`)
+  }, [filters, page, perPage])
 
-  // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
+  // 总页数因筛选收窄而减少时页码会越界，自动回退末页而不是停在空白页
   useEffect(() => {
-    if (!data?.credentials) {
-      setBalanceMap(new Map())
-      setLoadingBalanceIds(new Set())
-      return
+    if (!pageInfo) return
+    if (pageInfo.totalPages > 0 && page > pageInfo.totalPages) {
+      setPage(pageInfo.totalPages)
     }
+  }, [pageInfo, page])
 
-    const validIds = new Set(data.credentials.map(credential => credential.id))
-
+  // 清理判据是「已从系统删除」而不是「不在当前页」：分页后两者不再等价，
+  // 按后者清理等于每次翻页都丢掉已查到的实时值。
+  const dropCachedBalances = (ids: number[]) => {
+    if (ids.length === 0) return
+    const dropped = new Set(ids)
     setBalanceMap(prev => {
-      const next = new Map<number, BalanceResponse>()
-      prev.forEach((value, id) => {
-        if (validIds.has(id)) {
-          next.set(id, value)
-        }
-      })
+      const next = new Map(prev)
+      dropped.forEach(id => next.delete(id))
       return next.size === prev.size ? prev : next
     })
-
     setLoadingBalanceIds(prev => {
-      if (prev.size === 0) {
-        return prev
-      }
-      const next = new Set<number>()
-      prev.forEach(id => {
-        if (validIds.has(id)) {
-          next.add(id)
-        }
-      })
+      const next = new Set(prev)
+      dropped.forEach(id => next.delete(id))
       return next.size === prev.size ? prev : next
     })
-  }, [data?.credentials])
+    setSelected(prev => {
+      const next = new Map(prev)
+      dropped.forEach(id => next.delete(id))
+      return next.size === prev.size ? prev : next
+    })
+  }
 
   const toggleDarkMode = () => {
     setDarkMode(!darkMode)
@@ -158,54 +180,54 @@ export function Dashboard({ onLogout }: DashboardProps) {
     onLogout()
   }
 
-  // 选择管理
+  // 选择管理：勾选时把判断所需属性一起存下来
   const toggleSelect = (id: number) => {
-    const newSelected = new Set(selectedIds)
-    if (newSelected.has(id)) {
-      newSelected.delete(id)
-    } else {
-      newSelected.add(id)
-    }
-    setSelectedIds(newSelected)
+    const credential = currentCredentials.find(c => c.id === id)
+    setSelected(prev => {
+      const next = new Map(prev)
+      if (next.has(id)) {
+        next.delete(id)
+      } else if (credential) {
+        next.set(id, toSelection(credential))
+      }
+      return next
+    })
+  }
+
+  // 全选只作用于当前页；已全选时再点只取消本页，其他页的已选项不动
+  const toggleSelectCurrentPage = () => {
+    setSelected(prev => toggleCurrentPage(currentCredentials, prev))
   }
 
   const deselectAll = () => {
-    setSelectedIds(new Set())
+    setSelected(new Map())
   }
 
-  // 批量删除（仅删除已禁用项）
-  const handleBatchDelete = async () => {
-    if (selectedIds.size === 0) {
-      toast.error('请先选择要删除的凭据')
-      return
-    }
+  // 改任一筛选条件都回到第 1 页：留在原页码大概率直接越界
+  const handleFiltersChange = (next: CredentialFilters) => {
+    setFilters(next)
+    setPage(1)
+  }
 
-    const disabledIds = Array.from(selectedIds).filter(id => {
-      const credential = data?.credentials.find(c => c.id === id)
-      return Boolean(credential?.disabled)
-    })
+  const handlePerPageChange = (next: number) => {
+    setPerPage(next)
+    storage.setPerPage(next)
+    setPage(1)
+  }
 
-    if (disabledIds.length === 0) {
-      toast.error('选中的凭据中没有已禁用项')
-      return
-    }
-
-    const skippedCount = selectedIds.size - disabledIds.length
-    const skippedText = skippedCount > 0 ? `（将跳过 ${skippedCount} 个未禁用凭据）` : ''
-
-    if (!confirm(`确定要删除 ${disabledIds.length} 个已禁用凭据吗？此操作无法撤销。${skippedText}`)) {
-      return
-    }
-
+  // 逐个删除，顺带记下真正删成功的 id 供缓存清理使用
+  const deleteSequentially = async (ids: number[]) => {
     let successCount = 0
     let failCount = 0
+    const deletedIds: number[] = []
 
-    for (const id of disabledIds) {
+    for (const id of ids) {
       try {
         await new Promise<void>((resolve, reject) => {
           deleteCredential(id, {
             onSuccess: () => {
               successCount++
+              deletedIds.push(id)
               resolve()
             },
             onError: (err) => {
@@ -214,10 +236,39 @@ export function Dashboard({ onLogout }: DashboardProps) {
             }
           })
         })
-      } catch (error) {
+      } catch {
         // 错误已在 onError 中处理
       }
     }
+
+    return { successCount, failCount, deletedIds }
+  }
+
+  // 批量删除（仅删除已禁用项）
+  const handleBatchDelete = async () => {
+    if (selected.size === 0) {
+      toast.error('请先选择要删除的凭据')
+      return
+    }
+
+    const disabledIds = Array.from(selected.values())
+      .filter(item => item.disabled)
+      .map(item => item.id)
+
+    if (disabledIds.length === 0) {
+      toast.error('选中的凭据中没有已禁用项')
+      return
+    }
+
+    const skippedCount = selected.size - disabledIds.length
+    const skippedText = skippedCount > 0 ? `（将跳过 ${skippedCount} 个未禁用凭据）` : ''
+
+    if (!confirm(`确定要删除 ${disabledIds.length} 个已禁用凭据吗？此操作无法撤销。${skippedText}`)) {
+      return
+    }
+
+    const { successCount, failCount, deletedIds } = await deleteSequentially(disabledIds)
+    dropCachedBalances(deletedIds)
 
     const skippedResultText = skippedCount > 0 ? `，已跳过 ${skippedCount} 个未禁用凭据` : ''
 
@@ -232,15 +283,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   // 批量恢复异常
   const handleBatchResetFailure = async () => {
-    if (selectedIds.size === 0) {
+    if (selected.size === 0) {
       toast.error('请先选择要恢复的凭据')
       return
     }
 
-    const failedIds = Array.from(selectedIds).filter(id => {
-      const cred = data?.credentials.find(c => c.id === id)
-      return cred && cred.failureCount > 0
-    })
+    const failedIds = Array.from(selected.values())
+      .filter(item => item.failureCount > 0)
+      .map(item => item.id)
 
     if (failedIds.length === 0) {
       toast.error('选中的凭据中没有失败的凭据')
@@ -280,15 +330,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   // 批量刷新 Token
   const handleBatchForceRefresh = async () => {
-    if (selectedIds.size === 0) {
+    if (selected.size === 0) {
       toast.error('请先选择要刷新的凭据')
       return
     }
 
-    const enabledIds = Array.from(selectedIds).filter(id => {
-      const cred = data?.credentials.find(c => c.id === id)
-      return cred && !cred.disabled
-    })
+    const enabledIds = Array.from(selected.values())
+      .filter(item => !item.disabled)
+      .map(item => item.id)
 
     if (enabledIds.length === 0) {
       toast.error('选中的凭据中没有启用的凭据')
@@ -323,45 +372,36 @@ export function Dashboard({ onLogout }: DashboardProps) {
     deselectAll()
   }
 
-  // 一键清除所有已禁用凭据
+  /**
+   * 一键清除所有已禁用凭据。
+   *
+   * 范围是全量而非当前页：计数用 `total - available`，待删 id 用带
+   * `disabled=true` 的分页查询逐页取回。从 `data.credentials` 过滤会
+   * 让「清除所有」静默退化成「清除本页」。
+   */
   const handleClearAll = async () => {
-    if (!data?.credentials || data.credentials.length === 0) {
-      toast.error('没有可清除的凭据')
-      return
-    }
-
-    const disabledCredentials = data.credentials.filter(credential => credential.disabled)
-
-    if (disabledCredentials.length === 0) {
+    if (disabledCredentialCount === 0) {
       toast.error('没有可清除的已禁用凭据')
       return
     }
 
-    if (!confirm(`确定要清除所有 ${disabledCredentials.length} 个已禁用凭据吗？此操作无法撤销。`)) {
+    if (!confirm(`确定要清除所有 ${disabledCredentialCount} 个已禁用凭据吗？此操作无法撤销。`)) {
       return
     }
 
-    let successCount = 0
-    let failCount = 0
-
-    for (const credential of disabledCredentials) {
-      try {
-        await new Promise<void>((resolve, reject) => {
-          deleteCredential(credential.id, {
-            onSuccess: () => {
-              successCount++
-              resolve()
-            },
-            onError: (err) => {
-              failCount++
-              reject(err)
-            }
-          })
-        })
-      } catch (error) {
-        // 错误已在 onError 中处理
-      }
+    setClearingAll(true)
+    let ids: number[]
+    try {
+      ids = await fetchAllDisabledIds()
+    } catch (error) {
+      setClearingAll(false)
+      toast.error(`获取已禁用凭据列表失败: ${extractErrorMessage(error)}`)
+      return
     }
+
+    const { successCount, failCount, deletedIds } = await deleteSequentially(ids)
+    setClearingAll(false)
+    dropCachedBalances(deletedIds)
 
     if (failCount === 0) {
       toast.success(`成功清除所有 ${successCount} 个已禁用凭据`)
@@ -502,7 +542,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   // 批量验活
   const handleBatchVerify = async () => {
-    if (selectedIds.size === 0) {
+    if (selected.size === 0) {
       toast.error('请先选择要验活的凭据')
       return
     }
@@ -510,7 +550,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     // 初始化状态
     setVerifying(true)
     cancelVerifyRef.current = false
-    const ids = Array.from(selectedIds)
+    const ids = Array.from(selected.keys())
     setVerifyProgress({ current: 0, total: ids.length })
 
     let successCount = 0
@@ -737,9 +777,28 @@ export function Dashboard({ onLogout }: DashboardProps) {
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-4">
               <h2 className="text-xl font-semibold">凭据管理</h2>
-              {selectedIds.size > 0 && (
+              {currentCredentials.length > 0 && (
+                <Button
+                  onClick={toggleSelectCurrentPage}
+                  size="sm"
+                  variant="outline"
+                  aria-pressed={pageSelection === 'all'}
+                  title="全选范围仅限当前页，其他页的已选项不受影响"
+                >
+                  <ListChecks className="h-4 w-4 mr-2" />
+                  {pageSelection === 'all'
+                    ? '取消本页全选'
+                    : pageSelection === 'partial'
+                      ? '本页部分已选，全选本页'
+                      : '全选本页'}
+                </Button>
+              )}
+              {selected.size > 0 && (
                 <div className="flex items-center gap-2">
-                  <Badge variant="secondary">已选择 {selectedIds.size} 个</Badge>
+                  {/* N 是跨页累计，单独给出当前页条数才能看清即将执行的范围 */}
+                  <Badge variant="secondary">
+                    已选 {selected.size} 条 / 当前页 {currentCredentials.length} 条
+                  </Badge>
                   <Button onClick={deselectAll} size="sm" variant="ghost">
                     取消选择
                   </Button>
@@ -747,7 +806,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               )}
             </div>
             <div className="flex gap-2">
-              {selectedIds.size > 0 && (
+              {selected.size > 0 && (
                 <>
                   <Button onClick={handleBatchVerify} size="sm" variant="outline">
                     <CheckCircle2 className="h-4 w-4 mr-2" />
@@ -784,7 +843,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   验活中... {verifyProgress.current}/{verifyProgress.total}
                 </Button>
               )}
-              {data?.credentials && data.credentials.length > 0 && (
+              {currentCredentials.length > 0 && (
                 <Button
                   onClick={handleQueryCurrentPageInfo}
                   size="sm"
@@ -796,7 +855,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   {queryingInfo ? `查询中... ${queryInfoProgress.current}/${queryInfoProgress.total}` : '批量余额/订阅'}
                 </Button>
               )}
-              {data?.credentials && data.credentials.length > 0 && (
+              {currentCredentials.length > 0 && (
                 <div
                   className="flex items-center gap-1.5 rounded-md border px-2 py-1"
                   title="每隔指定秒数强制刷新当前页启用凭据的余额（跳过缓存）。每轮对每个凭据发起一次上游请求，默认关闭"
@@ -832,24 +891,23 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   />
                 </div>
               )}
-              {data?.credentials && data.credentials.length > 0 && (
-                <Button
-                  onClick={handleClearAll}
-                  size="sm"
-                  variant="outline"
-                  className="text-destructive hover:text-destructive"
-                  disabled={disabledCredentialCount === 0}
-                  title={disabledCredentialCount === 0 ? '没有可清除的已禁用凭据' : undefined}
-                >
-                  <Trash2 className="h-4 w-4 mr-2" />
-                  清除已禁用
-                </Button>
-              )}
+              {/* 全量语义的入口，可用性判据取全量已禁用数，不受当前页有无已禁用影响 */}
+              <Button
+                onClick={handleClearAll}
+                size="sm"
+                variant="outline"
+                className="text-destructive hover:text-destructive"
+                disabled={disabledCredentialCount === 0 || clearingAll}
+                title={disabledCredentialCount === 0 ? '没有可清除的已禁用凭据' : `清除全部 ${disabledCredentialCount} 个已禁用凭据`}
+              >
+                <Trash2 className="h-4 w-4 mr-2" />
+                {clearingAll ? '清除中...' : `清除已禁用${disabledCredentialCount > 0 ? ` (${disabledCredentialCount})` : ''}`}
+              </Button>
               <Button
                 onClick={handleRefreshAllModels}
                 size="sm"
                 variant="outline"
-                disabled={refreshingAllModels || !data?.credentials?.length}
+                disabled={refreshingAllModels || !data?.total}
                 title="刷新全部启用凭据的上游模型目录"
               >
                 <Boxes className={`h-4 w-4 mr-2 ${refreshingAllModels ? 'animate-spin' : ''}`} />
@@ -873,21 +931,29 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </Button>
             </div>
           </div>
-          {data?.credentials.length === 0 ? (
+          <CredentialFilterBar filters={filters} onChange={handleFiltersChange} facets={facets} />
+
+          {currentCredentials.length === 0 ? (
             <Card>
               <CardContent className="py-8 text-center text-muted-foreground">
-                暂无凭据
+                {pageInfo && pageInfo.filteredTotal === 0 && data && data.total > 0
+                  ? '没有符合筛选条件的凭据'
+                  : '暂无凭据'}
               </CardContent>
             </Card>
           ) : (
             <>
-              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 [&>*]:min-w-0">
+              {/* 翻页请求进行中只加一层半透明，不清空列表 */}
+              <div
+                className={`grid gap-4 md:grid-cols-2 lg:grid-cols-3 [&>*]:min-w-0 ${isFetching ? 'opacity-60 transition-opacity' : ''}`}
+                aria-busy={isFetching}
+              >
                 {currentCredentials.map((credential) => (
                   <CredentialCard
                     key={credential.id}
                     credential={credential}
                     onViewBalance={handleViewBalance}
-                    selected={selectedIds.has(credential.id)}
+                    selected={selected.has(credential.id)}
                     onToggleSelect={() => toggleSelect(credential.id)}
                     balance={balanceMap.get(credential.id) || null}
                     loadingBalance={loadingBalanceIds.has(credential.id)}
@@ -896,29 +962,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 ))}
               </div>
 
-              {/* 分页控件 */}
-              {totalPages > 1 && (
-                <div className="flex justify-center items-center gap-4 mt-6">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
-                    disabled={currentPage === 1}
-                  >
-                    上一页
-                  </Button>
-                  <span className="text-sm text-muted-foreground">
-                    第 {currentPage} / {totalPages} 页（共 {data?.credentials.length} 个凭据）
-                  </span>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
-                    disabled={currentPage === totalPages}
-                  >
-                    下一页
-                  </Button>
-                </div>
+              {pageInfo && (
+                <PaginationBar
+                  pageInfo={pageInfo}
+                  onPageChange={setPage}
+                  onPerPageChange={handlePerPageChange}
+                />
               )}
             </>
           )}

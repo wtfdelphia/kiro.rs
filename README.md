@@ -775,8 +775,6 @@ Admin `GET /api/admin/public-api` 均由它派生，避免多处手写清单互�
 | `*opus*`（含 4.5/4-5）   | `claude-opus-4.5`   |
 | `*haiku*`                | `claude-haiku-4.5`  |
 
-Sonnet 5 的 thinking 行为与已知限制见 [docs/claude-sonnet-5.md](docs/claude-sonnet-5.md)。
-
 ## Admin（可选）
 
 当 `config.json` 配置了非空 `adminApiKey` 时，会启用：
@@ -785,7 +783,8 @@ Admin API 使用**独立的** `adminApiKey` 认证（不是客户端 `apiKey`）
 
 - **凭据管理**
 
-  - `GET /api/admin/credentials` - 获取所有凭据状态
+  - `GET /api/admin/credentials` - 获取一页凭据状态（支持筛选与分页，见下方说明）
+  - `GET /api/admin/credentials/facets` - 筛选下拉的可选值全集（订阅等级、认证方式）
   - `POST /api/admin/credentials` - 添加新凭据
   - `DELETE /api/admin/credentials/:id` - 删除凭据
   - `POST /api/admin/credentials/import` - 导入单个凭据
@@ -823,6 +822,46 @@ Admin API 使用**独立的** `adminApiKey` 认证（不是客户端 `apiKey`）
   - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）
   - 顶栏入口：「运行时设置」（代理 / 上游端点 / 客户端鉴权 / websearch 开关 / 客户端标识）、「对外 API 端点」（分组端点卡 + 客户端配方 + 一键复制）
   - 列表区「刷新全部模型」；凭据卡片「查看模型 / 刷新模型 / 测试」
+  - 列表区筛选栏（订阅等级 / 认证方式 / 禁用状态 / Profile ARN / 优先级区间 / email / id）与分页控件；筛选与页码同步到 URL 查询串，刷新或把链接发给别人都能还原同一屏
+
+#### 凭据列表的筛选与分页
+
+**破坏性变更**：`GET /api/admin/credentials` 不再一次返回全部凭据，默认只返回第 1 页 12 条。外部消费者需按响应里的 `pageInfo` 逐页取回，或显式指定 `perPage`（上限 100）。
+
+查询参数（全部可选）：
+
+| 参数 | 说明 |
+| --- | --- |
+| `page` | 页码，从 1 起。小于 1 时按 1 处理；超出末页返回 200 与空数组，`pageInfo.page` 原样回显请求值 |
+| `perPage` | 每页条数，默认 12，上限 100 |
+| `subscriptionTitle` | 订阅等级精确匹配（大小写不敏感）；`__unknown__` 匹配无订阅等级的凭据 |
+| `authMethod` | 认证方式精确匹配（`social` / `idc` / `external_idp` / `api_key`） |
+| `disabled` | `true` / `false`，按禁用状态筛选 |
+| `hasProfileArn` | `true` / `false`，按是否有 Profile ARN 筛选 |
+| `priorityMin` / `priorityMax` | 优先级闭区间 |
+| `email` | email 子串匹配，大小写不敏感 |
+| `id` | 对 id 的十进制字符串形式做子串匹配 |
+
+响应新增 `pageInfo`，翻页只看它，没有 `Link` 响应头：
+
+```json
+{
+  "total": 120,
+  "available": 118,
+  "currentId": 3,
+  "credentials": [],
+  "pageInfo": {
+    "page": 1,
+    "perPage": 12,
+    "filteredTotal": 40,
+    "totalPages": 4,
+    "hasPrev": false,
+    "hasNext": true
+  }
+}
+```
+
+`total` 与 `available` 是全量基数，不受筛选与分页影响；`filteredTotal` 是应用筛选后、切页前的条数。要取全量已禁用数，用 `total - available`，不必额外请求。
 
 ## 注意事项
 
