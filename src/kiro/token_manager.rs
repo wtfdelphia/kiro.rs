@@ -755,6 +755,9 @@ pub struct CredentialEntrySnapshot {
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// 订阅等级（额度查询成功且取值变化时回写落盘）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_title: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -2047,6 +2050,7 @@ impl MultiTokenManager {
                         DisabledReason::InvalidConfig => "InvalidConfig",
                     }.to_string()),
                     endpoint: e.credentials.endpoint.clone(),
+                    subscription_title: e.credentials.subscription_title.clone(),
                 })
                 .collect(),
             current_id,
@@ -4330,6 +4334,33 @@ mod tests {
         let snapshot_json = serde_json::to_string(&manager.snapshot()).unwrap();
         assert!(!snapshot_json.to_lowercase().contains("cooldown"));
         assert!(!snapshot_json.to_lowercase().contains("version"));
+    }
+
+    #[test]
+    fn snapshot_carries_subscription_title() {
+        let mut with_title = sample_cred(1);
+        with_title.subscription_title = Some("KIRO PRO+".to_string());
+        let without_title = sample_cred(2);
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![with_title, without_title],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let snapshot = manager.snapshot();
+        let first = snapshot.entries.iter().find(|e| e.priority == 1).unwrap();
+        let second = snapshot.entries.iter().find(|e| e.priority == 2).unwrap();
+
+        assert_eq!(first.subscription_title.as_deref(), Some("KIRO PRO+"));
+        assert!(second.subscription_title.is_none());
+
+        // 缺省时不序列化该键
+        let json = serde_json::to_string(second).unwrap();
+        assert!(!json.contains("subscriptionTitle"));
     }
 
     // ================================================================

@@ -217,14 +217,9 @@ async fn main() {
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 
-            // 创建 Admin UI 路由
-            let admin_ui_app = admin_ui::create_admin_ui_router();
-
             tracing::info!("Admin API 已启用");
             tracing::info!("Admin UI 已启用: /admin");
-            anthropic_app
-                .nest("/api/admin", admin_app)
-                .nest("/admin", admin_ui_app)
+            admin_ui::mount_admin_ui(anthropic_app.nest("/api/admin", admin_app))
         }
     } else {
         anthropic_app

@@ -310,7 +310,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-2xl max-h-[85vh] flex flex-col">
+      <DialogContent className="sm:max-w-2xl max-h-[85vh] flex flex-col overflow-y-visible">
         <DialogHeader>
           <DialogTitle>批量导入凭据</DialogTitle>
         </DialogHeader>

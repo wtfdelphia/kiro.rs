@@ -349,7 +349,7 @@ export function SettingsPanel({ open, onOpenChange }: SettingsPanelProps) {
                   <p className="text-xs text-muted-foreground">
                     passthrough 为预留模式，当前选择后每个 turn 将以 501 响应。
                   </p>
-                  <div className="grid grid-cols-2 gap-2">
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                     <label className="space-y-1 text-xs text-muted-foreground">
                       <span>最大并发连接</span>
                       <Input

@@ -1,0 +1,75 @@
+== 4.1 getUsageLimits ==
+    1a |  403 | #1 无ARN | {"message":"User is not authorized to make this call.","reason":null}
+    1b |  200 | #1 builder占位ARN | KIRO PRO+
+    1c |  403 | #1 social占位ARN | {"message":"The bearer token included in the request is invalid.","reason":null}
+    1e |  403 | #2 无ARN | {"message":"User is not authorized to make this call.","reason":null}
+    1f |  200 | #2 builder占位ARN | KIRO PRO+
+    1d |  200 | #3 无ARN | KIRO FREE
+== 4.2 ListAvailableModels ==
+    2a |  403 | #1 无ARN | {"message":"User is not authorized to make this call.","reason":null}
+    2b |  403 | #1 builder占位ARN | {"message":"User is not authorized to make this call.","reason":null}
+    2c |  200 | #3 无ARN | models:9
+== 4.3 ListAvailableProfiles ==
+    3a |  403 | #1 | {"message":"AWS Builder ID is not supported for this operation.","reason":null}
+    3b |  200 | #3 | {"nextToken":null,"profiles":[]}
+== 4.4 generateAssistantResponse ==
+    4a |  403 | #1 无ARN | {"message":"User is not authorized to make this call.","reason":null}
+    4b |  403 | #1 builder占位ARN | {"message":"User is not authorized to make this call.","reason":null}
+    4c |  403 | #1 social占位ARN | {"message":"The bearer token included in the request is invalid.","reason":null}
+    4d |  200 | #3 无ARN | SSE:ok
+    4e |  200 | #3 无ARN 复验 | SSE:ok
+== 4.5 mcp ==
+    5a |  403 | #1 无ARN | {"message":"User is not authorized to make this call.","reason":null}
+    5b |  403 | #1 请求体带占位ARN | {"message":"User is not authorized to make this call.","reason":null}
+   5c2 |  403 | #1 请求头带占位ARN | {"message":"User is not authorized to make this call.","reason":null}
+    5c |  200 | #3 无ARN | tools:ok
+== 4.6 认证/刷新面（不单独触发，见文档 3.2 日志证据） ==
+     6 | SKIP | IdC/Social 刷新 | 避免额外轮转；以服务日志当日成功记录为证
+== 4.9/4.10 API Key 路径与 token 类型识别 ==
+    7a |  200 | #4 getUsageLimits 无ARN | KIRO PRO+
+    7b |  200 | #4 ListAvailableModels 无ARN | models:ok
+    7c |  200 | #4 generate 无ARN | SSE:ok
+    7d |  200 | #4 mcp | tools:ok
+    7e |  403 | #4 ListAvailableProfiles | {"message":"API key authentication is not supported for this operation.","reason":null}
+    8a |  403 | #4 key 不带tokentype头 | {"message":"The bearer token included in the request is invalid.","reason":null}
+    8b |  403 | #1 accessToken 冒充tokentype头 | {"message":"The bearer token included in the request is invalid.","reason":null}
+    8c |  200 | #4 key + builder占位ARN | models:ok
+    8d |  403 | #4 key + social占位ARN | {"message":"The bearer token included in the request is invalid.","reason":null}
+== 4.7 Kiro Control Plane 管理面 ==
+    9a |  400 | ListApiKeys 无效token | {"__type":"com.amazon.kiro.controlplane#AccessDeniedException","message":"Invalid token"}
+    9d |  200 | #1 ListApiKeys | keys:2
+   10a |  200 | #1 CreateApiKey | {"createdAt": 1787672607.348, "keyId": "kskid_\u2026", "keyPrefix": "ksk_\u2026", "rawKey": "ksk_\u2026"}
+   10b |  200 | rawKey generate | SSE:ok
+   10c |  200 | rawKey ListAvailableModels | models:ok
+   10d |  200 | DeleteApiKey 清理 | {}
+   10e |  200 | 复核已删除 | gone
+== 4.11 Kiro Web 门户面 ==
+   11a |  401 | GetUserInfo 仅Auth头 | f__typex5com.amazon.kirowebportalservice#UnauthorizedExceptiongmessagex Identity provider is required
+   11b |  401 | Usage 仅Auth头 | f__typex5com.amazon.kirowebportalservice#UnauthorizedExceptiongmessagex.Authentication required or profile is invalid.
+   11c |  401 | GetUserInfo Auth头+Idp/UserId cookie | f__typex5com.amazon.kirowebportalservice#UnauthorizedExceptiongmessagex Identity provider is required
+   11h |  200 | GetUserInfo 仅cookie | idp=BuilderId status=Active
+   11f |  401 | GetUserInfo 无token仅Idp cookie | f__typex5com.amazon.kirowebportalservice#UnauthorizedExceptiongmessagex Access token is required
+   11r |  200 | GetUserInfo 空body+cookie | status=Active
+   11g |  401 | GetUserInfo 空body 无cookie | f__typex5com.amazon.kirowebportalservice#UnauthorizedExceptiongmessagex Identity provider is required
+   11i |  200 | Usage 仅cookie | sub=KIRO PRO+
+   11j |  200 | Models 仅cookie | ldefaultModel gmodelIddauto fmodels
+   11l |  401 | GetUserInfo 缺Idp cookie | f__typex5com.amazon.kirowebportalservice#UnauthorizedExceptiongmessagex Identity provider is required
+   11m |  200 | GetUserInfo 无UserId cookie | status=Active
+   11n |  200 | GetUserInfo 无ARN | status=Active
+   11o |  200 | Usage 无ARN | sub=KIRO PRO+
+   11p |  200 | Models 无ARN | ldefaultModel gmodelIddauto fmodels
+   11q |  200 | #3 Social Idp=Social | status=Stale
+== 4.11 CSRF 与操作面探测 ==
+   12a |  400 | ListSpaces body假csrf | f__typex3com.amazon.kirowebportalservice#BadRequestExceptiongmessagevCSRF token is required
+   12b |  401 | ListSpaces 头假csrf | f__typex5com.amazon.kirowebportalservice#UnauthorizedExceptiongmessagerInvalid CSRF token
+   12e |  400 | SendMessage 空body | f__typex-com.amazon.coral.validate#ValidationExceptiongmessagey 3 validation errors detected: Value at 'spaceId' failed to satisfy constrain
+   12f |  400 | SendMessage 带spaceId | f__typex-com.amazon.coral.validate#ValidationExceptiongmessagex 2 validation errors detected: Value at 'contentBlocks' failed to satisfy con
+   12g |  404 | GenerateAssistantResponse | f__typex2com.amazon.coral.service#UnknownOperationException
+   12g |  404 | CreateConversation | f__typex2com.amazon.coral.service#UnknownOperationException
+   12g |  404 | Chat | f__typex2com.amazon.coral.service#UnknownOperationException
+   12g |  404 | GetCsrfToken | f__typex2com.amazon.coral.service#UnknownOperationException
+   12g |  404 | Bootstrap | f__typex2com.amazon.coral.service#UnknownOperationException
+
+== 汇总 ==
+共 61 项；时间 2026-08-25T15:43:59.634657+00:00
+注意：本输出含实时上游响应片段；存档时请确认无敏感值外泄（token/key/邮箱已按前缀脱敏）。
