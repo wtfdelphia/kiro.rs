@@ -136,11 +136,6 @@ OpenSpec 官方 init 已提供：`openspec-propose`、`openspec-apply-change`、
 
 不允许「先随手 `-m` 提上去，再 `--amend` 修文案」。`--amend` 会重写已有提交，在已推送的分支上要么强推要么留下分叉，代价远高于提交前多花一步。
 
-- 生成提交信息、commit message 或 `/commit` 时使用或遵循 `caveman-commit`。
-- 生成前先查看 staged diff；若没有 staged diff，先说明无法从暂存区生成提交信息。
-- 提交信息使用 Conventional Commits，保持短、准、可粘贴；涉及安全、SQL、调度、执行记录、模型执行、发布包、配置外置或 revert 时必须写 body 说明原因和影响。
-- 提交信息的描述内容（subject 摘要与 body）使用中文书写；`<type>(<scope>):` 前缀保持英文，类名、字段名、路径等技术术语保留原文。`caveman-commit` 的英文祈使句摘要要求与本条冲突时，以本条为准。
-
 要点（完整规则见 skill）：
 
 - Conventional Commits：`<type>(<scope>): <祈使式摘要>`，摘要用中文祈使式，代码标识符保持原文
@@ -149,6 +144,15 @@ OpenSpec 官方 init 已提供：`openspec-propose`、`openspec-apply-change`、
 - 正文默认省略，只写非显而易见的 why；breaking change、安全修复、schema 迁移、revert、告警门禁/发布路径/凭据相关改动必须写正文
 - 禁止「本次提交做了 X」式复述、emoji、在正文里叙述 AI 参与过程
 - 提交信息、PR 标题、squash 信息不写 `Assisted-by`、`Co-Authored-By`、`Co-authored-by` 等 AI 归属；真人共同作者的 `Co-authored-by` trailer 按实际协作保留
+
+## 提交粒度
+
+一个 OpenSpec change 一个提交：实现代码、`openspec/changes/<name>/` 工件目录（含归档后路径）、同步的主 specs 一起落库，不把代码与归档工件拆到多个提交。
+
+- 提交时点在 verify、归档、主 specs 同步全部完成之后；`Refs` 指向的归档路径必须存在于同一个提交内，不留悬空引用
+- 一个 change 大到没法原子提交时，拆 change，而不是拆提交
+- 纯 openspec 归拢（多个代码已全部入库的 change 批量归档、批量同步主 specs）可共用一个 `chore(openspec)` 提交
+- 非 OpenSpec 交付物（分析文档、流程规则）不受此条约束，但同样不得混入无关变更的提交
 
 ## README / AGENTS / spec 同步纪律
 
