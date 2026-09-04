@@ -74,7 +74,22 @@ OpenSpec 官方 init 已提供：`openspec-propose`、`openspec-apply-change`、
 | 实现后/审查前 | spec-compliance-check |
 | 归档前 | openspec-verify-change |
 | 最终回复/PR/归档/合并前 | verification-before-completion |
-| 起草提交信息 / PR 标题 / squash 信息 | caveman-commit |
+| 执行 `git commit` / `--amend` / squash 前，以及起草 PR 标题 | caveman-commit |
+| 交付任何 Markdown 文档前 | humanizer-zh |
+
+## 文档去 AI 痕迹（硬性）
+
+所有新增或改写的 Markdown 文档在交付前必须过一遍 `humanizer-zh`（`.codex/skills/humanizer-zh/SKILL.md`，`.claude/skills/` 有等价镜像）。适用范围：`docs/`、`README*.md`、`AGENTS.md`、`CLAUDE.md`、`spec/`、`openspec/changes/<name>/` 下的 proposal 与 design。
+
+重点清理：夸大意义的套话（「标志着」「至关重要的作用」「不断演变的格局」）、三段式强行列举、`-ing` 式肤浅收尾、否定式排比（「不仅……而且……」）、模糊归因（「专家认为」「行业报告显示」）、破折号与粗体滥用、通用积极结论、emoji 装饰。
+
+例外与边界：
+
+- 提交信息、PR 标题、squash 信息走 `caveman-commit`，不走本条
+- `openspec/specs/**/spec.md` 的规范条款保留 MUST / SHALL / SHOULD 原文与编号结构，只清理说明性段落
+- 代码块、命令、配置、表格中的字段名与路径一字不改
+- 技术判断的强度不因「去痕迹」而软化：该说破坏性变更就直说，不改成模糊限定
+- 排查记录、证据清单、结论编号表里的「粗体前缀 + 冒号」是索引结构而非装饰，保留
 
 ## CodeGraph
 
@@ -111,6 +126,20 @@ OpenSpec 官方 init 已提供：`openspec-propose`、`openspec-apply-change`、
 ## 提交信息纪律
 
 提交信息、PR 标题、squash 信息统一走 `caveman-commit` skill（`.codex/skills/caveman-commit/SKILL.md`，`.claude/skills/` 有等价镜像）。客户端不支持 skill 时按该文件规则等价产出。
+
+**门禁时点是执行命令之前，不是事后补救。** 以下命令在跑之前必须已经过 `caveman-commit`：
+
+- `git commit`（含 `-m`、`-F`、走编辑器三种形式）
+- `git commit --amend` 改动信息时
+- squash / `git rebase` 重写信息时
+- `gh pr create` 的标题与 `--body`
+
+不允许「先随手 `-m` 提上去，再 `--amend` 修文案」。`--amend` 会重写已有提交，在已推送的分支上要么强推要么留下分叉，代价远高于提交前多花一步。
+
+- 生成提交信息、commit message 或 `/commit` 时使用或遵循 `caveman-commit`。
+- 生成前先查看 staged diff；若没有 staged diff，先说明无法从暂存区生成提交信息。
+- 提交信息使用 Conventional Commits，保持短、准、可粘贴；涉及安全、SQL、调度、执行记录、模型执行、发布包、配置外置或 revert 时必须写 body 说明原因和影响。
+- 提交信息的描述内容（subject 摘要与 body）使用中文书写；`<type>(<scope>):` 前缀保持英文，类名、字段名、路径等技术术语保留原文。`caveman-commit` 的英文祈使句摘要要求与本条冲突时，以本条为准。
 
 要点（完整规则见 skill）：
 
