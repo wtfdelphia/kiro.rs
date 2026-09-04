@@ -576,24 +576,34 @@ describe('Dashboard 批量操作的跨页判据', () => {
 })
 
 describe('Dashboard 全量已禁用计数与清除', () => {
-  it('当前页无已禁用但全量有时计数仍大于 0，按钮可用', async () => {
+  // 「清除已禁用」收进了「更多操作」溢出菜单，先开菜单再取菜单项。
+  // 幂等：菜单已打开时不再点触发器，否则第二次点击会把菜单关掉
+  async function openClearDisabledItem(user: ReturnType<typeof userEvent.setup>) {
+    if (!screen.queryByRole('menuitem', { name: /清除已禁用/ })) {
+      await user.click(screen.getByRole('button', { name: '更多操作' }))
+    }
+    return await screen.findByRole('menuitem', { name: /清除已禁用/ })
+  }
+
+  it('当前页无已禁用但全量有时计数仍大于 0，菜单项可用', async () => {
     // 已禁用项全在第 3 页，第 1 页一个都没有
     fakeServer(makeMany(30, { disabledIds: [25, 26, 27] }))
-    await renderDashboard()
+    const { user } = await renderDashboard()
     await waitFor(() => expect(pageCheckboxes()).toHaveLength(12))
 
-    expect(pageCheckboxes()).toHaveLength(12)
-    const button = await screen.findByRole('button', { name: /清除已禁用 \(3\)/ })
-    expect(button).toBeEnabled()
+    const item = await openClearDisabledItem(user)
+    expect(item).toHaveAccessibleName('清除已禁用 (3)')
+    expect(item).not.toHaveAttribute('data-disabled')
   })
 
-  it('全量无已禁用时按钮禁用且不带计数', async () => {
+  it('全量无已禁用时菜单项禁用且不带计数', async () => {
     fakeServer(makeMany(30))
-    await renderDashboard()
+    const { user } = await renderDashboard()
     await waitFor(() => expect(pageCheckboxes()).toHaveLength(12))
 
-    const button = screen.getByRole('button', { name: '清除已禁用' })
-    expect(button).toBeDisabled()
+    const item = await openClearDisabledItem(user)
+    expect(item).toHaveAccessibleName('清除已禁用')
+    expect(item).toHaveAttribute('data-disabled')
   })
 
   it('清除已禁用：确认文案与实际删除请求数都等于全量数', async () => {
@@ -601,7 +611,7 @@ describe('Dashboard 全量已禁用计数与清除', () => {
     const { user } = await renderDashboard()
     await waitFor(() => expect(pageCheckboxes()).toHaveLength(12))
 
-    await user.click(await screen.findByRole('button', { name: /清除已禁用 \(3\)/ }))
+    await user.click(await openClearDisabledItem(user))
 
     expect(window.confirm).toHaveBeenCalledWith(
       expect.stringContaining('清除所有 3 个已禁用凭据'),
@@ -620,17 +630,17 @@ describe('Dashboard 全量已禁用计数与清除', () => {
     const { user } = await renderDashboard()
     await waitFor(() => expect(pageCheckboxes()).toHaveLength(12))
 
-    await user.click(await screen.findByRole('button', { name: /清除已禁用 \(3\)/ }))
+    await user.click(await openClearDisabledItem(user))
     await waitFor(() => expect(api.deleteCredential).toHaveBeenCalledTimes(3))
 
     // 服务端侧归零
     await waitFor(() => expect(store.filter((c) => c.disabled)).toHaveLength(0))
     expect(store).toHaveLength(27)
-    // 入口计数与作用范围同源，归零后按钮转为禁用且不带计数
-    await waitFor(() => {
-      const button = screen.getByRole('button', { name: /清除已禁用/ })
-      expect(button).toBeDisabled()
-      expect(button).toHaveAccessibleName('清除已禁用')
+    // 入口计数与作用范围同源，归零后菜单项转为禁用且不带计数
+    await waitFor(async () => {
+      const item = await openClearDisabledItem(user)
+      expect(item).toHaveAccessibleName('清除已禁用')
+      expect(item).toHaveAttribute('data-disabled')
     })
   })
 })
@@ -689,5 +699,154 @@ describe('Dashboard 实时余额缓存清理', () => {
     await waitFor(() => expect(screen.queryByText(/90\.00 \/ 100\.00/)).not.toBeInTheDocument())
     // 选中集合同步清空，已选计数区消失
     await waitFor(() => expect(screen.queryByText(/^已选 /)).not.toBeInTheDocument())
+  })
+})
+
+/**
+ * jsdom 不做布局计算，横向溢出与竖排都观测不到，判据只能是静态类名。
+ * 这几条锁住的是必要条件：多控件横向容器必须允许折行，容器高度必须能随折行增长。
+ */
+describe('Dashboard 横向容器折行', () => {
+  it('凭据管理标题行两层容器都允许折行', async () => {
+    fakeServer(makeMany(3))
+    await renderDashboard()
+
+    const row = screen.getByRole('heading', { name: '凭据管理' }).closest('div')!.parentElement!
+    // justify-between 用来锚定节点身份，确认取到的是标题行而不是某个祖先
+    expect(row.className.split(' ')).toContain('justify-between')
+    expect(row.className.split(' ')).toContain('flex-wrap')
+
+    // 左侧容器装着标题、全选按钮、已选徽标：勾选后子项变多，同样要能折行
+    const left = screen.getByRole('heading', { name: '凭据管理' }).parentElement!
+    expect(left.className.split(' ')).toContain('flex-wrap')
+
+    // 右侧批量操作区：与标题所在的左侧容器同级
+    const actions = row.lastElementChild as HTMLElement
+    expect(actions).not.toBe(row.firstElementChild)
+    expect(actions.className.split(' ')).toContain('flex-wrap')
+  })
+
+  it('全选本页后左侧容器仍允许折行', async () => {
+    fakeServer(makeMany(3))
+    await renderDashboard()
+
+    // 未勾选时左侧只有标题与全选按钮，缺陷要勾选后才暴露
+    await userEvent.click(screen.getByRole('button', { name: /全选本页/ }))
+    await screen.findByText(/已选 3 条/)
+
+    const left = screen.getByRole('heading', { name: '凭据管理' }).parentElement!
+    expect(left.className.split(' ')).toContain('flex-wrap')
+    expect(left.children.length).toBeGreaterThan(2)
+  })
+
+  it('标题与同排按钮等高，换行后不错位', async () => {
+    fakeServer(makeMany(3))
+    await renderDashboard()
+
+    // items-center 只在行内按各自高度居中：h2 默认行高 28px、按钮 36px，
+    // 不换行时看不出，换行后两者错开 4px。leading-9 把 h2 拉到 36px 消掉差值。
+    // jsdom 不算布局，只能锁类名。
+    const heading = screen.getByRole('heading', { name: '凭据管理' })
+    expect(heading.className.split(' ')).toContain('leading-9')
+  })
+
+  it('标题行有框线把整组操作区圈起来', async () => {
+    fakeServer(makeMany(3))
+    await renderDashboard()
+
+    // 从「凭据管理」到「添加凭据」是一整组操作区，框线跟筛选栏一致
+    const row = screen.getByRole('heading', { name: '凭据管理' }).closest('div')!.parentElement!
+    const tokens = row.className.split(' ')
+    expect(tokens).toContain('border')
+    expect(tokens).toContain('rounded-md')
+    expect(screen.getByRole('button', { name: /添加凭据/ }).closest('div')!.parentElement).toBe(row)
+  })
+
+  it('顶栏允许折行且高度可增长', async () => {
+    fakeServer(makeMany(3))
+    await renderDashboard()
+
+    const bar = screen.getByText('Kiro Admin').closest('div')!.parentElement!
+    const tokens = bar.className.split(' ')
+    expect(tokens).toContain('container')
+    expect(tokens).toContain('flex-wrap')
+
+    // min-h-14 而非 h-14：固定高会把折行后的第二行截掉。
+    // 判定必须按空格切分比对完整 token，includes('h-14') 与 /\bh-14\b/ 对 min-h-14 都为真，
+    // 会把正确实现判成失败。
+    expect(tokens).toContain('min-h-14')
+    expect(tokens).not.toContain('h-14')
+
+    const controls = bar.lastElementChild as HTMLElement
+    expect(controls.className.split(' ')).toContain('flex-wrap')
+  })
+})
+
+/**
+ * 选中态的批量操作曾与标题行全局操作挤在同一个右对齐容器里，
+ * 总需求宽度超出容器上限，桌面宽度下折成两三行混排。
+ * 拆出独立的批量工具栏行后，这些判据锁住归属关系：
+ * 批量按钮只出现在工具栏行，标题行不再含批量操作。
+ */
+describe('Dashboard 批量操作工具栏行', () => {
+  const BATCH_NAMES = [/批量验活/, /批量刷新 Token/, /恢复异常/, /批量删除/]
+
+  it('未选中时工具栏行只有批量余额/订阅，无批量操作', async () => {
+    fakeServer(makeMany(3))
+    await renderDashboard()
+
+    const toolbar = await screen.findByRole('toolbar', { name: '批量操作' })
+    expect(within(toolbar).getByRole('button', { name: /批量余额\/订阅/ })).toBeInTheDocument()
+    for (const name of BATCH_NAMES) {
+      expect(within(toolbar).queryByRole('button', { name })).not.toBeInTheDocument()
+    }
+  })
+
+  it('全选后四项批量操作全部落在工具栏行，不进标题行', async () => {
+    fakeServer(makeMany(3))
+    const { user } = await renderDashboard()
+    await user.click(screen.getByRole('button', { name: /全选本页/ }))
+    await screen.findByText(/已选 3 条/)
+
+    const toolbar = screen.getByRole('toolbar', { name: '批量操作' })
+    for (const name of BATCH_NAMES) {
+      expect(within(toolbar).getByRole('button', { name })).toBeInTheDocument()
+    }
+
+    // 标题行（锚定：含 justify-between 的框线行）内不再有批量按钮
+    const row = screen.getByRole('heading', { name: '凭据管理' }).closest('div')!.parentElement!
+    for (const name of BATCH_NAMES) {
+      expect(within(row).queryByRole('button', { name })).not.toBeInTheDocument()
+    }
+  })
+})
+
+/**
+ * 低频操作收进「更多操作」溢出菜单是标题行收窄到单行的前提。
+ * 断言菜单内容构成，防止有人把批量按钮塞回标题行后这里漏删。
+ */
+describe('Dashboard 更多操作溢出菜单', () => {
+  const MENU_ITEMS = [
+    'Kiro Account Manager 导入',
+    '批量导入',
+    '在线授权',
+    '刷新全部模型',
+    /清除已禁用/,
+  ]
+
+  it('低频导入与维护操作都在菜单内，标题行可见按钮不含它们', async () => {
+    fakeServer(makeMany(3, { disabledIds: [3] }))
+    const { user } = await renderDashboard()
+
+    // 标题行里不再渲染这些入口的按钮形态
+    const row = screen.getByRole('heading', { name: '凭据管理' }).closest('div')!.parentElement!
+    expect(within(row).queryByRole('button', { name: /Kiro Account Manager/ })).not.toBeInTheDocument()
+    expect(within(row).queryByRole('button', { name: '批量导入' })).not.toBeInTheDocument()
+    expect(within(row).queryByRole('button', { name: '在线授权' })).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: '更多操作' }))
+    for (const name of MENU_ITEMS) {
+      expect(await screen.findByRole('menuitem', { name })).toBeInTheDocument()
+    }
   })
 })

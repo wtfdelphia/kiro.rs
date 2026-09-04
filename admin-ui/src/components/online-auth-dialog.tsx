@@ -233,7 +233,7 @@ export function OnlineAuthDialog({ open, onOpenChange }: OnlineAuthDialogProps) 
         if (!v) resetAll()
       }}
     >
-      <DialogContent className="sm:max-w-lg max-h-[85vh] flex flex-col">
+      <DialogContent className="sm:max-w-lg max-h-[85vh] flex flex-col overflow-y-visible">
         <DialogHeader>
           <DialogTitle>在线授权添加账号</DialogTitle>
         </DialogHeader>

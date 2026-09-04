@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, KeyRound, Boxes, Settings, Plug, Wallet, Timer, ListChecks } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, KeyRound, Boxes, Settings, Plug, Wallet, Timer, ListChecks, MoreHorizontal } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -38,6 +38,13 @@ import type { BalanceResponse, ModelsRefreshAllResponse } from '@/types/api'
 import { ModelsRefreshResultDialog } from '@/components/models-refresh-result-dialog'
 import { SettingsPanel } from '@/components/settings-panel'
 import { PublicApiPanel } from '@/components/public-api-panel'
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+} from '@/components/ui/dropdown-menu'
 
 interface DashboardProps {
   onLogout: () => void
@@ -699,12 +706,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
     <div className="min-h-screen bg-background">
       {/* 顶部导航 */}
       <header className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-        <div className="container flex h-14 items-center justify-between px-4 md:px-8">
+        <div className="container flex min-h-14 flex-wrap items-center justify-between gap-y-2 px-4 md:px-8">
           <div className="flex items-center gap-2">
             <Server className="h-5 w-5" />
             <span className="font-semibold">Kiro Admin</span>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center justify-end gap-2">
             <Button
               variant="outline"
               size="sm"
@@ -774,9 +781,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
         {/* 凭据列表 */}
         <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
-              <h2 className="text-xl font-semibold">凭据管理</h2>
+          {/* 框线对齐筛选栏：标题到「添加凭据」是一整组操作区，圈起来才能跟下方列表分开 */}
+          <div className="flex flex-wrap items-center justify-between gap-y-2 rounded-md border p-3">
+            {/* 勾选后子项从 2 个涨到 3 个，nowrap 会把标题压成竖排：必须允许折行 */}
+            <div className="flex flex-wrap items-center gap-4 gap-y-2">
+              {/* leading-9 让标题与同排的 h-9 按钮等高：高度不齐时 items-center 会在行内各自居中，换行后错开 4px */}
+              <h2 className="text-xl font-semibold leading-9">凭据管理</h2>
               {currentCredentials.length > 0 && (
                 <Button
                   onClick={toggleSelectCurrentPage}
@@ -805,56 +815,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 </div>
               )}
             </div>
-            <div className="flex gap-2">
-              {selected.size > 0 && (
-                <>
-                  <Button onClick={handleBatchVerify} size="sm" variant="outline">
-                    <CheckCircle2 className="h-4 w-4 mr-2" />
-                    批量验活
-                  </Button>
-                  <Button
-                    onClick={handleBatchForceRefresh}
-                    size="sm"
-                    variant="outline"
-                    disabled={batchRefreshing}
-                  >
-                    <RefreshCw className={`h-4 w-4 mr-2 ${batchRefreshing ? 'animate-spin' : ''}`} />
-                    {batchRefreshing ? `刷新中... ${batchRefreshProgress.current}/${batchRefreshProgress.total}` : '批量刷新 Token'}
-                  </Button>
-                  <Button onClick={handleBatchResetFailure} size="sm" variant="outline">
-                    <RotateCcw className="h-4 w-4 mr-2" />
-                    恢复异常
-                  </Button>
-                  <Button
-                    onClick={handleBatchDelete}
-                    size="sm"
-                    variant="destructive"
-                    disabled={selectedDisabledCount === 0}
-                    title={selectedDisabledCount === 0 ? '只能删除已禁用凭据' : undefined}
-                  >
-                    <Trash2 className="h-4 w-4 mr-2" />
-                    批量删除
-                  </Button>
-                </>
-              )}
-              {verifying && !verifyDialogOpen && (
-                <Button onClick={() => setVerifyDialogOpen(true)} size="sm" variant="secondary">
-                  <CheckCircle2 className="h-4 w-4 mr-2 animate-spin" />
-                  验活中... {verifyProgress.current}/{verifyProgress.total}
-                </Button>
-              )}
-              {currentCredentials.length > 0 && (
-                <Button
-                  onClick={handleQueryCurrentPageInfo}
-                  size="sm"
-                  variant="outline"
-                  disabled={queryingInfo}
-                  title="查询当前页启用凭据的余额/订阅，可能返回最近 5 分钟内的缓存结果；需要最新数据请用单卡「刷新余额」或开启定时刷新"
-                >
-                  <Wallet className={`h-4 w-4 mr-2 ${queryingInfo ? 'animate-spin' : ''}`} />
-                  {queryingInfo ? `查询中... ${queryInfoProgress.current}/${queryInfoProgress.total}` : '批量余额/订阅'}
-                </Button>
-              )}
+            <div className="flex flex-wrap justify-end gap-2">
               {currentCredentials.length > 0 && (
                 <div
                   className="flex items-center gap-1.5 rounded-md border px-2 py-1"
@@ -891,46 +852,108 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   />
                 </div>
               )}
-              {/* 全量语义的入口，可用性判据取全量已禁用数，不受当前页有无已禁用影响 */}
-              <Button
-                onClick={handleClearAll}
-                size="sm"
-                variant="outline"
-                className="text-destructive hover:text-destructive"
-                disabled={disabledCredentialCount === 0 || clearingAll}
-                title={disabledCredentialCount === 0 ? '没有可清除的已禁用凭据' : `清除全部 ${disabledCredentialCount} 个已禁用凭据`}
-              >
-                <Trash2 className="h-4 w-4 mr-2" />
-                {clearingAll ? '清除中...' : `清除已禁用${disabledCredentialCount > 0 ? ` (${disabledCredentialCount})` : ''}`}
-              </Button>
-              <Button
-                onClick={handleRefreshAllModels}
-                size="sm"
-                variant="outline"
-                disabled={refreshingAllModels || !data?.total}
-                title="刷新全部启用凭据的上游模型目录"
-              >
-                <Boxes className={`h-4 w-4 mr-2 ${refreshingAllModels ? 'animate-spin' : ''}`} />
-                {refreshingAllModels ? '刷新模型中...' : '刷新全部模型'}
-              </Button>
-              <Button onClick={() => setKamImportDialogOpen(true)} size="sm" variant="outline">
-                <FileUp className="h-4 w-4 mr-2" />
-                Kiro Account Manager 导入
-              </Button>
-              <Button onClick={() => setBatchImportDialogOpen(true)} size="sm" variant="outline">
-                <Upload className="h-4 w-4 mr-2" />
-                批量导入
-              </Button>
-              <Button onClick={() => setOnlineAuthDialogOpen(true)} size="sm" variant="outline">
-                <KeyRound className="h-4 w-4 mr-2" />
-                在线授权
-              </Button>
               <Button onClick={() => setAddDialogOpen(true)} size="sm">
                 <Plus className="h-4 w-4 mr-2" />
                 添加凭据
               </Button>
+              {/* 低频操作收进溢出菜单：选中态右组控件从 12 个降到 8 个，
+                  宽度需求降到容器上限以内，标题行不再被折行吃掉两行高度 */}
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button size="sm" variant="outline" aria-label="更多操作" title="导入与维护类操作">
+                    <MoreHorizontal className="h-4 w-4 mr-2" />
+                    更多操作
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="min-w-52">
+                  <DropdownMenuItem onSelect={() => setKamImportDialogOpen(true)}>
+                    <FileUp />
+                    Kiro Account Manager 导入
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onSelect={() => setBatchImportDialogOpen(true)}>
+                    <Upload />
+                    批量导入
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onSelect={() => setOnlineAuthDialogOpen(true)}>
+                    <KeyRound />
+                    在线授权
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    onSelect={() => void handleRefreshAllModels()}
+                    disabled={refreshingAllModels || !data?.total}
+                  >
+                    <Boxes className={refreshingAllModels ? 'animate-spin' : ''} />
+                    {refreshingAllModels ? '刷新模型中...' : '刷新全部模型'}
+                  </DropdownMenuItem>
+                  {/* 全量语义的入口，可用性判据取全量已禁用数，不受当前页有无已禁用影响 */}
+                  <DropdownMenuItem
+                    onSelect={() => void handleClearAll()}
+                    disabled={disabledCredentialCount === 0 || clearingAll}
+                    className="text-destructive focus:text-destructive"
+                    title={disabledCredentialCount === 0 ? '没有可清除的已禁用凭据' : `清除全部 ${disabledCredentialCount} 个已禁用凭据`}
+                  >
+                    <Trash2 />
+                    {clearingAll ? '清除中...' : `清除已禁用${disabledCredentialCount > 0 ? ` (${disabledCredentialCount})` : ''}`}
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
             </div>
           </div>
+          {/* 批量操作独立成工具栏行：与标题行的全局操作同排时总需求宽度超出
+              容器上限，折行混排且层次混乱；拆开后标题行只留全局操作。
+              行内有凭据时常驻：未选中时只有批量余额/订阅，选中后追加四项批量操作 */}
+          {(currentCredentials.length > 0 || (verifying && !verifyDialogOpen)) && (
+            <div role="toolbar" aria-label="批量操作" className="flex flex-wrap items-center gap-2 rounded-md border bg-muted/40 p-2">
+              <Button
+                onClick={handleQueryCurrentPageInfo}
+                size="sm"
+                variant="outline"
+                disabled={queryingInfo}
+                title="查询当前页启用凭据的余额/订阅，可能返回最近 5 分钟内的缓存结果；需要最新数据请用单卡「刷新余额」或开启定时刷新"
+              >
+                <Wallet className={`h-4 w-4 mr-2 ${queryingInfo ? 'animate-spin' : ''}`} />
+                {queryingInfo ? `查询中... ${queryInfoProgress.current}/${queryInfoProgress.total}` : '批量余额/订阅'}
+              </Button>
+              {selected.size > 0 && (
+                <>
+              <Button onClick={handleBatchVerify} size="sm" variant="outline">
+                <CheckCircle2 className="h-4 w-4 mr-2" />
+                批量验活
+              </Button>
+              <Button
+                onClick={handleBatchForceRefresh}
+                size="sm"
+                variant="outline"
+                disabled={batchRefreshing}
+              >
+                <RefreshCw className={`h-4 w-4 mr-2 ${batchRefreshing ? 'animate-spin' : ''}`} />
+                {batchRefreshing ? `刷新中... ${batchRefreshProgress.current}/${batchRefreshProgress.total}` : '批量刷新 Token'}
+              </Button>
+              <Button onClick={handleBatchResetFailure} size="sm" variant="outline">
+                <RotateCcw className="h-4 w-4 mr-2" />
+                恢复异常
+              </Button>
+              <Button
+                onClick={handleBatchDelete}
+                size="sm"
+                variant="destructive"
+                disabled={selectedDisabledCount === 0}
+                title={selectedDisabledCount === 0 ? '只能删除已禁用凭据' : undefined}
+              >
+                <Trash2 className="h-4 w-4 mr-2" />
+                批量删除
+              </Button>
+                </>
+              )}
+              {verifying && !verifyDialogOpen && (
+                <Button onClick={() => setVerifyDialogOpen(true)} size="sm" variant="secondary">
+                  <CheckCircle2 className="h-4 w-4 mr-2 animate-spin" />
+                  验活中... {verifyProgress.current}/{verifyProgress.total}
+                </Button>
+              )}
+            </div>
+          )}
           <CredentialFilterBar filters={filters} onChange={handleFiltersChange} facets={facets} />
 
           {currentCredentials.length === 0 ? (

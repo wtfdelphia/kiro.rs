@@ -102,7 +102,7 @@ export function BatchVerifyDialog({
                     </span>
                   </div>
                   {result.error && (
-                    <div className="text-xs mt-1 opacity-90">
+                    <div className="text-xs mt-1 opacity-90 break-words">
                       错误: {result.error}
                     </div>
                   )}

@@ -237,7 +237,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         onOpenChange(newOpen)
       }}
     >
-      <DialogContent className="sm:max-w-2xl max-h-[80vh] flex flex-col">
+      <DialogContent className="sm:max-w-2xl max-h-[80vh] flex flex-col overflow-y-visible">
         <DialogHeader>
           <DialogTitle>KAM 账号导入（自动验活）</DialogTitle>
         </DialogHeader>
@@ -270,8 +270,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
                     key={item.index}
                     className={
                       item.valid
-                        ? 'text-muted-foreground'
-                        : 'text-red-600 dark:text-red-400'
+                        ? 'break-words text-muted-foreground'
+                        : 'break-words text-red-600 dark:text-red-400'
                     }
                   >
                     #{item.index + 1} {item.email || item.nickname || item.path} —{' '}
@@ -301,7 +301,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
                 )}
               </div>
 
-              <div className="flex gap-4 text-sm">
+              <div className="flex flex-wrap gap-4 text-sm">
                 <span className="text-green-600 dark:text-green-400">
                   ✓ 成功: {results.filter(r => r.status === 'verified').length}
                 </span>
@@ -343,7 +343,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
                           <div className="text-xs text-muted-foreground mt-1">profileArn: 已就绪{result.provider ? ` · ${result.provider}` : ''}</div>
                         )}
                         {result.error && (
-                          <div className="text-xs text-red-600 dark:text-red-400 mt-1">{result.error}</div>
+                          <div className="text-xs text-red-600 dark:text-red-400 mt-1 break-words">{result.error}</div>
                         )}
                       </div>
                     </div>
