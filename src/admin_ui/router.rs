@@ -15,10 +15,20 @@ use rust_embed::Embed;
 struct Asset;
 
 /// 创建 Admin UI 路由
-pub fn create_admin_ui_router() -> Router {
+fn create_admin_ui_router() -> Router {
     Router::new()
         .route("/", get(index_handler))
         .route("/{*file}", get(static_handler))
+}
+
+/// 把 Admin UI 挂到 `/admin`
+///
+/// 单独一个函数是因为尾斜杠接不住：`nest` 注册的是 `/admin` 与
+/// `/admin/{*file}`，而 catch-all 至少要吃一个字符，`/admin/` 两条都落不到，
+/// 内层 fallback 也进不去（404 在外层就产生了）。所以额外显式挂一条。
+pub fn mount_admin_ui(app: Router) -> Router {
+    app.nest("/admin", create_admin_ui_router())
+        .route("/admin/", get(index_handler))
 }
 
 /// 处理首页请求
