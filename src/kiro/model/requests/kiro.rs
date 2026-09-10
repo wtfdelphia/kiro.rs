@@ -13,9 +13,10 @@ use super::conversation::ConversationState;
 /// # 示例
 ///
 /// ```rust
-/// use kiro_rs::kiro::model::requests::{
-///     KiroRequest, ConversationState, CurrentMessage, UserInputMessage, Tool
+/// use kiro_rs::kiro::model::requests::conversation::{
+///     ConversationState, CurrentMessage, UserInputMessage,
 /// };
+/// use kiro_rs::kiro::model::requests::kiro::KiroRequest;
 ///
 /// // 创建简单请求
 /// let state = ConversationState::new("conv-123")
@@ -24,8 +25,11 @@ use super::conversation::ConversationState;
 ///         UserInputMessage::new("Hello", "claude-3-5-sonnet")
 ///     ));
 ///
-/// let request = KiroRequest::new(state);
-/// let json = request.to_json().unwrap();
+/// let request = KiroRequest {
+///     conversation_state: state,
+///     profile_arn: None,
+/// };
+/// let json = serde_json::to_string(&request).unwrap();
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

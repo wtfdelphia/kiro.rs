@@ -15,6 +15,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -29,6 +30,7 @@ use crate::kiro::model::token_refresh::{
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::models_api::list_available_models_with_meta;
 use crate::model::config::Config;
+use crate::storage::{ConfigStore, CredentialStore, JsonCredentialStore};
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -837,8 +839,10 @@ pub struct MultiTokenManager {
     current_id: Mutex<u64>,
     /// Token 刷新锁，确保同一时间只有一个刷新操作
     refresh_lock: TokioMutex<()>,
-    /// 凭据文件路径（用于回写）
-    credentials_path: Option<PathBuf>,
+    /// 凭据存储后端（回写与缓存目录派生）；None 表示不回写
+    credential_store: Option<Arc<dyn CredentialStore>>,
+    /// 配置存储后端；None 时 `save_config` 回退到 [`Config::save`]（旧路径）
+    config_store: Option<Arc<dyn ConfigStore>>,
     /// 是否为多凭据格式（数组格式才回写）
     is_multiple_format: bool,
     /// 负载均衡模式（运行时可修改）
@@ -924,6 +928,35 @@ impl MultiTokenManager {
         credentials: Vec<KiroCredentials>,
         proxy: Option<ProxyConfig>,
         credentials_path: Option<PathBuf>,
+        is_multiple_format: bool,
+    ) -> anyhow::Result<Self> {
+        let credential_store = credentials_path
+            .map(|p| Arc::new(JsonCredentialStore::new(p)) as Arc<dyn CredentialStore>);
+        Self::with_stores(
+            config,
+            credentials,
+            proxy,
+            credential_store,
+            None,
+            is_multiple_format,
+        )
+    }
+
+    /// 创建多凭据 Token 管理器（存储后端注入入口，供桌面端替换为 SQLite）
+    ///
+    /// # Arguments
+    /// * `config` - 应用配置
+    /// * `credentials` - 凭据列表
+    /// * `proxy` - 可选的代理配置
+    /// * `credential_store` - 凭据存储后端（回写与缓存目录派生），None 表示不回写
+    /// * `config_store` - 配置存储后端，None 时 `save_config` 回退到 `Config::save`
+    /// * `is_multiple_format` - 是否为多凭据格式（数组格式才回写）
+    pub fn with_stores(
+        config: Config,
+        credentials: Vec<KiroCredentials>,
+        proxy: Option<ProxyConfig>,
+        credential_store: Option<Arc<dyn CredentialStore>>,
+        config_store: Option<Arc<dyn ConfigStore>>,
         is_multiple_format: bool,
     ) -> anyhow::Result<Self> {
         // 计算当前最大 ID，为没有 ID 的凭据分配新 ID
@@ -1016,7 +1049,8 @@ impl MultiTokenManager {
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
             refresh_lock: TokioMutex::new(()),
-            credentials_path,
+            credential_store,
+            config_store,
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
@@ -1057,7 +1091,13 @@ impl MultiTokenManager {
     }
 
     pub fn save_config(&self) -> anyhow::Result<()> {
-        self.config.lock().save()
+        match &self.config_store {
+            Some(store) => {
+                let cfg = self.config.lock().clone();
+                store.save(&cfg)
+            }
+            None => self.config.lock().save(),
+        }
     }
 
     /// 全局代理配置（供 profile 解析等复用）
@@ -1561,22 +1601,20 @@ impl MultiTokenManager {
     ///
     /// 仅在以下条件满足时回写：
     /// - 源文件是多凭据格式（数组）
-    /// - credentials_path 已设置
+    /// - 已配置凭据存储后端
     ///
     /// # Returns
-    /// - `Ok(true)` - 成功写入文件
-    /// - `Ok(false)` - 跳过写入（非多凭据格式或无路径配置）
+    /// - `Ok(true)` - 成功写入
+    /// - `Ok(false)` - 跳过写入（非多凭据格式或无存储后端）
     /// - `Err(_)` - 写入失败
     fn persist_credentials(&self) -> anyhow::Result<bool> {
-        use anyhow::Context;
-
         // 仅多凭据格式才回写
         if !self.is_multiple_format {
             return Ok(false);
         }
 
-        let path = match &self.credentials_path {
-            Some(p) => p,
+        let store = match &self.credential_store {
+            Some(s) => s,
             None => return Ok(false),
         };
 
@@ -1595,30 +1633,15 @@ impl MultiTokenManager {
                 .collect()
         };
 
-        // 序列化为 pretty JSON
-        let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
-
-        // 原子写入（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
-        //
-        // 与迁移路径共用同一个原子写工具：在同一个文件上同时存在原子与非原子两条
-        // 写路径，比两者都不原子更糟——读者无法判断当前内容出自哪条路径。
-        let write = || crate::common::atomic_file::write_atomic(path, &json);
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(write)
-                .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
-        } else {
-            write().with_context(|| format!("回写凭据文件失败: {:?}", path))?;
-        }
-
-        tracing::debug!("已回写凭据到文件: {:?}", path);
+        // 序列化与原子写入细节在存储后端内实现（JsonCredentialStore 保留
+        // 原 write_atomic + block_in_place 语义）
+        store.persist(&credentials)?;
         Ok(true)
     }
 
-    /// 获取缓存目录（凭据文件所在目录）
+    /// 获取缓存目录（由凭据存储后端派生，文件后端为凭据文件所在目录）
     pub fn cache_dir(&self) -> Option<PathBuf> {
-        self.credentials_path
-            .as_ref()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        self.credential_store.as_ref().and_then(|s| s.cache_dir())
     }
 
     /// 统计数据文件路径
@@ -3004,6 +3027,19 @@ impl MultiTokenManager {
 
     fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
         use anyhow::Context;
+
+        // 经配置存储后端：重新加载存储中的配置，只改负载均衡模式再写回，
+        // 保留「以存储为准」的语义。无后端时回退旧路径（config_path + Config::save）。
+        if let Some(store) = &self.config_store {
+            let mut config = store
+                .load()
+                .context("重新加载配置失败")?;
+            config.load_balancing_mode = mode.to_string();
+            store
+                .save(&config)
+                .context("持久化负载均衡模式失败")?;
+            return Ok(());
+        }
 
         let config_path = match self.config.lock().config_path() {
             Some(path) => path.to_path_buf(),

@@ -3,7 +3,9 @@
 ```text
 kiro-rs/
 ├── src/                    # Rust 服务端源码
-│   ├── main.rs
+│   ├── lib.rs              # lib 目标（桌面二进制依赖）
+│   ├── main.rs             # bin 目标（CLI）
+│   ├── bootstrap.rs        # 装配复用：bootstrap / build_routes
 │   ├── anthropic/          # Anthropic API 兼容
 │   ├── openai/             # OpenAI 兼容（Chat Completions / Responses）
 │   ├── public_api/         # 对外端点注册表（单一事实源 + 防漂移断言）
@@ -11,6 +13,7 @@ kiro-rs/
 │   ├── admin/              # Admin API
 │   ├── admin_ui/           # 嵌入 UI 路由
 │   ├── model/              # 配置与参数
+│   ├── storage/            # 存储接缝（CredentialStore / ConfigStore）
 │   └── common/             # 公共工具
 ├── admin-ui/               # 前端工程（构建产物嵌入二进制）
 ├── tools/                  # 辅助工具（非运行时核心）

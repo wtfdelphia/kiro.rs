@@ -62,7 +62,7 @@ kiro.rs/
 ├── src/
 │   ├── lib.rs          # 新增：声明全部模块，导出装配面 + 存储 trait
 │   ├── main.rs         # 保留：CLI 服务入口，改为调用 lib 的装配函数
-│   ├── storage/        # 新增：CredentialStore/ConfigStore trait + JsonFileStore
+│   ├── storage/        # 新增：CredentialStore/ConfigStore trait + JsonCredentialStore/JsonConfigStore
 │   ├── kiro/ model/ common/ http_client.rs token.rs   # 不变
 │   ├── anthropic/ openai/ admin/ admin_ui/ public_api/ # 不变，可见性按需放开
 │   ├── debug.rs        # 孤儿文件，不在模块树内，不随本次变更处理
@@ -112,7 +112,7 @@ kiro.rs/
 | `admin::{AdminService, AdminState, create_admin_router}` | 管理面直调与可选 HTTP |
 | `anthropic::create_router_with_provider_and_auth`、`openai::create_openai_routes`、`admin_ui::mount_admin_ui` | 可选 axum 监听的路由装配 |
 | `http_client::ProxyConfig`、`token::{init_config, CountTokensConfig}`、`public_api` | 装配所需 |
-| `storage::{CredentialStore, ConfigStore, JsonFileStore}`（本期新增） | 存储接缝，见第七节 |
+| `storage::{CredentialStore, ConfigStore, JsonCredentialStore, JsonConfigStore}`（本期新增） | 存储接缝，见第七节 |
 | `bootstrap`、`build_routes`（本期新增） | 装配复用，见 4.3 |
 
 ### 3.4 两个不参与编译的孤儿文件
@@ -177,7 +177,10 @@ pub enum CoreEvent {
 
 ### 4.3 装配复用：`bootstrap` 模块
 
-`main.rs` 现有装配链抽成 lib 里的分步函数（跨模块重构，走 OpenSpec）：
+`main.rs` 现有装配链抽成 lib 里的分步函数（跨模块重构，走 OpenSpec）。
+change 1 落地后的终稿签名（与设计草案的差异：`BootOptions` 不携带路径字段，
+路径封装在 store 实现内部；`AppState` 是路由构建的产物，由 `build_routes`
+返还，不在 `Bootstrapped` 里）：
 
 ```rust
 pub struct Bootstrapped {
@@ -189,14 +192,20 @@ pub struct Bootstrapped {
     pub is_multiple_format: bool,
 }
 
-pub fn bootstrap(stores: &Stores, config_path: &str, credentials_path: &str)
-    -> anyhow::Result<Bootstrapped>;
+pub struct BootOptions {
+    pub credential_store: Arc<dyn CredentialStore>,
+    pub config_store: Arc<dyn ConfigStore>,
+}
 
-pub fn build_routes(b: &Bootstrapped, api_key: &str, admin_key: Option<&str>)
-    -> (axum::Router, AppState);
+/// 装配到「核心就绪」为止：不构建路由、不 bind、不 serve
+pub fn bootstrap(opts: &BootOptions) -> anyhow::Result<Bootstrapped>;
+
+/// 全量路由（anthropic + openai + admin + admin_ui）；
+/// admin_api_key 为 None 或空串时不挂 admin 路由，与现 main.rs 判定一致
+pub fn build_routes(b: &Bootstrapped) -> (axum::Router, AppState);
 ```
 
-`Stores` 是 `(Arc<dyn CredentialStore>, Arc<dyn ConfigStore>)` 的组合，桌面端传 SQLite 实现，CLI 传 JSON 文件实现。`build_routes` 的 `admin_key` 参数决定 Admin 路由是否挂载（与现有 `main.rs` 的空 key 判定逻辑一致），见 5.3。
+桌面端传 SQLite store，CLI 传 `JsonCredentialStore` / `JsonConfigStore`。admin 挂载判定读 `Bootstrapped.config.admin_api_key`（与现 `main.rs` 的空 key 判定一致），不再需要单独的 `admin_key` 参数，见 5.3。
 
 CLI 调这两个函数后 `axum::serve`，行为与现在等价；桌面端调同样的函数，区别在服务器是否启动与存储后端。
 
@@ -377,7 +386,7 @@ pub trait ConfigStore: Send + Sync {
 
 `Config::save` 需要 `config_path` 才能写文件（`config.rs:417` 无路径即报错）。改道方案：`Config` 保留现有方法给 CLI，`save_config` 的实现体换成 `ConfigStore`；`AdminService` 的五处设置更新（`service.rs:1278,1324,1396,1430,1654`）与 `persist_load_balancing_mode`（`token_manager.rs:3005`）都经 `save_config` 统一走新路径，不需要逐处修改。
 
-`MultiTokenManager::new` 增加一个接受 `Arc<dyn CredentialStore>` 的构造入口，现有签名保留（内部包一层 `JsonFileStore`），全部现有测试不动。这属于跨模块变更，走 OpenSpec。
+`MultiTokenManager::new` 增加一个接受 `Arc<dyn CredentialStore>` 与 `Arc<dyn ConfigStore>` 的构造入口（`with_stores`），现有签名保留（内部包一层 `JsonCredentialStore`），全部现有测试不动。这属于跨模块变更，走 OpenSpec。
 
 ### 7.3 SQLite schema
 
@@ -564,7 +573,7 @@ Root
 
 | # | change 名 | 内容 | 验证 |
 | --- | --- | --- | --- |
-| 1 | `desktop-lib-extraction` | 新增 `lib.rs`，装配函数抽取，`main.rs` 改调 lib，存储 trait 与 `JsonFileStore` 落地并完成 7.2 的调用线改道 | `cargo check --release --all-targets` 零新增告警；全量 `cargo test`；CLI 冒烟（`/v1/models` + `/v1/messages` 前后比对） |
+| 1 | `desktop-lib-extraction` | 新增 `lib.rs`，装配函数抽取，`main.rs` 改调 lib，存储 trait 与 `JsonCredentialStore` / `JsonConfigStore` 落地并完成 7.2 的调用线改道 | `cargo check --release --all-targets` 零新增告警；全量 `cargo test`；CLI 冒烟（`/v1/models` + `/v1/messages` 前后比对） |
 | 2 | `desktop-app-shell` | `desktop/` 独立 workspace 骨架：双运行时、bridge、单实例锁、数据目录解析、窗口 + sidebar + 空视图；含 6.5 两个常驻前提的 spike 结论 | 应用可启动显示四视图骨架；零窗口存活与托盘事件送达验证记录；根侧 `cargo check` 确认门禁腿不受影响 |
 | 3 | `desktop-sqlite-storage` | `SqliteStore`、schema 与迁移、keyring 集成与加密文件回退、JSON 导入导出、存储门面并发方案 | 首启迁移测试；keyring 不可用回退测试；导入导出往返一致性测试；并发写测试；CLI 行为不变（全量测试） |
 | 4 | `desktop-credentials-view` | 凭据列表 + 启停/优先级/删除/测试/余额 + 添加与批量导入对话框 | gpui headless 测试；手动全流程 |
@@ -572,7 +581,7 @@ Root
 | 6 | `desktop-tray-resident` | tray-icon 集成、关窗拦截、窗口重建、托盘四态图标与菜单、开机自启 | 三平台托盘交互手测；关窗常驻 → 托盘唤回全流程 |
 | 7 | `desktop-embedded-packaging` | 自动启动服务器收尾、`packager.toml`、三平台 CI 流水线（含 Linux 系统依赖安装步骤）、签名门控、应用图标资源 | 三平台产物构建证据（绿路径）；签名缺失降级路径证据（红路径）；产物可安装冒烟 |
 
-依赖关系：change 1 是全部前置；change 2 用 change 1 的 `JsonFileStore` 读取配置与凭据（解决 v2 的「shell 启动就要读配置，存储层却在 change 3」的顺序问题）；change 3 是 4/5/6 的前置（视图与服务都依赖存储层）。
+依赖关系：change 1 是全部前置；change 2 用 change 1 的 `JsonCredentialStore` / `JsonConfigStore` 读取配置与凭据（解决 v2 的「shell 启动就要读配置，存储层却在 change 3」的顺序问题）；change 3 是 4/5/6 的前置（视图与服务都依赖存储层）。
 
 每个 change 实现前按门禁走 `openspec-superpowers-bridge`，实现后 `spec-compliance-check`，归档前 `openspec-verify-change`。
 
