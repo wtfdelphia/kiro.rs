@@ -5,6 +5,7 @@
 //! 服务器启停、托盘常驻、两阶段退出由后续 change 实现。
 
 mod bridge;
+mod core;
 mod lock;
 mod logging;
 mod paths;
@@ -143,8 +144,17 @@ fn main() {
                         }
                     });
                 }
+                // 桌面专用 AdminService：不带 admin_api_key 门槛
+                //（门槛只管 HTTP Admin API，本地界面不受限）
+                let admin_service = Arc::new(kiro_rs::admin::AdminService::new_with_runtime(
+                    b.token_manager.clone(),
+                    b.endpoint_names.clone(),
+                    None,
+                    Some(b.kiro_provider.clone()),
+                ));
                 CoreEvent::Bootstrapped {
                     credential_count: b.token_manager.total_count(),
+                    handle: crate::core::CoreHandle::new(admin_service, tokio::runtime::Handle::current()),
                 }
             }
             Err(e) => CoreEvent::BootstrapFailed(format!("{:#}", e)),
@@ -166,23 +176,40 @@ fn main() {
                 let view = cx.new(|cx| AppView::new(window, cx));
                 cx.new(|cx| Root::new(view, window, cx))
             });
-            match view {
+            let window_handle = match view {
                 Ok(handle) => {
                     tracing::info!("主窗口已创建 (window_id={})", handle.window_id().as_u64());
+                    handle
                 }
                 Err(e) => {
                     tracing::error!("窗口创建失败: {}", e);
+                    return;
                 }
-            }
+            };
 
-            // 消费事件循环（骨架阶段仅记录装配结果）
+            // 消费事件循环：把核心句柄注入主视图
             while let Some(event) = event_rx.next().await {
-                match &event {
-                    CoreEvent::Bootstrapped { credential_count } => {
+                match event {
+                    CoreEvent::Bootstrapped {
+                        credential_count,
+                        handle,
+                    } => {
                         tracing::info!("核心装配完成，凭据数: {}", credential_count);
+                        let _ = window_handle.update(cx, move |root, _, cx| {
+                            let root_view = root.view().clone();
+                            if let Ok(app_view) = root_view.downcast::<AppView>() {
+                                app_view.update(cx, |v, cx| v.bootstrapped(handle, cx));
+                            }
+                        });
                     }
                     CoreEvent::BootstrapFailed(msg) => {
                         tracing::error!("核心装配失败: {}", msg);
+                        let _ = window_handle.update(cx, move |root, _, cx| {
+                            let root_view = root.view().clone();
+                            if let Ok(app_view) = root_view.downcast::<AppView>() {
+                                app_view.update(cx, |v, cx| v.bootstrap_failed(msg.clone(), cx));
+                            }
+                        });
                         break;
                     }
                 }

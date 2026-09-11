@@ -78,7 +78,7 @@ impl SqliteStore {
 
     /// 指定 secret 后端打开（测试用，绕开钥匙串探测）
     #[cfg(test)]
-    fn open_with_backend(
+    pub(crate) fn open_with_backend(
         data_dir: &Path,
         backend: Box<dyn secrets::SecretBackend>,
     ) -> anyhow::Result<Arc<Self>> {
@@ -114,6 +114,12 @@ impl SqliteStore {
         let conn = self.conn.lock();
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM config", [], |r| r.get(0))?;
         Ok(n > 0)
+    }
+
+    /// 钥匙串条目探测（测试专用：断言删除后的同步清理）
+    #[cfg(test)]
+    pub(crate) fn secret_present(&self, key: &str) -> bool {
+        self.secrets.read(key).ok().flatten().is_some()
     }
 
     // ========================================================================

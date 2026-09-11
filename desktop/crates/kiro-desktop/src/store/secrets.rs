@@ -179,6 +179,38 @@ fn probe_keyring() -> anyhow::Result<()> {
     }
 }
 
+/// 内存 secret 后端（测试专用：绕开钥匙串探测，确定性断言）
+#[cfg(test)]
+#[derive(Default)]
+pub struct MemoryBackend {
+    map: Mutex<HashMap<String, String>>,
+}
+
+#[cfg(test)]
+impl MemoryBackend {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[cfg(test)]
+impl SecretBackend for MemoryBackend {
+    fn write(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        self.map.lock().insert(key.to_string(), value.to_string());
+        Ok(())
+    }
+    fn read(&self, key: &str) -> anyhow::Result<Option<String>> {
+        Ok(self.map.lock().get(key).cloned())
+    }
+    fn delete(&self, key: &str) -> anyhow::Result<()> {
+        self.map.lock().remove(key);
+        Ok(())
+    }
+    fn is_system(&self) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
