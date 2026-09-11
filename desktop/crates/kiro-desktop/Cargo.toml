@@ -1,0 +1,19 @@
+[package]
+name = "kiro-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "kiro-desktop"
+path = "src/main.rs"
+
+[dependencies]
+kiro-rs = { path = "../../.." }
+gpui-kit = "0.6"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+futures = "0.3"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.5", features = ["derive"] }

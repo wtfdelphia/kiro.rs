@@ -22,9 +22,14 @@
 | crate | 类型 | 版本 | 用途 | 引入变更 |
 | --- | --- | --- | --- | --- |
 | tower | dev-dependency | 0.5.2（features: util） | 单测中用 `ServiceExt::oneshot` 对真实 Axum Router 发请求，支撑 `live ⊆ routes` 防漂移断言与 auth / body-limit 矩阵 | `public-api-catalog-admin-display` |
+| gpui-kit | 依赖（仅 `desktop/` workspace） | 0.6.1（解析到 `gpui-pre` 0.3.4） | 桌面应用骨架的 UI 框架与组件（GPUI + gpui-base + gpui-component） | `desktop-app-shell` |
 
 `tower` 已是 axum 的传递依赖（`Cargo.lock` 中原本存在），此处只是显式声明为
 dev-dependency 以便测试直接引用；不增加运行时依赖，不进入发布产物。
+
+`gpui-kit` 只在 `desktop/` 独立 workspace 中引入，根仓 `Cargo.toml` 与发布
+产物不受影响；桌面锁文件为 `desktop/Cargo.lock`。`clap` 根仓本已依赖，
+桌面端各自声明、各自锁版本。
 
 ## 安装核验命令（示例）
 

@@ -37,7 +37,8 @@
 ## 构建与测试策略
 
 - 后端：`cargo test` / `cargo build --release`（release 前需 admin-ui build 以嵌入静态资源，见 README）
-- 告警门禁：`cargo check --release --all-targets` 必须无新增告警。项目只有 binary target（无 `src/lib.rs`），`pub` 不构成对外 API 豁免理由，所有 `pub` 项都需 crate 内实际调用点
+- 告警门禁：`cargo check --release --all-targets` 必须无新增告警。项目为 lib + bin 双目标（`src/lib.rs` 供桌面二进制依赖，见 `spec/structure.md`），`pub` 不构成对外 API 豁免理由，所有 `pub` 项都需有实际调用点或属于 `docs/desktop-gpui-embedded-design.md` §3.3 登记的导出面
+- 桌面版：`desktop/` 独立 workspace，告警判定与根侧等价（`-D warnings` + `--locked`），不借用根门禁；根侧流水线零改动（见该目录 `README.md`）
 - 前端：`cd admin-ui && pnpm install && pnpm build`
 - Docker：docker-compose / Dockerfile / CI workflows
 - AI 变更：OpenSpec validate + 对应高风险验证矩阵（见 `AGENTS.md`）

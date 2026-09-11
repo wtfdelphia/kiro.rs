@@ -1,0 +1,8 @@
+/target/
+
+# 本地运行数据（数据目录默认在系统 data_dir，此处防调试残留误入）
+*.log
+config.json
+credentials.json
+credentials.*
+kiro-desktop.lock

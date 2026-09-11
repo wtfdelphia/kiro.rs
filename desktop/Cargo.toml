@@ -1,0 +1,20 @@
+# 桌面版独立 workspace（不加入根 workspace）
+#
+# 原因见 `docs/desktop-gpui-embedded-design.md` §3.1：根门禁
+# （warning-gate.yaml）在 ubuntu-latest 上无 GPUI 系统依赖，
+# 把桌面目标并入根会打穿服务端发布路径。
+#
+# 告警判定等价口径：
+#   RUSTFLAGS="-D warnings" cargo check --release --all-targets --locked
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+
+[profile.release]
+lto = true
+strip = true

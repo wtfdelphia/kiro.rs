@@ -16,6 +16,9 @@ kiro-rs/
 │   ├── storage/            # 存储接缝（CredentialStore / ConfigStore）
 │   └── common/             # 公共工具
 ├── admin-ui/               # 前端工程（构建产物嵌入二进制）
+├── desktop/                # 桌面版独立 workspace（不进根 workspace）
+│   ├── Cargo.toml          # workspace 根（含独立 Cargo.lock）
+│   └── crates/kiro-desktop # 应用 crate，path 依赖根仓 kiro-rs lib
 ├── tools/                  # 辅助工具（非运行时核心）
 ├── docs/                   # 专题文档、白皮书、工具来源、superpowers
 ├── spec/                   # 长期需求/设计/结构事实

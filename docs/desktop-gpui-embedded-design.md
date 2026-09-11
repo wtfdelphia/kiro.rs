@@ -282,7 +282,17 @@ v2 设计在 `on_app_quit` 里停服务器并等待最多 10 秒，这个方案�
 - Zed 上游的托盘 PR `zed-industries/zed#44047`（gpui: Add Tray support）于 2025-12-12 关闭，GitHub API 确认 `merged: false`，短期内不会进上游
 - 事实标准是 `tray-icon`（tauri-apps）：0.24.2，累计下载约 2800 万，2026-07-27 发版，许可 MIT OR Apache-2.0，支持 Windows / macOS / Linux（AppIndicator 或 KSNI）
 
-选型：`tray-icon = "0.24"`，Linux 用 `ksni` feature（StatusNotifierItem D-Bus 后端，自带工作线程），关掉默认的 `libappindicator`，避免引入 GTK3 依赖树。菜单用 `tray-icon` 自带的 muda 集成。
+选型：`tray-icon = "0.24"`，菜单用 `tray-icon` 自带的 muda 集成。
+
+> **v2.2 修订（2026-09-11，change 2 实测推翻）**：`tray-icon` 0.20–0.24 全系
+> **没有 `ksni` feature**（crates.io features 字段逐版本核对），docs.rs 0.24.2
+> 原文「Linux (**gtk Only**)」，且要求同线程有 gtk 事件循环；Linux 依赖
+> `libgtk-3-dev`、`libxdo-dev`、`libappindicator-gtk3`。原文「用 `ksni`
+> feature 避免 GTK3 依赖树」的方案不存在，change 6 必须在三个方向里重选：
+> a) 接受 GTK3 依赖，独立线程跑 gtk 事件循环并把事件转发回 GPUI；
+> b) 不用 `tray-icon`，直接用 `ksni` crate 做 StatusNotifierItem（纯 D-Bus，
+> 无 GTK，菜单协议自带）；c) macOS/Windows 仍用 `tray-icon`，Linux 单独走
+> ksni。详见 `openspec/changes/desktop-app-shell/evidence/tray-icon-research.md`。
 
 ### 6.2 线程与事件模型
 
@@ -339,10 +349,19 @@ kiro-rs  ·  服务器: 运行中 (127.0.0.1:3000)   ← 标题项，只读
 
 ### 6.5 待 spike 验证的两个前提
 
-- 零窗口时 GPUI 应用循环是否继续运行（Zed 在 macOS 上如此，Linux/Windows 行为需在钉定的 `gpui-pre` 上实测；若自动退出，用 `on_window_should_close` 返回 `false` 兜底，常驻语义不变）
-- Windows 上 `tray-icon` 事件在 GPUI 消息循环内能否送达（KSNI 只影响 Linux，Windows 走隐藏窗口消息）
+两项已在 change 2（2026-09-11）验证，结论：
 
-两项都放进 change 2（app-shell）的验收清单，失败不阻塞其余 change，托盘降级为「仅退出入口」也能用。
+- **零窗口存活：Linux 上不成立**。`gpui-pre` 0.3.4 在本机（Xvfb + llvmpipe）
+  实测：销毁最后一个窗口后 `run()` 立即返回，应用循环退出。§6.3「销毁 + 重建」
+  在 Linux 上需要兜底：关窗拦截后保留一个占位窗口（或拦截不销毁），否则
+  销毁唯一窗口的瞬间进程就退了。macOS/Windows 未测，常驻实现必须按平台分支。
+  证据：`openspec/changes/desktop-app-shell/evidence/spike-zero-window.md`
+- **tray-icon 事件送达：无法在本环境验证**。原因见 §6.1 修订：Linux 后端
+  是 gtk Only，本机无头且装不动 GTK3 dev 树；且「用 `ksni` feature」这一
+  前提本身不成立。结论延到有显示 + GTK 环境的 change 6 实测。
+  证据：`openspec/changes/desktop-app-shell/evidence/tray-icon-research.md`
+
+两项均不阻塞其余 change：托盘降级为「仅退出入口」也能用，常驻语义不受影响。
 
 ## 七、SQLite 存储与系统钥匙串（本期新增）
 
