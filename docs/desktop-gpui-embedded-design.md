@@ -427,8 +427,10 @@ CREATE TABLE credentials (
 );
 
 CREATE TABLE secrets (
-    credential_id INTEGER PRIMARY KEY REFERENCES credentials(id),
-    keyring_ref   TEXT NOT NULL        -- 钥匙串条目 key，如 "cred-3:refresh_token"
+    credential_id INTEGER NOT NULL REFERENCES credentials(id) ON DELETE CASCADE,
+    field         TEXT NOT NULL,        -- refresh_token / client_secret / kiro_api_key / proxy_password
+    keyring_ref   TEXT NOT NULL,        -- 钥匙串条目 key，如 "cred-3:refresh_token"
+    PRIMARY KEY (credential_id, field)  -- 每凭据每字段一行，删除凭据级联清理
 );
 
 -- 整表 JSON 单行：Config 字段有 20 多个且持续增长，

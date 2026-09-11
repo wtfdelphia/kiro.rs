@@ -8,6 +8,7 @@ mod bridge;
 mod lock;
 mod logging;
 mod paths;
+mod store;
 mod ui;
 
 use std::sync::Arc;
@@ -16,6 +17,7 @@ use clap::Parser;
 use futures::StreamExt;
 use gpui_kit::component::Root;
 use gpui_kit::*;
+use kiro_rs::storage::{ConfigStore, CredentialStore};
 
 use crate::bridge::{CoreEvent, event_channel};
 use crate::lock::InstanceLock;
@@ -67,19 +69,58 @@ fn main() {
 
     let (event_tx, mut event_rx) = event_channel();
 
-    // 在 tokio 侧装配核心（经 change 1 的 bootstrap，存储走 JSON store）
-    let config_path = args
-        .config
-        .clone()
-        .unwrap_or_else(|| kiro_rs::model::config::Config::default_config_path().to_string());
-    let credentials_path = args.credentials.clone().unwrap_or_else(|| {
-        kiro_rs::kiro::model::credentials::KiroCredentials::default_credentials_path().to_string()
-    });
+    // 存储后端选择：显式 --config / --credentials 走 JSON 文件（等价 CLI，
+    // 调试用）；否则 SQLite + 系统钥匙串（数据目录，设计文档 §7）
+    let json_mode = args.config.is_some() || args.credentials.is_some();
 
-    let credential_store = Arc::new(kiro_rs::storage::JsonCredentialStore::new(
-        credentials_path,
-    ));
-    let config_store = Arc::new(kiro_rs::storage::JsonConfigStore::new(config_path));
+    let sqlite_store = if json_mode {
+        None
+    } else {
+        match store::SqliteStore::open(&data_dir) {
+            Ok(s) => {
+                tracing::info!(
+                    "SQLite 存储就绪（{}），secret 后端: {}",
+                    s.data_dir().join("kiro.db").display(),
+                    if s.secret_backend_is_system() {
+                        "系统钥匙串"
+                    } else {
+                        "加密文件回退"
+                    }
+                );
+                // 首启（库为空）才导入 JSON，避免覆盖已有数据；成功后备份 .bak
+                let empty = s.credential_count().unwrap_or(0) == 0 && !s.has_config().unwrap_or(false);
+                if empty {
+                    store::json_io::detect_and_import(&data_dir, &s);
+                }
+                Some(s)
+            }
+            Err(e) => {
+                eprintln!("SQLite 存储初始化失败: {:#}", e);
+                std::process::exit(1);
+            }
+        }
+    };
+
+    let (credential_store, config_store): (Arc<dyn CredentialStore>, Arc<dyn ConfigStore>) =
+        match &sqlite_store {
+            Some(s) => (s.clone(), s.clone()),
+            None => {
+                let config_path = args.config.clone().unwrap_or_else(|| {
+                    kiro_rs::model::config::Config::default_config_path().to_string()
+                });
+                let credentials_path = args.credentials.clone().unwrap_or_else(|| {
+                    kiro_rs::kiro::model::credentials::KiroCredentials::default_credentials_path()
+                        .to_string()
+                });
+                tracing::info!("调试模式：存储走 JSON 文件（--config / --credentials）");
+                (
+                    Arc::new(kiro_rs::storage::JsonCredentialStore::new(credentials_path)),
+                    Arc::new(kiro_rs::storage::JsonConfigStore::new(config_path)),
+                )
+            }
+        };
+
+    let sqlite_store_for_boot = sqlite_store.clone();
 
     rt.spawn(async move {
         let opts = kiro_rs::bootstrap::BootOptions {
@@ -87,9 +128,25 @@ fn main() {
             config_store: config_store.clone(),
         };
         let event = match kiro_rs::bootstrap::bootstrap(&opts) {
-            Ok(b) => CoreEvent::Bootstrapped {
-                credential_count: b.token_manager.total_count(),
-            },
+            Ok(b) => {
+                // SQLite 模式：回填模型目录 + 后台周期快照（设计文档 D7）
+                if let Some(store) = &sqlite_store_for_boot {
+                    store::restore_model_catalog(store, &b.token_manager);
+                    let store = Arc::clone(store);
+                    let token_manager = Arc::clone(&b.token_manager);
+                    tokio::spawn(async move {
+                        // 首拍延迟 20 秒，等预热刷新的第一批结果落地
+                        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                        loop {
+                            store::snapshot_model_catalog(&store, &token_manager);
+                            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                        }
+                    });
+                }
+                CoreEvent::Bootstrapped {
+                    credential_count: b.token_manager.total_count(),
+                }
+            }
             Err(e) => CoreEvent::BootstrapFailed(format!("{:#}", e)),
         };
         let _ = event_tx.unbounded_send(event);

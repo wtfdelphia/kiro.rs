@@ -4,8 +4,10 @@
 `docs/desktop-gpui-embedded-design.md` §3.1：根门禁环境没有 GPUI 的
 Linux 系统依赖，合并会打穿服务端发布路径）。
 
-当前是 change 2（`desktop-app-shell`）的应用骨架：双运行时、事件桥、
-数据目录、单实例锁、窗口 + sidebar + 四占位视图。无业务功能。
+当前是 change 3（`desktop-sqlite-storage`）：change 2 骨架 + SQLite 存储。
+凭据与配置默认落 `<数据目录>/kiro.db`（WAL），凭据 secret 字段走系统
+钥匙串（`keyring`），无 Secret Service 的环境回退加密文件（`secrets.enc`）。
+显式 `--config` / `--credentials` 时仍走 JSON 文件（等价 CLI，调试用）。
 
 ## 构建前提
 
@@ -76,9 +78,16 @@ xvfb-run -a target/release/kiro-desktop \
 ```
 
 `--config` / `--credentials` 显式指定时走 JSON 文件存储（等价 CLI 行为，
-便于调试）；未指定时读数据目录下的 `config.json` / `credentials.json`。
+便于调试）；未指定时走 SQLite 存储，首启会检测数据目录与 cwd 下的
+`config.json` / `credentials.json` 并导入（成功后备份 `.bak`）。
 数据目录：Linux `$XDG_DATA_HOME/kiro-rs/`（缺省 `~/.local/share/kiro-rs/`），
-可用 `KIRO_RS_DATA_DIR` 覆盖。
+可用 `KIRO_RS_DATA_DIR` 覆盖。目录内含：
+
+| 文件 | 内容 |
+| --- | --- |
+| `kiro.db` / `-wal` / `-shm` | SQLite 主存储（凭据、配置、模型目录） |
+| `secrets.enc` / `secrets.key` | 钥匙串不可用时的加密文件回退（0600） |
+| `kiro-desktop.log` / `kiro-desktop.lock` | 日志与单实例锁（change 2） |
 
 ## 告警纪律
 
@@ -88,7 +97,7 @@ xvfb-run -a target/release/kiro-desktop \
 
 ## 后续
 
-- change 3：SQLite 存储替换 JSON store
+- change 3：SQLite 存储替换 JSON store（本次）
 - change 4/5：凭据视图、设置与服务器视图
 - change 6：托盘与常驻
 - change 7：打包与三平台 CI

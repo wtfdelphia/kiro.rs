@@ -2687,9 +2687,12 @@ impl MultiTokenManager {
     // ========================================================================
 
 
-    /// 测试/内部：写入凭据模型缓存（不访问上游）
-    #[cfg(test)]
-    pub fn test_seed_model_cache(
+    /// 写入凭据模型缓存（不访问上游）
+    ///
+    /// 测试注入与桌面端从 SQLite 回填模型目录共用此入口（后者在
+    /// `bootstrap` 之后、预热刷新之外提供重启恢复能力）。写入后立即重建
+    /// 全局聚合。
+    pub fn seed_model_cache(
         &self,
         id: u64,
         models: Vec<UpstreamModelInfo>,
@@ -2707,6 +2710,17 @@ impl MultiTokenManager {
             },
         );
         self.rebuild_global_catalog_locked(&mut catalog);
+    }
+
+    /// 读取指定凭据的模型缓存原始列表（含未进全局聚合前的全部条目）。
+    /// 凭据不存在或无缓存时返回空列表。桌面端用它把目录落盘进 SQLite。
+    pub fn credential_model_catalog(&self, id: u64) -> Vec<UpstreamModelInfo> {
+        self.model_catalog
+            .lock()
+            .per_credential
+            .get(&id)
+            .map(|c| c.raw.clone())
+            .unwrap_or_default()
     }
 
     /// 启动后台模型预热：对启用凭据限并发 refresh（失败仅 log）

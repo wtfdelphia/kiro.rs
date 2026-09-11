@@ -2160,7 +2160,7 @@ mod tests {
             // use refresh path internals: write through refresh_models is async; use test helper if any
             // Directly call get after seeding via private API is hard; use token_manager test inject if exists.
             // Fallback: only assert field presence when empty path works; if inject available:
-            mgr.test_seed_model_cache(1, vec![info], Some("2026-07-24T00:00:00Z".into()));
+            mgr.seed_model_cache(1, vec![info], Some("2026-07-24T00:00:00Z".into()));
         }
         let service = AdminService::new(mgr, Vec::<String>::new());
         let status = service.get_all_credentials();
@@ -2802,7 +2802,7 @@ mod tests {
             .collect();
         let mgr =
             Arc::new(MultiTokenManager::new(Config::default(), creds, None, None, false).unwrap());
-        mgr.test_seed_model_cache(
+        mgr.seed_model_cache(
             3,
             vec![UpstreamModelInfo {
                 model_id: "claude-sonnet-4.6".into(),

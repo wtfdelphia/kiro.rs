@@ -23,6 +23,11 @@
 | --- | --- | --- | --- | --- |
 | tower | dev-dependency | 0.5.2（features: util） | 单测中用 `ServiceExt::oneshot` 对真实 Axum Router 发请求，支撑 `live ⊆ routes` 防漂移断言与 auth / body-limit 矩阵 | `public-api-catalog-admin-display` |
 | gpui-kit | 依赖（仅 `desktop/` workspace） | 0.6.1（解析到 `gpui-pre` 0.3.4） | 桌面应用骨架的 UI 框架与组件（GPUI + gpui-base + gpui-component） | `desktop-app-shell` |
+| rusqlite | 依赖（仅 `desktop/` workspace） | 0.40.2（`bundled` feature，自带 SQLite 源码） | 桌面端主存储：凭据、配置、模型目录落盘（`kiro.db`） | `desktop-sqlite-storage` |
+| keyring | 依赖（仅 `desktop/` workspace） | 4.2.0（默认 `v1` feature，Linux 走 zbus Secret Service） | 桌面端凭据 secret 字段存系统钥匙串；无 Secret Service 时回退加密文件 | `desktop-sqlite-storage` |
+| parking_lot | 依赖（仅 `desktop/` workspace） | 0.12.5 | SQLite 单写连接互斥（不用 `tokio::sync::Mutex`，避免跨运行时等锁拖住后台线程池） | `desktop-sqlite-storage` |
+| ring | 依赖（仅 `desktop/` workspace） | 0.17.14（已在桌面锁内，随 gpui 引入） | 加密文件回退后端的 AES-256-GCM 与随机数 | `desktop-sqlite-storage` |
+| tempfile | dev-dependency（仅 `desktop/` workspace） | 3.x | store 模块单测的临时目录 | `desktop-sqlite-storage` |
 
 `tower` 已是 axum 的传递依赖（`Cargo.lock` 中原本存在），此处只是显式声明为
 dev-dependency 以便测试直接引用；不增加运行时依赖，不进入发布产物。
@@ -30,6 +35,10 @@ dev-dependency 以便测试直接引用；不增加运行时依赖，不进入�
 `gpui-kit` 只在 `desktop/` 独立 workspace 中引入，根仓 `Cargo.toml` 与发布
 产物不受影响；桌面锁文件为 `desktop/Cargo.lock`。`clap` 根仓本已依赖，
 桌面端各自声明、各自锁版本。
+
+`rusqlite` / `keyring` / `parking_lot` / `ring` / `tempfile` 同样只在
+`desktop/` workspace 声明与锁定，根仓依赖零变化。`ring` 本已随桌面锁的
+gpui 依赖链存在，此处显式声明供加密文件回退使用。
 
 ## 安装核验命令（示例）
 
