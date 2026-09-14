@@ -5,6 +5,8 @@
 
 pub mod credentials;
 pub mod root;
+pub mod server;
+pub mod settings;
 pub mod views;
 
 pub use root::AppView;

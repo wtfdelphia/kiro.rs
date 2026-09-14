@@ -116,6 +116,19 @@ impl SqliteStore {
         Ok(n > 0)
     }
 
+    /// WAL checkpoint：把 WAL 内容合并回主库文件（两阶段退出阶段 1 调用）
+    ///
+    /// `PRAGMA wal_checkpoint(TRUNCATE)` 完成后 `-wal` 文件被截空，
+    /// 备份与外部工具只需看主库文件。失败仅记日志：checkpoint 失败不
+    /// 阻塞退出（数据仍在 WAL 里，下次打开自动恢复）。
+    pub fn wal_checkpoint(store: &Arc<Self>) {
+        let conn = store.conn.lock();
+        match conn.pragma_update(None, "wal_checkpoint", "TRUNCATE") {
+            Ok(()) => tracing::info!("SQLite WAL checkpoint 完成"),
+            Err(e) => tracing::warn!("SQLite WAL checkpoint 失败（不影响退出）: {}", e),
+        }
+    }
+
     /// 钥匙串条目探测（测试专用：断言删除后的同步清理）
     #[cfg(test)]
     pub(crate) fn secret_present(&self, key: &str) -> bool {

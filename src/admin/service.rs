@@ -763,6 +763,14 @@ impl AdminService {
         }
     }
 
+    /// 退出前强制落盘统计（跳过防抖）。
+    ///
+    /// 桌面端两阶段退出阶段 1 调用，保证尾部统计不丢。无存储后端时为
+    /// no-op（与 [`MultiTokenManager::flush_stats`] 一致）。
+    pub fn flush_stats(&self) {
+        self.token_manager.flush_stats();
+    }
+
     /// 设置负载均衡模式
     pub fn set_load_balancing_mode(
         &self,
@@ -1399,6 +1407,56 @@ impl AdminService {
         Ok(super::types::SuccessResponse::new("鉴权设置已更新"))
     }
 
+    /// 服务器监听设置（host / port）
+    ///
+    /// 桌面端服务视图读取与修改；CLI 侧配置加载同样经此读写。
+    /// 修改落盘后，运行中的服务器不会换端口（新地址在下次启动生效）。
+    pub fn get_server_settings(&self) -> crate::admin::types::ServerSettingsResponse {
+        let cfg = self.token_manager.config();
+        crate::admin::types::ServerSettingsResponse {
+            host: cfg.host.clone(),
+            port: cfg.port,
+        }
+    }
+
+    /// 更新服务器监听设置：未携带字段保持当前值；校验后落盘
+    pub fn update_server_settings(
+        &self,
+        req: crate::admin::types::UpdateServerSettingsRequest,
+    ) -> Result<super::types::SuccessResponse, AdminServiceError> {
+        let current = self.get_server_settings();
+        let host = match req.host {
+            Some(h) => {
+                let t = h.trim().to_string();
+                if t.is_empty() {
+                    return Err(AdminServiceError::InvalidCredential("host 不能为空".into()));
+                }
+                t
+            }
+            None => current.host,
+        };
+        let port = match req.port {
+            Some(0) => {
+                return Err(AdminServiceError::InvalidCredential(
+                    "port 不能为 0（0 是桌面端启动时的随机端口占位，不适合作为配置）".into(),
+                ));
+            }
+            Some(p) => p,
+            None => current.port,
+        };
+
+        self.token_manager
+            .update_config_with(|cfg| {
+                cfg.host = host;
+                cfg.port = port;
+            })
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        self.token_manager
+            .save_config()
+            .map_err(|e| AdminServiceError::InternalError(format!("配置落盘失败: {}", e)))?;
+        Ok(super::types::SuccessResponse::new("服务器监听设置已更新"))
+    }
+
     pub fn get_client_identity_settings(&self) -> ClientIdentitySettingsResponse {
         let cfg = self.token_manager.config();
         ClientIdentitySettingsResponse {
@@ -1977,6 +2035,7 @@ fn matches_query(item: &CredentialStatusItem, query: &CredentialsQuery) -> bool 
 mod tests {
     use super::*;
     use crate::admin::types::TestCredentialRequest;
+    use crate::admin::types::UpdateServerSettingsRequest;
     use crate::kiro::model::credentials::KiroCredentials;
     use crate::model::config::Config;
 
@@ -2115,6 +2174,57 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn server_settings_get_update_and_persist() {
+        let (cfg, path) = temp_config();
+        let mgr = manager_with_config(cfg);
+        let service = AdminService::new(mgr, Vec::<String>::new());
+        let before = service.get_server_settings();
+        assert!(!before.host.is_empty(), "默认配置应有 host");
+        assert!(before.port > 0, "默认配置应有合法端口");
+
+        // 部分更新：只改 port，host 保持
+        let resp = service
+            .update_server_settings(UpdateServerSettingsRequest {
+                host: None,
+                port: Some(9999),
+            })
+            .unwrap();
+        assert!(resp.success);
+        let after = service.get_server_settings();
+        assert_eq!(after.port, 9999);
+        assert_eq!(after.host, before.host);
+
+        // 落盘文件包含新值
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("9999"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn server_settings_rejects_invalid() {
+        let (cfg, path) = temp_config();
+        let mgr = manager_with_config(cfg);
+        let service = AdminService::new(mgr, Vec::<String>::new());
+
+        let err = service
+            .update_server_settings(UpdateServerSettingsRequest {
+                host: Some("  ".into()),
+                port: None,
+            })
+            .unwrap_err();
+        assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
+
+        let err = service
+            .update_server_settings(UpdateServerSettingsRequest {
+                host: None,
+                port: Some(0),
+            })
+            .unwrap_err();
+        assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

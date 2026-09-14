@@ -1717,6 +1717,15 @@ impl MultiTokenManager {
         }
     }
 
+    /// 退出前强制落盘统计：跳过 [`save_stats_debounced`] 的防抖判断。
+    ///
+    /// 防抖窗口内的最后一次更新可能还留在内存里，进程退出前必须刷盘，
+    /// 否则桌面端两阶段退出（阶段 1 落盘）会丢尾部统计。无缓存目录
+    /// （存储后端不提供）时静默返回，与 `save_stats` 行为一致。
+    pub fn flush_stats(&self) {
+        self.save_stats();
+    }
+
     /// 标记统计数据已更新，并按 debounce 策略决定是否立即落盘
     fn save_stats_debounced(&self) {
         self.stats_dirty.store(true, Ordering::Relaxed);
@@ -3152,6 +3161,46 @@ mod tests {
         let expires = Utc::now() + Duration::minutes(15);
         credentials.expires_at = Some(expires.to_rfc3339());
         assert!(!is_token_expiring_soon(&credentials));
+    }
+
+    #[test]
+    fn flush_stats_bypasses_debounce_and_persists() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-flush-stats-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cred_path = dir.join("credentials.json");
+
+        let mut cred = KiroCredentials::default();
+        cred.refresh_token = Some("x".repeat(150));
+        let mgr = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(cred_path),
+            true,
+        )
+        .unwrap();
+
+        let stats_path = dir.join("kiro_stats.json");
+        // 首次成功：无上次落盘时间，防抖直接放行，立即写盘
+        mgr.report_success(1);
+        assert!(stats_path.exists(), "首次统计应立即落盘");
+
+        // 第二次成功：落在 30 秒防抖窗口内，不写盘
+        mgr.report_success(1);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&stats_path).unwrap()).unwrap();
+        assert_eq!(v["1"]["success_count"], 1, "防抖窗口内不应写盘");
+
+        // flush_stats 强制落盘：退出前的最后一刷
+        mgr.flush_stats();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&stats_path).unwrap()).unwrap();
+        assert_eq!(v["1"]["success_count"], 2, "flush_stats 应跳过防抖落盘");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

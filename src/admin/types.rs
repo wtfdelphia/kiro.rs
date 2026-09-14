@@ -1115,6 +1115,22 @@ pub struct UpdateAuthSettingsRequest {
     pub api_key: Option<String>,
 }
 
+/// 服务器监听设置（host / port）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerSettingsResponse {
+    pub host: String,
+    pub port: u16,
+}
+
+/// 更新服务器监听设置：未携带字段保持当前值
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateServerSettingsRequest {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientIdentitySettingsResponse {

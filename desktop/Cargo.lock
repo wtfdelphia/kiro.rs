@@ -3949,6 +3949,7 @@ name = "kiro-desktop"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "clap",
  "futures",
@@ -3958,6 +3959,7 @@ dependencies = [
  "kiro-rs",
  "open",
  "parking_lot",
+ "reqwest",
  "ring",
  "rusqlite",
  "serde",

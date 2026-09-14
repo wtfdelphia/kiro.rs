@@ -12,6 +12,7 @@ path = "src/main.rs"
 kiro-rs = { path = "../../.." }
 gpui-kit = "0.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+axum = "0.8"
 futures = "0.3"
 anyhow = "1"
 tracing = "0.1"
@@ -28,4 +29,6 @@ open = "5"
 
 [dev-dependencies]
 tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 gpui = { package = "gpui-pre", version = "0.3.4", features = ["test-support"] }
+gpui-kit = { version = "0.6", features = ["test-support"] }
