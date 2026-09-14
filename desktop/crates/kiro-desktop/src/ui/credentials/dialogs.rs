@@ -30,7 +30,8 @@ pub fn open_delete_confirm(
         dialog
             .title("删除凭据")
             .description(format!(
-                "确认删除凭据 #{}？此操作会同步清理本地存储与钥匙串条目。",
+                "确认删除凭据 #{}？启用中的凭据将先禁用再删除；\
+                此操作会同步清理本地存储与钥匙串条目。",
                 id
             ))
             .button_props(
@@ -47,6 +48,11 @@ pub fn open_delete_confirm(
                     let view = view.clone();
                     let service = exec.service.clone();
                     let rx = exec.exec(async move {
+                        // 服务端要求凭据先禁用才能删除（只能删除已禁用
+                        // 的凭据），两步在同一任务内串行：禁用失败即中止
+                        service
+                            .set_disabled(id, true)
+                            .map_err(|e| format!("删除前禁用失败: {}", e))?;
                         service.delete_credential(id).map_err(|e| e.to_string())
                     });
                     window

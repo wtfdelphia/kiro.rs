@@ -169,3 +169,37 @@ async fn exec_delete_cleans_sqlite_row_and_secret() {
     // 钥匙串条目同步清理
     assert!(!store.secret_present(&secret_key), "删除后钥匙串条目应同步清理");
 }
+
+/// 审核修复 4：启用中的凭据经删除对话框单任务「先禁用再删除」路径可删
+#[tokio::test]
+async fn exec_delete_enabled_credential_disables_then_deletes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_store(dir.path());
+    let creds = vec![social_cred("en@x.com", "rt-en")];
+    let service = service_with_store(store.clone(), creds);
+    let handle = CoreHandle::new(service.clone(), tokio::runtime::Handle::current());
+
+    let q = CredentialsQuery::default();
+    let id = service
+        .query_credentials(&q)
+        .credentials
+        .into_iter()
+        .next()
+        .unwrap()
+        .id;
+
+    // 与 open_delete_confirm 的 on_ok 同构：单个 exec 内串行两步
+    let svc = service.clone();
+    handle
+        .exec(async move {
+            svc.set_disabled(id, true).map_err(|e| format!("删除前禁用失败: {}", e))?;
+            svc.delete_credential(id).map_err(|e| e.to_string())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let after = service.query_credentials(&q);
+    assert_eq!(after.total, 0, "启用中的凭据经先禁用再删除后应为空");
+    assert_eq!(store.credential_count().unwrap(), 0, "SQLite 凭据行应清空");
+}

@@ -40,7 +40,11 @@ impl InstanceLock {
             }
         })?;
 
-        // 写 PID 便于排查（锁文件保留，不删）
+        // 写 PID 便于排查（锁文件保留，不删）。
+        // 先截断再写：新 PID 位数可能比上次短（12345 -> 987），
+        // 不截断会残留旧字节。不能在 open 时加 .truncate(true)——
+        // 那会在别的进程持锁时抹掉它的 PID。拿锁成功后才截断。
+        file.set_len(0).map_err(Some)?;
         let mut f = &file;
         let _ = write!(f, "{}", std::process::id());
 
@@ -104,6 +108,24 @@ mod tests {
         let lock = InstanceLock::acquire(&dir).expect("拿锁应成功");
         let content = std::fs::read_to_string(&lock.path).unwrap();
         assert_eq!(content, std::process::id().to_string());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stale_longer_pid_is_truncated() {
+        let dir = temp_dir();
+        let lock_path = dir.join("kiro-desktop.lock");
+        // 预写一个比当前 PID 长的旧内容，模拟上次运行的残留
+        std::fs::write(&lock_path, "9999999999").unwrap();
+
+        let lock = InstanceLock::acquire(&dir).expect("拿锁应成功");
+        let content = std::fs::read_to_string(&lock.path).unwrap();
+        assert_eq!(
+            content,
+            std::process::id().to_string(),
+            "写新 PID 前必须截断旧内容，不能残留旧字节"
+        );
+        drop(lock);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

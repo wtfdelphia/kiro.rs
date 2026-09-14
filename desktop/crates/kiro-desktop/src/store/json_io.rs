@@ -38,7 +38,6 @@ pub fn detect_and_import_in(
     store: &SqliteStore,
     dirs: &[std::path::PathBuf],
 ) -> ImportReport {
-    let _ = data_dir;
     let mut report = ImportReport::default();
 
     for dir in dirs {
@@ -46,6 +45,7 @@ pub fn detect_and_import_in(
         if cred_path.exists() && report.credential_count == 0 {
             match import_credentials(store, &cred_path) {
                 Ok(n) => {
+                    log_import_source(data_dir, &cred_path, "凭据");
                     if let Ok(backup) = backup_file(&cred_path) {
                         report.backups.push(backup);
                     }
@@ -59,6 +59,7 @@ pub fn detect_and_import_in(
         if config_path.exists() && !report.config_imported {
             match import_config(store, &config_path) {
                 Ok(()) => {
+                    log_import_source(data_dir, &config_path, "配置");
                     if let Ok(backup) = backup_file(&config_path) {
                         report.backups.push(backup);
                     }
@@ -78,6 +79,19 @@ pub fn detect_and_import_in(
         );
     }
     report
+}
+
+/// 记录单次成功导入的来源路径；来源在数据目录之外（cwd 命中）时额外告警
+fn log_import_source(data_dir: &Path, source: &Path, kind: &str) {
+    tracing::info!("已导入{}文件: {}", kind, source.display());
+    if !source.starts_with(data_dir) {
+        tracing::warn!(
+            "{}导入来源在数据目录之外（{}），已备份为 .bak；\
+             如非预期，请检查启动目录下的 config.json / credentials.json",
+            kind,
+            source.display()
+        );
+    }
 }
 
 /// 导入单个凭据 JSON 文件（单对象或数组或导入工具容器格式）

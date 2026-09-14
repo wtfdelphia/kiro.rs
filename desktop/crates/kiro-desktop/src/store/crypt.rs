@@ -99,7 +99,23 @@ pub fn load_or_create_key(path: &Path) -> anyhow::Result<[u8; KEY_LEN]> {
 }
 
 /// 写文件并设 0600 权限（Unix）
+///
+/// Unix 下用 `OpenOptions::mode(0o600)` 创建：文件出生即 0600，
+/// 没有「默认 0644 创建完再改权限」的可读窗口。`set_permissions`
+/// 兜底把已存在的文件（旧版本写下的）也收紧到 0600。
 pub fn write_file_0600(path: &Path, content: &[u8]) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    let mut f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("创建文件失败: {}", path.display()))?
+    };
+    #[cfg(not(unix))]
     let mut f = fs::File::create(path)
         .with_context(|| format!("创建文件失败: {}", path.display()))?;
     f.write_all(content)?;
@@ -169,6 +185,22 @@ mod tests {
         load_or_create_key(&path).unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_0600_tightens_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loose.enc");
+        // 模拟旧版本写下的宽松权限文件
+        fs::write(&path, b"old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_file_0600(&path, b"new").unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "已存在的文件也必须收紧到 0600");
+        assert_eq!(fs::read(&path).unwrap(), b"new");
     }
 
     #[test]

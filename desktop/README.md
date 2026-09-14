@@ -78,8 +78,21 @@ xvfb-run -a target/release/kiro-desktop \
 ```
 
 `--config` / `--credentials` 显式指定时走 JSON 文件存储（等价 CLI 行为，
-便于调试）；未指定时走 SQLite 存储，首启会检测数据目录与 cwd 下的
-`config.json` / `credentials.json` 并导入（成功后备份 `.bak`）。
+便于调试）；未指定时走 SQLite 存储。
+
+### 首启 JSON 导入
+
+SQLite 库为空（无凭据且无配置）时，首启按顺序探测两个目录下的
+`config.json` / `credentials.json`：
+
+1. 数据目录（`KIRO_RS_DATA_DIR` 或默认 `~/.local/share/kiro-rs/`）
+2. 启动时的工作目录（cwd）
+
+命中即导入，成功后源文件改名为 `config.json.bak` /
+`credentials.json.bak`（同名已存在时覆盖）。cwd 命中意味着启动目录下
+有这两个文件会被搬走，日志会以 warn 记录来源路径；不想让桌面端碰
+工作目录文件时，从别的目录启动，或先把文件挪进数据目录。
+
 数据目录：Linux `$XDG_DATA_HOME/kiro-rs/`（缺省 `~/.local/share/kiro-rs/`），
 可用 `KIRO_RS_DATA_DIR` 覆盖。目录内含：
 
