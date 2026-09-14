@@ -4,7 +4,10 @@
 `docs/desktop-gpui-embedded-design.md` §3.1：根门禁环境没有 GPUI 的
 Linux 系统依赖，合并会打穿服务端发布路径）。
 
-当前是 change 3（`desktop-sqlite-storage`）：change 2 骨架 + SQLite 存储。
+当前已完成到 change 4（`desktop-credentials-view`）加审核修复
+（`desktop-review-followups`）：change 2 骨架、change 3 SQLite 存储、
+change 4 凭据视图（列表/筛选/启停/删除/测试/余额 + 添加/批量导入/
+KAM 导入对话框 + Builder ID / IAM SSO 在线登录）。
 凭据与配置默认落 `<数据目录>/kiro.db`（WAL），凭据 secret 字段走系统
 钥匙串（`keyring`），无 Secret Service 的环境回退加密文件（`secrets.enc`）。
 显式 `--config` / `--credentials` 时仍走 JSON 文件（等价 CLI，调试用）。
@@ -110,7 +113,6 @@ SQLite 库为空（无凭据且无配置）时，首启按顺序探测两个目�
 
 ## 后续
 
-- change 3：SQLite 存储替换 JSON store（本次）
-- change 4/5：凭据视图、设置与服务器视图
+- change 5：设置面板与服务器启停视图（未开始）
 - change 6：托盘与常驻
 - change 7：打包与三平台 CI

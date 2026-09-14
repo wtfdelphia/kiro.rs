@@ -602,6 +602,12 @@ Root
 | 6 | `desktop-tray-resident` | tray-icon 集成、关窗拦截、窗口重建、托盘四态图标与菜单、开机自启 | 三平台托盘交互手测；关窗常驻 → 托盘唤回全流程 |
 | 7 | `desktop-embedded-packaging` | 自动启动服务器收尾、`packager.toml`、三平台 CI 流水线（含 Linux 系统依赖安装步骤）、签名门控、应用图标资源 | 三平台产物构建证据（绿路径）；签名缺失降级路径证据（红路径）；产物可安装冒烟 |
 
+> **进度注记（2026-09-14）**：change 1 至 4 已实现并各自提交
+> （`9323be7`、`09a31f4`、`c620b82`、`c633953`），change 4 之后的
+> 审核修复另立为 `desktop-review-followups`（`ebde5d1`：锁文件截断、
+> 加密文件创建权限、首启导入日志可见性、删除前自动禁用）。change 5
+> 起未开始。
+
 依赖关系：change 1 是全部前置；change 2 用 change 1 的 `JsonCredentialStore` / `JsonConfigStore` 读取配置与凭据（解决 v2 的「shell 启动就要读配置，存储层却在 change 3」的顺序问题）；change 3 是 4/5/6 的前置（视图与服务都依赖存储层）。
 
 每个 change 实现前按门禁走 `openspec-superpowers-bridge`，实现后 `spec-compliance-check`，归档前 `openspec-verify-change`。

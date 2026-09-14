@@ -960,6 +960,7 @@ kiro-rs/
 │   └── common/                 # 公共模块
 │       └── auth.rs             # 认证工具函数
 ├── admin-ui/                   # Admin UI 前端工程（构建产物会嵌入二进制）
+├── desktop/                    # 桌面版（GPUI，独立 workspace，见 desktop/README.md）
 ├── tools/                      # 辅助工具
 ├── Cargo.toml                  # 项目配置
 ├── config.example.json         # 配置示例
