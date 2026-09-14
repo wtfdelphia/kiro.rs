@@ -26,6 +26,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 open = "5"
+# change 6：系统托盘。ksni 后端 = 纯 D-Bus StatusNotifierItem，
+# 无 GTK 依赖（见 openspec/changes/desktop-tray-resident/evidence/tray-icon-0.25-ksni.md）
+tray-icon = { version = "0.25", default-features = false, features = ["ksni"] }
+
+# change 6：Windows 开机自启走注册表（target-gated，本环境只编译验证）
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
 
 [dev-dependencies]
 tempfile = "3"

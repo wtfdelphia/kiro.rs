@@ -3,8 +3,10 @@
 //! 双运行时：tokio 后台运行时先建好，GPUI `run()` 占用主线程。
 //! 装配完成后自动启动内嵌服务器（端口冲突进 Failed 态，界面可重试）；
 //! 退出走两阶段协调（`quit.rs`：先收敛服务器再 `cx.quit()`）。
-//! 托盘常驻由 change 6 实现。
+//! change 6 起：系统托盘（`tray.rs`）、关窗最小化常驻、开机自启
+//!（`autostart.rs`）与行为偏好（`store::prefs`）。
 
+mod autostart;
 mod bridge;
 mod core;
 mod lock;
@@ -12,12 +14,13 @@ mod logging;
 mod paths;
 mod quit;
 mod store;
+mod tray;
 mod ui;
 
 use std::sync::Arc;
 
 use clap::Parser;
-use futures::StreamExt;
+use futures::{StreamExt, future::Either};
 use gpui_kit::component::Root;
 use gpui_kit::*;
 use kiro_rs::storage::{ConfigStore, CredentialStore};
@@ -170,11 +173,20 @@ fn main() {
                     .with_ws_runtime(app_state.ws_settings.clone(), app_state.ws_admission.clone()),
                 );
                 server.attach(router, app_state.ws_shutdown.clone());
-                // 默认行为：装配成功即按配置地址启动；端口冲突就是
-                // bind 失败，进 Failed 态（服务视图可见原因并重试）
+                // 装配成功即按配置地址启动（`auto_start_server` 可关，
+                // change 6）；端口冲突就是 bind 失败，进 Failed 态
+                //（服务视图可见原因并重试）
                 let addr = format!("{}:{}", b.config.host, b.config.port);
-                tracing::info!("自动启动内嵌服务器: {}", addr);
-                server.start(&addr);
+                let auto_start = sqlite_store_for_boot
+                    .as_ref()
+                    .map(|s| s.get_preference(crate::store::prefs::AUTO_START_SERVER))
+                    .unwrap_or(true);
+                if auto_start {
+                    tracing::info!("自动启动内嵌服务器: {}", addr);
+                    server.start(&addr);
+                } else {
+                    tracing::info!("auto_start_server 关闭，跳过自动启动（服务视图 / 托盘可手动启动）");
+                }
                 let mut handle = crate::core::CoreHandle::new(
                     admin_service,
                     tokio::runtime::Handle::current(),
@@ -236,12 +248,12 @@ fn main() {
             let view = cx.open_window(WindowOptions::default(), |window, cx| {
                 let view = cx.new(|cx| AppView::new(window, cx));
                 *slot.write() = Some(view.clone());
-                // 关窗拦截：未退出时进阶段 1 并保留窗口（阶段 2 随进程
-                // 退出）；已进入退出流程则放行。change 6 会把这里改成
-                // 「常驻时最小化」。
+                // 关窗拦截（change 6 常驻，design D2）：退出中放行；
+                // `close_to_tray` 开则最小化常驻（窗口不销毁）；关则进
+                // 两阶段退出阶段 1 并保留窗口（阶段 2 随进程退出）。
                 let slot2 = slot.clone();
                 let events2 = events_for_close.clone();
-                window.on_window_should_close(cx, move |_window, cx| {
+                window.on_window_should_close(cx, move |window, cx| {
                     if quit::is_quitting() {
                         return true;
                     }
@@ -251,6 +263,15 @@ fn main() {
                     let Some(handle) = v.read(cx).core_handle() else {
                         return true;
                     };
+                    // 调试模式（无 SQLite）按缺省：关窗常驻开
+                    let close_to_tray = handle
+                        .store()
+                        .map(|s| s.get_preference(crate::store::prefs::CLOSE_TO_TRAY))
+                        .unwrap_or(true);
+                    if close_to_tray {
+                        window.minimize_window();
+                        return false;
+                    }
                     quit::begin_phase1(handle, events2.clone(), cx);
                     false
                 });
@@ -267,14 +288,38 @@ fn main() {
                 }
             };
 
-            // 消费事件循环：装配句柄、服务器状态、退出协调
-            while let Some(event) = event_rx.next().await {
+            // 托盘驻留主线程：`tray_icon::TrayIcon` 内部 `Rc<RefCell<…>>`
+            //（!Send），不能挂跨线程的 `CoreHandle`（design D3 的挂法在
+            // 编译层不成立，修正为驻留事件循环）。无 SNI 宿主时自动降级。
+            let mut tray = tray::Tray::init();
+            let any_window: gpui::AnyWindowHandle = *window_handle;
+            let events_for_tray = events_for_close.clone();
+
+            // 消费事件循环：装配句柄、服务器状态、退出协调；托盘事件经
+            // 200ms tick 交织轮询（`tray::poll`，try_recv 非阻塞）
+            loop {
+                let next_event = event_rx.next();
+                futures::pin_mut!(next_event);
+                let tick = cx.background_executor().timer(tray::POLL_INTERVAL);
+                futures::pin_mut!(tick);
+                let event = match futures::future::select(next_event, tick).await {
+                    Either::Left((event, _)) => event,
+                    Either::Right((_, _)) => {
+                        tray.poll(cx);
+                        continue;
+                    }
+                };
+                let Some(event) = event else {
+                    // 事件通道关闭：装配任务已退出，应用随之结束
+                    break;
+                };
                 match event {
                     CoreEvent::Bootstrapped {
                         credential_count,
                         handle,
                     } => {
                         tracing::info!("核心装配完成，凭据数: {}", credential_count);
+                        tray.attach(handle.clone(), events_for_tray.clone(), any_window);
                         let _ = window_handle.update(cx, move |root, _, cx| {
                             let root_view = root.view().clone();
                             if let Ok(app_view) = root_view.downcast::<AppView>() {
@@ -294,6 +339,7 @@ fn main() {
                     }
                     CoreEvent::ServerStatus(status) => {
                         tracing::info!("服务器状态: {:?}", status);
+                        tray.on_server_status(status.clone());
                         let _ = window_handle.update(cx, move |root, _, cx| {
                             let root_view = root.view().clone();
                             if let Ok(app_view) = root_view.downcast::<AppView>() {
@@ -314,8 +360,11 @@ fn main() {
                     }
                 }
             }
+            drop(tray);
         })
         .detach();
     });
-    // run() 返回即应用已退出（两阶段退出已在 quit 前完成）；rt 在此 drop
+    // run() 返回即应用已退出（两阶段退出已在 quit 前完成）；托盘随
+    // `Tray` drop 关闭（D-Bus 服务 shutdown + watcher 线程 join）。
+    // rt 在此 drop
 }

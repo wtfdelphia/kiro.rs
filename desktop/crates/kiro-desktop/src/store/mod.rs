@@ -27,6 +27,26 @@ use kiro_rs::storage::{ConfigStore, CredentialStore};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 
+/// 行为偏好（change 6：托盘常驻 / 开机自启 / 自动启动服务器）
+pub mod prefs {
+    /// 关窗时最小化常驻（关则走两阶段退出）
+    pub const CLOSE_TO_TRAY: &str = "close_to_tray";
+    /// 开机自启（联动平台入口，见 `autostart`）
+    pub const LAUNCH_AT_LOGIN: &str = "launch_at_login";
+    /// 装配成功后自动启动内嵌服务器
+    pub const AUTO_START_SERVER: &str = "auto_start_server";
+
+    /// 缺省值（不写库，读时兜底）
+    pub fn default(key: &str) -> bool {
+        match key {
+            CLOSE_TO_TRAY => true,
+            AUTO_START_SERVER => true,
+            LAUNCH_AT_LOGIN => false,
+            _ => false,
+        }
+    }
+}
+
 /// SQLite 存储：单写连接 + secret 后端
 pub struct SqliteStore {
     data_dir: PathBuf,
@@ -183,6 +203,49 @@ impl SqliteStore {
             }
         }
         Ok(grouped.into_iter().collect())
+    }
+
+    // ========================================================================
+    // 行为偏好（change 6：schema v2 `preferences` 表）
+    // ========================================================================
+
+    /// 读行为设置：未写库返回缺省值；读库失败记日志后同样兜底缺省
+    ///（偏好读取不阻断托盘 / 关窗拦截等主路径）
+    pub fn get_preference(&self, key: &str) -> bool {
+        let default = prefs::default(key);
+        let conn = self.conn.lock();
+        let row: Option<String> = conn
+            .query_row(
+                "SELECT value FROM preferences WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap_or_else(|e| {
+                tracing::warn!("读取偏好失败（{}），按缺省 {} 处理: {}", e, default, key);
+                None
+            });
+        match row.as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            None => default,
+            Some(other) => {
+                tracing::warn!("偏好值非法（{}={}），按缺省 {} 处理", key, other, default);
+                default
+            }
+        }
+    }
+
+    /// 写行为设置（upsert）。调用方负责先完成伴随动作（如开机自启的
+    /// 平台入口写入）再落库
+    pub fn set_preference(&self, key: &str, value: bool) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO preferences (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, if value { "1" } else { "0" }],
+        )?;
+        Ok(())
     }
 }
 

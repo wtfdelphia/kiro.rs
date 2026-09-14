@@ -372,3 +372,78 @@ impl SecretBackend for BackendClone {
         true
     }
 }
+
+// ============================================================================
+// change 6：preferences（schema v2）
+// ============================================================================
+
+/// 未写库：读缺省值（close_to_tray / auto_start_server 默认开，
+/// launch_at_login 默认关），且缺省不落库
+#[test]
+fn preference_defaults_without_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_store(dir.path());
+
+    assert!(store.get_preference(super::prefs::CLOSE_TO_TRAY));
+    assert!(store.get_preference(super::prefs::AUTO_START_SERVER));
+    assert!(!store.get_preference(super::prefs::LAUNCH_AT_LOGIN));
+
+    // 缺省读取不产生行
+    let conn = store.conn.lock();
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM preferences", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+/// 写入读出 + 覆盖 + 重开持久
+#[test]
+fn preference_write_read_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_store(dir.path());
+
+    store
+        .set_preference(super::prefs::CLOSE_TO_TRAY, false)
+        .unwrap();
+    store
+        .set_preference(super::prefs::LAUNCH_AT_LOGIN, true)
+        .unwrap();
+    assert!(!store.get_preference(super::prefs::CLOSE_TO_TRAY));
+    assert!(store.get_preference(super::prefs::LAUNCH_AT_LOGIN));
+
+    // 覆盖写（upsert 不产生重复行）
+    store
+        .set_preference(super::prefs::CLOSE_TO_TRAY, true)
+        .unwrap();
+    assert!(store.get_preference(super::prefs::CLOSE_TO_TRAY));
+    {
+        let conn = store.conn.lock();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM preferences", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+    drop(store);
+
+    // 重开：偏好持久
+    let store2 = open_store(dir.path());
+    assert!(store2.get_preference(super::prefs::CLOSE_TO_TRAY));
+    assert!(store2.get_preference(super::prefs::LAUNCH_AT_LOGIN));
+    assert!(store2.get_preference(super::prefs::AUTO_START_SERVER));
+}
+
+/// 非法值：读时兜底缺省（手改库的容错）
+#[test]
+fn preference_invalid_value_falls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_store(dir.path());
+    {
+        let conn = store.conn.lock();
+        conn.execute(
+            "INSERT INTO preferences (key, value) VALUES ('close_to_tray', 'yes')",
+            [],
+        )
+        .unwrap();
+    }
+    assert!(store.get_preference(super::prefs::CLOSE_TO_TRAY));
+}

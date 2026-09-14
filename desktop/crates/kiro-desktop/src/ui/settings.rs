@@ -1,9 +1,13 @@
 //! 设置视图（设计文档 §8「设置」行）
 //!
-//! 分区：鉴权 / 代理 / 默认端点 / 负载均衡 / WebSocket / 数据。
+//! 分区：鉴权 / 代理 / 默认端点 / 负载均衡 / WebSocket / 行为 / 数据。
 //! 全部经现有 `AdminService` 设置方法（change 4 起桌面实例已挂 auth /
 //! ws 运行时句柄，热更新直达运行中的服务器）。视图持快照，写操作成功
-//! 后整体重拉；`closeToTray` 与开机自启是 change 6 的设置项，本期不放。
+//! 后整体重拉。
+//!
+//! 行为分区（change 6）：关窗常驻 / 开机自启 / 自动启动服务器三个开关，
+//! 直读直写本地 SQLite `preferences` 表（不走 `AdminService`）；开机自启
+//! 开关联动平台入口，入口写入成功才落库。
 //!
 //! 数据分区：JSON 导出（保存对话框）与手动导入（选择对话框）。手动导入
 //! 不改名源文件，与首启自动导入（改名 `.bak`）区分。
@@ -23,7 +27,8 @@ use kiro_rs::admin::types::{
 };
 
 use crate::core::CoreHandle;
-use crate::store::json_io;
+use crate::store::{json_io, prefs};
+use crate::autostart;
 
 /// 各分区快照（视图持快照，写后重拉）
 #[derive(Default)]
@@ -35,6 +40,16 @@ struct Snapshot {
     ws: Option<WsSettingsResponse>,
     credential_count: i64,
     has_config: bool,
+    /// 行为偏好（无 SQLite 句柄的调试模式为 `None`，分区禁用）
+    behavior: Option<BehaviorSnapshot>,
+}
+
+/// 行为分区三键快照
+#[derive(Default, Clone)]
+struct BehaviorSnapshot {
+    close_to_tray: bool,
+    launch_at_login: bool,
+    auto_start_server: bool,
 }
 
 /// 设置视图
@@ -86,6 +101,11 @@ impl SettingsView {
                 .store()
                 .and_then(|st| st.has_config().ok())
                 .unwrap_or(false),
+            behavior: self.handle.store().map(|st| BehaviorSnapshot {
+                close_to_tray: st.get_preference(prefs::CLOSE_TO_TRAY),
+                launch_at_login: st.get_preference(prefs::LAUNCH_AT_LOGIN),
+                auto_start_server: st.get_preference(prefs::AUTO_START_SERVER),
+            }),
         };
         cx.notify();
     }
@@ -146,6 +166,32 @@ impl SettingsView {
             window,
             cx,
         );
+    }
+
+    /// 行为偏好写（change 6）：直写本地 `preferences` 表，成功重拉快照。
+    /// 与服务器设置不同，这三键不经 `AdminService`、无需网络。
+    fn save_preference(&mut self, key: &'static str, value: bool, cx: &mut Context<Self>) {
+        let Some(store) = self.handle.store().cloned() else {
+            return;
+        };
+        if let Err(e) = store.set_preference(key, value) {
+            tracing::warn!("写入偏好失败 ({}): {}", key, e);
+        }
+        self.reload(cx);
+    }
+
+    /// 开机自启开关联动平台入口（design D4/D5）：先写入口，成功才落库；
+    /// 失败则通知且偏好不变。
+    fn toggle_launch_at_login(&mut self, next: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(e) = autostart::set_enabled(next) {
+            tracing::warn!("设置开机自启失败（入口写入失败，偏好不变）: {}", e);
+            window.push_notification(
+                Notification::error(format!("开机自启设置失败: {}", e)),
+                cx,
+            );
+            return;
+        }
+        self.save_preference(prefs::LAUNCH_AT_LOGIN, next, cx);
     }
 
     fn save_endpoint(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -509,6 +555,41 @@ impl Render for SettingsView {
                 )));
         }
 
+        // 行为（change 6：托盘常驻 / 开机自启 / 自动启动服务器）
+        // 直读直写本地 preferences，不走 AdminService；无 SQLite 句柄
+        //（调试模式）时分区禁用
+        if let Some(behavior) = &snap.behavior {
+            page = page
+                .child(section("行为"))
+                .child(row(
+                    "关窗时最小化常驻",
+                    Switch::new("beh-close-tray")
+                        .checked(behavior.close_to_tray)
+                        .on_click(cx.listener(|this, checked: &bool, _window, cx| {
+                            this.save_preference(prefs::CLOSE_TO_TRAY, *checked, cx);
+                        })),
+                ))
+                .child(row(
+                    "开机自启",
+                    Switch::new("beh-launch-login")
+                        .checked(behavior.launch_at_login)
+                        .on_click(cx.listener(|this, checked: &bool, window, cx| {
+                            this.toggle_launch_at_login(*checked, window, cx);
+                        })),
+                ))
+                .child(row(
+                    "启动时自动运行服务器",
+                    Switch::new("beh-auto-start")
+                        .checked(behavior.auto_start_server)
+                        .on_click(cx.listener(|this, checked: &bool, _window, cx| {
+                            this.save_preference(prefs::AUTO_START_SERVER, *checked, cx);
+                        })),
+                ))
+                .child(div().text_xs().child(
+                    "关窗常驻仅最小化窗口，服务器与进程继续运行；退出经托盘「退出」或快捷键",
+                ));
+        }
+
         // 数据（JSON 导入导出）
         let store_available = self.handle.store().is_some();
         page = page
@@ -578,7 +659,8 @@ mod tests {
     /// 任务 5.5：六分区标题渲染（headless，经 a11y 标签断言）
     ///
     /// 数据分区在无 SQLite 句柄时仍渲染（导出/导入按钮禁用），
-    /// 断言六个分区全部在场
+    /// 断言六个分区全部在场。change 6 起「行为」分区仅在持有 SQLite
+    /// 句柄时渲染，本用例（无句柄）断言其缺席、其余六分区在场。
     #[gpui::test]
     fn all_sections_render_headless(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_kit::init);
@@ -610,10 +692,59 @@ mod tests {
                 assert_eq!(snap.label(), Some(title), "分区 {} 应渲染", title);
                 assert!(snap.visible(), "分区 {} 应可见", title);
             }
+            // 无 SQLite 句柄：行为分区不渲染
+            assert!(
+                window.try_find("sec-行为").is_none(),
+                "行为分区应缺席（无句柄）"
+            );
             // 无 SQLite 句柄：数据导出/导入按钮在场但禁用
             for id in ["export-creds", "export-config", "import-creds", "import-config"] {
                 assert!(window.find(id).visible(), "按钮 {} 应渲染", id);
             }
+        })
+        .unwrap();
+    }
+
+    /// 任务 5.2：行为分区在持有 SQLite 句柄时渲染，三个开关在场
+    #[gpui::test]
+    fn behavior_section_renders_with_store(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let service = Arc::new(kiro_rs::admin::AdminService::new_with_runtime(
+            Arc::new(
+                kiro_rs::kiro::token_manager::MultiTokenManager::new(
+                    kiro_rs::model::config::Config::default(),
+                    vec![],
+                    None,
+                    None,
+                    false,
+                )
+                .unwrap(),
+            ),
+            Vec::<String>::new(),
+            None,
+            None,
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        // 无钥匙串的测试环境自动回退加密文件后端（`select_backend`）
+        let store = crate::store::SqliteStore::open(dir.path()).unwrap();
+        let handle = CoreHandle::new(service, rt.handle().clone()).with_store(store);
+        let window = cx.add_window(move |window, cx| SettingsView::new(handle, window, cx));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            let sec = window.find("sec-行为");
+            assert_eq!(sec.label(), Some("行为"), "行为分区应渲染");
+            assert!(sec.visible(), "行为分区应可见");
+            for id in ["beh-close-tray", "beh-launch-login", "beh-auto-start"] {
+                assert!(window.find(id).visible(), "开关 {} 应渲染", id);
+            }
+            // 缺省：关窗常驻开、自动启动服务器开、开机自启关
+            assert_eq!(window.find("beh-close-tray").checked(), Some(true));
+            assert_eq!(window.find("beh-auto-start").checked(), Some(true));
+            assert_eq!(window.find("beh-launch-login").checked(), Some(false));
         })
         .unwrap();
     }

@@ -4,11 +4,13 @@
 `docs/desktop-gpui-embedded-design.md` §3.1：根门禁环境没有 GPUI 的
 Linux 系统依赖，合并会打穿服务端发布路径）。
 
-当前已完成到 change 5（`desktop-settings-server-view`）：change 2 骨架、
+当前已完成到 change 6（`desktop-tray-resident`）：change 2 骨架、
 change 3 SQLite 存储、change 4 凭据视图（列表/筛选/启停/删除/测试/
 余额 + 添加/批量导入/ KAM 导入对话框 + Builder ID / IAM SSO 在线
 登录）、change 5 设置面板与内嵌服务器（启停/重启/改地址即时重启 +
-两阶段退出 + 标题栏实时状态徽标），另有审核修复
+两阶段退出 + 标题栏实时状态徽标）、change 6 系统托盘与关窗常驻
+（`tray-icon` 0.25 ksni 后端，无 SNI 宿主自动降级；关窗最小化常驻 +
+托盘唤回；开机自启三平台入口；设置「行为」分区），另有审核修复
 （`desktop-review-followups`）。
 凭据与配置默认落 `<数据目录>/kiro.db`（WAL），凭据 secret 字段走系统
 钥匙串（`keyring`），无 Secret Service 的环境回退加密文件（`secrets.enc`）。
@@ -115,5 +117,4 @@ SQLite 库为空（无凭据且无配置）时，首启按顺序探测两个目�
 
 ## 后续
 
-- change 6：托盘与常驻（未开始）
 - change 7：打包与三平台 CI

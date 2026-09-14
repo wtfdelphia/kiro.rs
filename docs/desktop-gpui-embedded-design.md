@@ -293,6 +293,15 @@ v2 设计在 `on_app_quit` 里停服务器并等待最多 10 秒，这个方案�
 > b) 不用 `tray-icon`，直接用 `ksni` crate 做 StatusNotifierItem（纯 D-Bus，
 > 无 GTK，菜单协议自带）；c) macOS/Windows 仍用 `tray-icon`，Linux 单独走
 > ksni。详见 `openspec/changes/desktop-app-shell/evidence/tray-icon-research.md`。
+>
+> **v2.3 定案（2026-09-15，change 6 实现后回填）**：`tray-icon` 0.25.0
+>（2026-09-11 发版）新增 `ksni` feature（`default-features = false` +
+> `features = ["ksni"]`），纯 D-Bus StatusNotifierItem 后端自管工作线程，
+> 无 GTK 依赖、无事件循环约束。v2.2 的三个重选方向全部作废。无 SNI 宿主
+> 时 `TrayIcon::new` 失败，降级为无托盘（常驻、退出、服务器路径不受影响）。
+> 取证：`openspec/changes/desktop-tray-resident/evidence/tray-icon-0.25-ksni.md`、
+> `spike-tray-register.md`（无宿主 `DEGRADED` / 假 watcher 在场 `REGISTER OK`
+> 双路径实测）。
 
 ### 6.2 线程与事件模型
 
@@ -317,16 +326,20 @@ cx.spawn(async move |cx| {
 
 200ms 轮询对托盘交互的延迟可接受，且零额外依赖。若后续验证 `tray-icon` 的 `set_event_handler` 回调模式与 GPUI 主循环兼容，可改为推送式。
 
-### 6.3 常驻模型：关窗拦截 + 窗口重建
+### 6.3 常驻模型：关窗拦截 + 最小化唤回
 
-GPUI 的 `PlatformWindow` trait 共 94 个方法，没有窗口级隐藏接口（逐一检查，只有软键盘、字符面板等无关项）。所以常驻不做「隐藏窗口」，做「销毁 + 重建」：
+> **v2.3 修订（2026-09-15）**：change 2 spike 实测 Linux 上销毁最后一个
+> 窗口即触发 `run()` 返回，原「销毁 + 重建」方案废弃。改为最小化 + 唤回：
+> 窗口全程存在，不存在重建路径，视图状态天然保留。
+
+GPUI 的 `PlatformWindow` trait 共 94 个方法，没有窗口级隐藏接口（逐一检查，只有软键盘、字符面板等无关项）。所以常驻不做「隐藏窗口」，做「最小化 + 唤回」：
 
 1. 窗口注册 `on_window_should_close`（签名 `Fn(&mut Window, &mut App) -> bool`，Zed `window.rs:6439`）
-2. 回调内读用户设置 `closeToTray`（默认开，存 SQLite）：
-   - 开：返回 `false` 取消原生关闭，随后调 `window.remove_window()` 销毁窗口（gpui-kit 的 `lifecycle` 测试即此写法），进程与服务器继续运行
-   - 关：返回 `true`，触发两阶段退出（5.2）
-3. 托盘单击或菜单「显示主窗口」：`cx.open_window` 重建，视图状态从 SQLite 与核心快照恢复
-4. 托盘菜单「退出」、Cmd+Q / Alt+F4：进阶段 1
+2. 回调内读用户设置 `close_to_tray`（默认开，存 SQLite `preferences` 表）：
+   - 开：`window.minimize_window()` 后返回 `false`，窗口最小化，进程与服务器继续运行
+   - 关：返回 `false` 并进两阶段退出阶段 1（5.2，阶段 2 随进程退出）
+3. 托盘单击或菜单「显示主窗口」：`window.activate_window()`（X11 走 `_NET_ACTIVE_WINDOW`，最小化窗口随之恢复聚焦）
+4. 托盘菜单「退出」、Cmd+Q / Alt+F4、关窗（`close_to_tray` 关）：四入口统一收敛 `quit::begin_phase1`
 
 托盘菜单结构：
 
@@ -339,12 +352,12 @@ kiro-rs  ·  服务器: 运行中 (127.0.0.1:3000)   ← 标题项，只读
 退出
 ```
 
-托盘图标随服务器状态切换（运行中/已停止/失败/退出中四态），图标资源走 `gpui-kit-assets` 之外的自有 assets（托盘位图不能用 SVG，需准备 PNG/ICO/icns 三套）。
+托盘图标随服务器状态切换（运行中/已停止/失败/退出中四态）。change 6 用运行时生成的 22x22 RGBA 圆点（纯色 + 透明底），位图资源（PNG/ICO/icns 三套）留给 change 7 打包。
 
-### 6.4 平台细节（v2.1 新增）
+### 6.4 平台细节（v2.3 落定）
 
 - macOS Dock 图标：GPUI 没有 activation policy API（上游无 `set_activation_policy`），常驻时 Dock 图标不会消失，这是已知体验缺口，不在本期解决
-- 开机自启：三平台各写各的原生入口，设置项存 SQLite，实现放 change 6。Windows 写注册表 `Run` 键；macOS 写 `~/Library/LaunchAgents` 下的 plist；Linux 写 `~/.config/autostart` 下的 desktop entry。三者都是文件操作，无需系统权限
+- 开机自启（change 6 已实现）：三平台各写各的原生入口，`launch_at_login` 偏好存 SQLite `preferences` 表，开关先写平台入口、成功才落库。Windows 写注册表 `Run` 键（`winreg`，本环境仅编译验证）；macOS 写 `~/Library/LaunchAgents/dev.kiro-rs.desktop.plist`（本环境仅编译验证）；Linux 写 `~/.config/autostart/dev.kiro-rs.desktop`。三者都是文件操作，无需系统权限
 - 日志：`tracing_subscriber` 输出到 `<data_dir>/kiro-rs/kiro-desktop.log`（带轮转上限），保留终端输出。常驻应用没有终端可看，文件日志是排障唯一入口
 
 ### 6.5 待 spike 验证的两个前提
@@ -362,6 +375,15 @@ kiro-rs  ·  服务器: 运行中 (127.0.0.1:3000)   ← 标题项，只读
   证据：`openspec/changes/desktop-app-shell/evidence/tray-icon-research.md`
 
 两项均不阻塞其余 change：托盘降级为「仅退出入口」也能用，常驻语义不受影响。
+
+**change 6 落定（2026-09-15）**：
+
+- 零窗口存活不成立 → 常驻改最小化，不做窗口销毁（§6.3 v2.3）
+- tray-icon 事件送达 → 0.25.0 ksni 后端 `dbus-run-session` 双路径取证：
+  无宿主 `DEGRADED`、假 watcher 在场 `REGISTER OK`（§6.1 v2.3）。
+  Xvfb 冒烟（9 项断言全过）：关窗常驻 → 进程/窗口/服务器存活 →
+  Alt+F4 两阶段退出；托盘降级日志可证。真实桌面下的托盘交互
+  （单击唤回、菜单操作）留手测
 
 ## 七、SQLite 存储与系统钥匙串（本期新增）
 
