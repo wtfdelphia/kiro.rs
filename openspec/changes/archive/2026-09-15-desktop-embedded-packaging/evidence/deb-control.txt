@@ -1,0 +1,14 @@
+ new Debian package, version 2.0.
+ size 23675868 bytes: control archive=736 bytes.
+     376 bytes,    10 lines      control              
+     833 bytes,    10 lines      md5sums              
+ Package: kiro-rs
+ Version: 0.1.0
+ Architecture: amd64
+ Installed-Size: 57412
+ Maintainer: kiro-rs maintainers
+ Priority: optional
+ Homepage: https://github.com/wtfdelphia/kiro.rs
+ Depends: libxau6, libxdmcp6, libbsd0, libmd0, libxcb1, libxcb-xkb1, libxkbcommon0, libxkbcommon-x11-0
+ Description: kiro-rs 桌面端：Anthropic Claude 兼容代理 + 管理界面 + 托盘常驻
+  (none)

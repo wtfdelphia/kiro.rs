@@ -1,0 +1,47 @@
+run: 34928807955 (push, dev-desktop @ b83aa64) 最终全绿运行
+✓ dev-desktop Desktop Release · 34928807955
+Triggered via push about 17 minutes ago
+JOBS
+✓ desktop-gate in 2m20s (ID 104252496456)
+✓ package (ubuntu-22.04, Linux, deb) in 6m42s (ID 104252949614)
+✓ package (macos-latest, macOS, dmg) in 8m5s (ID 104252949654)
+✓ package (windows-latest, Windows, nsis) in 11m31s (ID 104252949684)
+✓ release in 19s (ID 104255179729)
+
+release assets:
+kiro-desktop_0.1.0_amd64.deb 23672848
+kiro-desktop_0.1.0_x64-setup.exe 11357702
+kiro-rs_0.1.0_aarch64.dmg 12068496
+SHA256SUMS-Linux 95
+SHA256SUMS-macOS 92
+SHA256SUMS-Windows 99
+run: 34930064003 (push, dev-desktop @ 95348f0) 文档修正后确认运行，全绿
+✓ dev-desktop Desktop Release · 34930064003
+✓ desktop-gate in 2m41s (ID 104256240947)
+✓ package (macos-latest, macOS, dmg) in 6m33s (ID 104256751052)
+✓ package (windows-latest, Windows, nsis) in 12m21s (ID 104256751109)
+✓ package (ubuntu-22.04, Linux, deb) in 6m29s (ID 104256751203)
+✓ release in 33s (ID 104259078538)
+
+kiro-desktop_0.1.0_amd64.deb 23672864
+kiro-desktop_0.1.0_x64-setup.exe 11364331
+kiro-rs_0.1.0_aarch64.dmg 12068490
+SHA256SUMS-Linux 95
+SHA256SUMS-macOS 92
+SHA256SUMS-Windows 99
+
+run: 34954258947 (push, dev-desktop @ 734939b) 审查修复 + change 6 Windows 修复后的最终确认运行，全绿
+✓ dev-desktop Desktop Release · 34954258947
+✓ desktop-gate in 2m11s (ID 104332362721)
+✓ package (ubuntu-22.04, Linux, deb) in 9m18s (ID 104333042039)
+✓ package (windows-latest, Windows, nsis) in 11m36s (ID 104333042088)
+✓ package (macos-latest, macOS, dmg) in 7m36s (ID 104333042114)
+✓ release in 20s (ID 104336376822)
+
+release assets:
+kiro-desktop_0.1.0_amd64.deb 23672866
+kiro-desktop_0.1.0_x64-setup.exe 11344276
+kiro-rs_0.1.0_aarch64.dmg 12068569
+SHA256SUMS-Linux 95
+SHA256SUMS-macOS 92
+SHA256SUMS-Windows 99

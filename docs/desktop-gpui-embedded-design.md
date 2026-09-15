@@ -99,7 +99,7 @@ kiro.rs/
 
 ### 3.2 admin-ui/dist 的编译期依赖
 
-`src/admin_ui` 用 rust-embed 在编译期嵌入 `admin-ui/dist`（该目录被 gitignore，缺失时编译直接失败）。desktop 依赖根 lib，所以 desktop 的任何构建（本地与 CI）都要先满足其一：跑过 `pnpm build`，或建一个占位 `admin-ui/dist`。warning-gate 现在用的就是占位目录方案，desktop CI 沿用。
+`src/admin_ui` 用 rust-embed 在编译期嵌入 `admin-ui/dist`（该目录被 gitignore，缺失时编译直接失败）。desktop 依赖根 lib，所以 desktop 的任何构建（本地与 CI）都要先满足其一：跑过 `pnpm build`，或建一个占位 `admin-ui/dist`。warning-gate 现在用的就是占位目录方案；desktop 打包流水线最终走真实 `pnpm build`（产物内嵌可用的管理界面），占位方案只适用于纯编译门禁腿。
 
 ### 3.3 `lib.rs` 导出的最小面
 
@@ -570,17 +570,17 @@ Root
 | `tauri-bundler` | 2.9.4 | 158 万下载，但与 Tauri 应用结构绑定 | 不选 |
 | `cargo-bundle` | 0.11.0 | 能力停留在打 bundle，无更新器与签名集成 | 不选 |
 
-`cargo-packager` 与框架无关（只打已构建的二进制），配置 `packager.toml`，支持 macOS `.app`/`.dmg`、Linux `.deb`/`.AppImage`、Windows `.msi`/`.nsis`，自带可选的更新器服务端协议。其源码含完整签名配置面：macOS `signing_certificate` / `signing_certificate_password` / `MacOsNotarizationCredentials`（`config/mod.rs:662-742`）、Windows 证书 thumbprint 与摘要算法。
+`cargo-packager` 与框架无关（只打已构建的二进制），配置可放 `packager.toml` 或 `Cargo.toml` 的 `[package.metadata.packager]`，支持 macOS `.app`/`.dmg`、Linux `.deb`/`.AppImage`、Windows `.msi`/`.nsis`，自带可选的更新器服务端协议。其源码含完整签名配置面：macOS 原生读 `APPLE_CERTIFICATE` / `APPLE_CERTIFICATE_PASSWORD` 环境变量（`codesign/macos.rs:175`）、公证读 `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID`、Windows 走 `certificate_thumbprint` 配置字段。
 
 ### 10.2 流水线范围
 
-新增 `.github/workflows/desktop-release.yml`：
+新增 `.github/workflows/desktop-release.yaml`：
 
-1. 矩阵构建：`macos-latest` / `windows-latest` / `ubuntu-latest`。Linux 腿需先安装系统依赖（`libxkbcommon-x11-dev`、`libfontconfig-dev`、`libwayland-dev`、`libx11-xcb-dev`、`libasound2-dev` 等，清单以 Zed `script/linux` 为准），再在 `desktop/` 目录下 `cargo build --release`，最后 `cargo packager`
-2. warning-gate 对齐：构建前在 `desktop/` workspace 跑 `cargo check --release --all-targets --locked` + `RUSTFLAGS=-D warnings`，门禁红则不出产物；另建 `admin-ui/dist` 占位目录（3.2）
+1. 矩阵构建：`macos-latest` / `windows-latest` / `ubuntu-22.04`。Linux 腿需先安装系统依赖（实测清单：`libxkbcommon-x11-dev`、`libasound2-dev`、`libzstd-dev`、`libx11-xcb-dev`、`libxcb-xkb-dev`、`libfontconfig-dev`、`libvulkan-dev`），再在 `desktop/` 目录下 `cargo build --release`，最后 `cargo packager`
+2. warning-gate 对齐：构建前在 `desktop/` workspace 跑 `cargo check --release --all-targets --locked` + `RUSTFLAGS=-D warnings`，门禁红则不出产物；`admin-ui` 真实构建（根仓的 rust-embed 编译期依赖产物内嵌界面）
 3. 签名门控：
-   - macOS：`MACOS_CERTIFICATE` / `MACOS_CERTIFICATE_PASSWORD` / `APPLE_ID` 等 secrets 存在时走内置签名 + 公证；缺失时产出未签名 `.dmg` 并在 release 说明标注
-   - Windows：`WINDOWS_CERTIFICATE` 存在时签名，缺失时未签名
+   - macOS：`APPLE_CERTIFICATE` / `APPLE_CERTIFICATE_PASSWORD` / `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` secrets 映射为环境变量后工具原生读取，在场即签名 + 公证；缺席产出未签名 `.dmg` 并在 release 说明标注
+   - Windows：工具只读配置字段（`certificate_thumbprint`），无环境变量通道，本期不接；证书到位后经 `beforePackagingCommand` 或模板注入配置再接
    - Linux：不签名，产物附 sha256
 4. 产物上传 release，命名含平台与架构
 
@@ -591,6 +591,19 @@ Root
 ### 10.3 桌面专属资源
 
 打包需要而仓库还没有的：应用图标（1024 PNG → 各平台格式）、托盘四态图标、macOS `Info.plist` 元数据、Windows 版本信息。随 change 7 一并进仓库，路径 `desktop/assets/`。
+
+### 10.4 实测结论（change 7，2026-09-15 回填）
+
+`desktop-embedded-packaging` 实现后对本节的修订：
+
+1. 配置载体：`Cargo.toml` 的 `[package.metadata.packager]`，与 manifest 同源。键名为 camelCase（`productName`、`installerIcon`，`deny_unknown_fields` 拒绝 kebab-case）；`category` 只接受工具枚举值，取 `Utility`
+2. 格式裁剪：只打 `dmg` / `nsis` / `deb`，经 CLI `--formats` 按平台驱动。AppImage 不做（构建期外部下载工具链 + 运行期依赖 FUSE）；msi 不做（配置面重）
+3. `binaries` 显式声明主二进制：否则工具自动收集全部 bin target，会把 `src/bin/` 下的取证程序一起打进包
+4. CI Linux 构建依赖清单在首跑暴露缺口：`libfontconfig-dev` 缺失（本机预装掩盖），已补入流水线；最终清单见 10.2 第 1 条
+5. deb 运行时依赖（ldd 实测并经本机仓库校验）：`libxau6`、`libxdmcp6`、`libbsd0`、`libmd0`、`libxcb1`、`libxcb-xkb1`、`libxkbcommon0`、`libxkbcommon-x11-0`
+6. 图标：PIL 生成 8 档方形 PNG + 多尺寸 `icon.ico`，色板与 change 6 托盘同源（深色底 + (76,175,80) 绿点）；icns 由工具从 PNG 派生，仓库不存二进制 icns
+7. 产物形态：`kiro-desktop_0.1.0_amd64.deb`，control 含 Depends/Maintainer/Homepage，桌面入口与 hicolor 图标树就位；解包二进制经 `LD_LIBRARY_PATH` 补库 + Xvfb 启动，日志确认「主窗口已创建」
+8. 滚动预发布：三平台产物附 `SHA256SUMS-*`，上传 `desktop-dev-latest` 滚动 tag，release 说明标注未签名
 
 ## 十一、gpui-shell 与 gpui-wry 的必要性评估
 
@@ -622,15 +635,17 @@ Root
 | 4 | `desktop-credentials-view` | 凭据列表 + 启停/优先级/删除/测试/余额 + 添加与批量导入对话框 | gpui headless 测试；手动全流程 |
 | 5 | `desktop-settings-server-view` | 设置面板 + 服务器启停视图 + 两阶段退出（5.2） | 设置修改落 SQLite 验证；服务器启停与端口冲突手测；退出时 10 秒级在途请求收敛验证 |
 | 6 | `desktop-tray-resident` | tray-icon 集成、关窗拦截、窗口重建、托盘四态图标与菜单、开机自启 | 三平台托盘交互手测；关窗常驻 → 托盘唤回全流程 |
-| 7 | `desktop-embedded-packaging` | 自动启动服务器收尾、`packager.toml`、三平台 CI 流水线（含 Linux 系统依赖安装步骤）、签名门控、应用图标资源 | 三平台产物构建证据（绿路径）；签名缺失降级路径证据（红路径）；产物可安装冒烟 |
+| 7 | `desktop-embedded-packaging` | 自动启动服务器收尾、`Cargo.toml` 的 `[package.metadata.packager]` 打包配置、三平台 CI 流水线（含 Linux 系统依赖安装步骤）、签名门控、应用图标资源 | 三平台产物构建证据（绿路径）；签名缺失降级路径证据（红路径）；产物可安装冒烟 |
 
-> **进度注记（2026-09-14）**：change 1 至 5 已实现。change 1 至 4
+> **进度注记（2026-09-15 更新）**：change 1 至 7 全部实现。change 1 至 4
 > 各自提交（`9323be7`、`09a31f4`、`c620b82`、`c633953`），change 4
 > 之后的审核修复另立为 `desktop-review-followups`（`ebde5d1`：锁文件
 > 截断、加密文件创建权限、首启导入日志可见性、删除前自动禁用）。
 > change 5（`desktop-settings-server-view`）实现内嵌服务器状态机、
-> 两阶段退出、设置与服务视图，随本注记所在提交落库。change 6 起
-> 未开始。
+> 两阶段退出、设置与服务视图。change 6（`desktop-tray-resident`）
+> 实现托盘常驻与关窗拦截。change 7（`desktop-embedded-packaging`，
+> 随本提交落库）实现 cargo-packager 打包与三平台
+> 发布流水线，实测结论见 §10.4。
 
 依赖关系：change 1 是全部前置；change 2 用 change 1 的 `JsonCredentialStore` / `JsonConfigStore` 读取配置与凭据（解决 v2 的「shell 启动就要读配置，存储层却在 change 3」的顺序问题）；change 3 是 4/5/6 的前置（视图与服务都依赖存储层）。
 
@@ -665,7 +680,7 @@ Root
 | 双实例抢资源 | 数据目录文件锁（9.2） |
 | change 1 触碰装配链导致 CLI 回归 | 抽取前后各录一次 `/v1/models` + `/v1/messages` 冒烟比对；现有集成测试兜底 |
 | desktop 依赖的系统库让根门禁失败 | 独立 workspace 隔离（3.1）；desktop 有自己的门禁腿 |
-| `admin-ui/dist` 缺失导致 desktop 编译失败 | CI 建占位目录（3.2），本地文档说明 |
+| `admin-ui/dist` 缺失导致 desktop 编译失败 | 桌面流水线各腿真实 `pnpm build`（根门禁腿才用占位目录，3.2） |
 | 无证书导致产物无法分发 | 未签名包 + 文档说明手动信任流程；证书到位后流水线零改动生效 |
 | `cargo-packager` 版本演进 | 钉 0.11.8；升级跟 release notes |
 | admin-ui 行为在翻译中走样 | 以现有组件与其测试为语义基准，交互差异视为 bug |

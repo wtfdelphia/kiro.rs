@@ -1,0 +1,308 @@
+name: Desktop Release
+
+# change 7（desktop-embedded-packaging）：桌面端三平台打包流水线。
+#
+# 结构（与根侧流水线哲学一致）：
+# - desktop-gate：钉版工具链 + `-D warnings` 判定，红则不出产物
+# - package：三平台矩阵浮动 stable，cargo build 后 cargo-packager 打包
+# - release：产物汇总上传滚动预发布 desktop-dev-latest
+#
+# 签名门控：无证书即产出未签名包（cargo-packager 原生语义）。
+# macOS 腿把 APPLE_CERTIFICATE 等 secrets 映射为工具读取的环境变量，
+# 在场即签名 + 公证；缺席时本流水线每次运行本身就是「未签名降级
+# 路径」的运行证据。Windows 代码签名无环境变量通道（只读配置项），
+# 本期不接，见设计文档 D4。
+
+on:
+  push:
+    branches:
+      - dev-desktop
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# 滚动发布是删除重建共享的 desktop-dev-latest：不加并发控制时，
+# 连续推送产生的重叠运行会在 delete+重建序列上互相打穿
+concurrency:
+  group: desktop-release
+  cancel-in-progress: true
+
+jobs:
+  desktop-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # 根 lib 的 rust-embed 编译期依赖；桌面腿真实构建前端
+      #（产物内嵌可用的管理界面），不用占位
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 11
+
+      - name: Build admin-ui
+        working-directory: admin-ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      # GPUI 构建依赖（change 2 spike 实证清单）
+      - name: Install GPUI system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-x11-dev \
+            libasound2-dev \
+            libzstd-dev \
+            libx11-xcb-dev \
+            libxcb-xkb-dev \
+            libfontconfig-dev \
+            libvulkan-dev
+
+      # 门禁钉版：与根侧 warning-gate 同一度量衡（见
+      # docs/warning-gate-two-line-defense-design.md）
+      - name: Setup pinned Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+
+      - name: Assert pinned toolchain
+        run: |
+          set -euo pipefail
+          ACTUAL="$(rustc --version)"
+          echo "rustc: ${ACTUAL}"
+          if [[ "${ACTUAL}" != *"1.97.1"* ]]; then
+            echo "::error::Desktop gate expects rustc 1.97.1 but found: ${ACTUAL}"
+            exit 1
+          fi
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop -> target
+          shared-key: "desktop-gate"
+          cache-on-failure: true
+
+      # 桌面门禁口径（desktop/README.md）：-D warnings + --locked，
+      # 在独立 workspace 内判定，不触达根仓
+      - name: Desktop warning gate
+        working-directory: desktop
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo check --release --all-targets --locked
+
+  package:
+    needs: desktop-gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macOS
+            format: dmg
+          - os: windows-latest
+            name: Windows
+            format: nsis
+          - os: ubuntu-22.04
+            name: Linux
+            format: deb
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 11
+
+      - name: Build admin-ui
+        working-directory: admin-ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Install GPUI system dependencies (Linux)
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-x11-dev \
+            libasound2-dev \
+            libzstd-dev \
+            libx11-xcb-dev \
+            libxcb-xkb-dev \
+            libfontconfig-dev \
+            libvulkan-dev
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop -> target
+          shared-key: "desktop-release-${{ matrix.os }}"
+          cache-on-failure: true
+
+      # 钉版安装 + 二进制缓存（cargo install 全量编译约数分钟）
+      - name: Cache cargo-packager
+        id: packager-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-packager
+            ~/.cargo/bin/cargo-packager.exe
+          key: cargo-packager-0.11.8-${{ matrix.os }}
+
+      - name: Install cargo-packager
+        if: steps.packager-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-packager --version 0.11.8 --locked
+
+      - name: Build desktop app
+        working-directory: desktop
+        run: cargo build --release --locked
+
+      # macOS 签名 + 公证：secrets 在场即生效（工具原生读取这些变量）；
+      # 缺席产出未签名包，不报错
+      - name: Package (${{ matrix.format }})
+        working-directory: desktop
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: cargo packager --release --formats ${{ matrix.format }}
+
+      - name: Stage artifacts with checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p staged
+          # packager 产物落在 desktop/target/release/（metadata 模式
+          # 默认 out_dir = 目标目录）。按格式收窄匹配：裸 '*.exe'
+          # 会把原始构建产物与 src/bin/ 取证程序一起收进来
+          case "${{ matrix.format }}" in
+            dmg)  PATTERN='*.dmg' ;;
+            deb)  PATTERN='*.deb' ;;
+            nsis) PATTERN='*-setup.exe' ;;
+            *)    echo "::error::unknown format"; exit 1 ;;
+          esac
+          find desktop/target/release -maxdepth 1 \
+            -name "$PATTERN" -type f -print0 | while IFS= read -r -d '' f; do
+            cp "$f" staged/
+          done
+          ls -la staged
+          test -n "$(find staged -type f | head -n 1)" || {
+            echo "::error::No package artifacts produced"
+            exit 1
+          }
+          cd staged
+          if command -v sha256sum >/dev/null; then
+            sha256sum * > SHA256SUMS-${{ matrix.name }}
+          else
+            shasum -a 256 * > SHA256SUMS-${{ matrix.name }}
+          fi
+          cat SHA256SUMS-${{ matrix.name }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: kiro-desktop-${{ matrix.name }}
+          if-no-files-found: error
+          compression-level: 6
+          path: staged/*
+
+  release:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Determine release identity
+        id: version
+        shell: bash
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      # 签名状态按 APPLE_CERTIFICATE 是否在场动态写入正文，
+      # 避免证书接入后仍声称「全部未签名」（secrets 不出现在日志，
+      # 表达式只比较是否为空）
+      - name: Determine signing status
+        id: signing
+        shell: bash
+        env:
+          HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
+        run: |
+          if [ "${HAS_APPLE_CERT}" = "true" ]; then
+            NOTE="macOS 产物已签名并公证（APPLE_CERTIFICATE 已配置）；Windows 签名本期未接入，Linux 不签名"
+          else
+            NOTE="**本期所有产物均为未签名构建**：签名证书未配置，安装时需按平台流程信任未签名包；证书到位后同一流水线零改动生效"
+          fi
+          echo "note=${NOTE}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: release-assets
+          pattern: kiro-desktop-*
+          merge-multiple: true
+
+      - name: List release assets
+        run: |
+          set -euo pipefail
+          find release-assets -type f -print
+          test -n "$(find release-assets -type f | head -n 1)"
+
+      - name: Move rolling tag to current commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git tag -f desktop-dev-latest "${{ github.sha }}"
+          git push origin refs/tags/desktop-dev-latest --force
+
+      - name: Recreate prerelease shell for clean asset replace
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release delete desktop-dev-latest --yes 2>/dev/null || true
+
+      - name: Create or update GitHub prerelease
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: desktop-dev-latest
+          name: Desktop rolling build (${{ steps.version.outputs.short_sha }})
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          make_latest: false
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            Automated desktop rolling prerelease（change 7 流水线）。
+
+            - Rolling tag: `desktop-dev-latest`
+            - Commit: ${{ github.sha }}
+            - 三平台：macOS (dmg) / Windows (nsis) / Linux (deb)
+            - ${{ steps.signing.outputs.note }}
+            - 校验：见 `SHA256SUMS-*` 文件
+          files: |
+            release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

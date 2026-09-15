@@ -109,6 +109,48 @@ SQLite 库为空（无凭据且无配置）时，首启按顺序探测两个目�
 | `secrets.enc` / `secrets.key` | 钥匙串不可用时的加密文件回退（0600） |
 | `kiro-desktop.log` / `kiro-desktop.lock` | 日志与单实例锁（change 2） |
 
+## 打包（change 7）
+
+打包走 `cargo-packager`（0.11.8），配置在 `crates/kiro-desktop/Cargo.toml`
+的 `[package.metadata.packager]`；格式经 `--formats` 按平台驱动，
+只打 `dmg`（macOS）/ `nsis`（Windows）/ `deb`（Linux），不做 AppImage
+（需 FUSE + 构建期外部下载）。产物落在 `target/release/`。
+
+```bash
+cd desktop
+
+# 一次性装工具（钉版）
+cargo install cargo-packager --version 0.11.8 --locked
+
+# 先构建再打包（Linux 示例；产物 *.deb）
+cargo build --release --locked
+cargo packager --release --formats deb
+
+# 结构校验 + 解包启动（脚本在 openspec/changes/desktop-embedded-packaging/evidence/）
+dpkg-deb -I target/release/kiro-desktop_0.1.0_amd64.deb
+```
+
+deb 运行时依赖（ldd 实测写入 Depends）：`libxau6`、`libxdmcp6`、
+`libbsd0`、`libmd0`、`libxcb1`、`libxcb-xkb1`、`libxkbcommon0`、
+`libxkbcommon-x11-0`。
+
+### 签名 secrets 映射（`.github/workflows/desktop-release.yaml`）
+
+签名走 cargo-packager 原生语义：secrets 在场即签名 + 公证，缺席产出
+未签名包不报错。本期所有产物均为未签名构建。
+
+| GitHub secret | 工具读取的环境变量 | 作用 |
+| --- | --- | --- |
+| `APPLE_CERTIFICATE` | `APPLE_CERTIFICATE` | macOS 签名证书（base64 p12） |
+| `APPLE_CERTIFICATE_PASSWORD` | `APPLE_CERTIFICATE_PASSWORD` | 证书口令 |
+| `APPLE_ID` | `APPLE_ID` | 公证账号 |
+| `APPLE_PASSWORD` | `APPLE_PASSWORD` | 应用专用密码 |
+| `APPLE_TEAM_ID` | `APPLE_TEAM_ID` | 团队 ID |
+
+Windows 签名本期不接：工具只读 `certificate_thumbprint` 配置字段，
+无环境变量通道（见设计文档 §10.2）。三平台产物附 `SHA256SUMS-*`，
+上传滚动预发布 `desktop-dev-latest`。
+
 ## 告警纪律
 
 与根仓一致：零新增编译告警。判定命令即上面的 `cargo check --release
@@ -117,4 +159,8 @@ SQLite 库为空（无凭据且无配置）时，首启按顺序探测两个目�
 
 ## 后续
 
-- change 7：打包与三平台 CI
+- 签名证书到位后接入（macOS 签名 + 公证；Windows 经
+  `certificate_thumbprint` 配置）
+- AppImage / msi 格式（可加项，配置一行）
+- 自动更新（cargo-packager 更新器协议）
+- 正式发版版本策略（随首个公开版本另立）

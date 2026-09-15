@@ -1,0 +1,7 @@
+run: 34925224697 (workflow_dispatch, tmp/desktop-gate-negative @ 3217e7c)
+desktop-gate	Desktop warning gate	2026-09-15T03:31:27.1029188Z     Checking serde_path_to_error v0.1.20
+desktop-gate	Desktop warning gate	2026-09-15T03:32:06.1919012Z error: function `gate_negative_probe` is never used
+desktop-gate	Desktop warning gate	2026-09-15T03:32:06.1923679Z    = help: to override `-D warnings` add `#[expect(dead_code)]` or `#[allow(dead_code)]`
+desktop-gate	Desktop warning gate	2026-09-15T03:32:06.2242736Z error: could not compile `kiro-desktop` (bin "kiro-desktop") due to 1 previous error
+desktop-gate	Desktop warning gate	2026-09-15T03:32:06.4313145Z error: could not compile `kiro-desktop` (bin "kiro-desktop" test) due to 1 previous error
+desktop-gate	Desktop warning gate	2026-09-15T03:32:06.4724841Z ##[error]Process completed with exit code 101.

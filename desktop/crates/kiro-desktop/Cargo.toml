@@ -39,3 +39,38 @@ tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 gpui = { package = "gpui-pre", version = "0.3.4", features = ["test-support"] }
 gpui-kit = { version = "0.6", features = ["test-support"] }
+
+# change 7：cargo-packager 打包配置（design D1：配置放 manifest，
+# formats 经 CLI `--formats` 按平台驱动，不在共享配置里写死，
+# 避免 Linux 默认格式带上需要 FUSE + 外部下载的 AppImage）。
+# 图标 / installer-icon 相对 crate 目录；binaries/out_dir 默认指向
+# target/<profile>，无需手写。
+[package.metadata.packager]
+productName = "kiro-rs"
+identifier = "dev.kiro-rs.desktop"
+description = "kiro-rs 桌面端：Anthropic Claude 兼容代理 + 管理界面 + 托盘常驻"
+homepage = "https://github.com/wtfdelphia/kiro.rs"
+authors = ["kiro-rs maintainers"]
+category = "Utility"
+icons = ["../../assets/icons/icon_*.png"]
+
+# 显式声明：metadata 模式下工具自动收集全部 bin target，
+# 不声明会把 src/bin/ 下两个 spike 取证程序一起打进包
+[[package.metadata.packager.binaries]]
+path = "kiro-desktop"
+main = true
+
+[package.metadata.packager.deb]
+depends = [
+    "libxau6",
+    "libxdmcp6",
+    "libbsd0",
+    "libmd0",
+    "libxcb1",
+    "libxcb-xkb1",
+    "libxkbcommon0",
+    "libxkbcommon-x11-0",
+]
+
+[package.metadata.packager.nsis]
+installerIcon = "../../assets/icons/icon.ico"

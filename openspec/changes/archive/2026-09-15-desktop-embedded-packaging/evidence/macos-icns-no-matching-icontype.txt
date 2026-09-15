@@ -1,0 +1,5 @@
+run: 34925219921 job 104242183650 (macos dmg)：tauri-icns 无 (1024,1024,1) 类型映射，1024 PNG 需按 @2x 命名
+修复：icon_1024.png 改名 icon_512@2x.png（density 2 → RGBA32_512x512_2x）
+package (macos-latest, macOS, dmg)	Package (dmg)	2026-09-15T03:42:40.0036250Z  INFO Packaging kiro-rs.app (/Users/runner/work/kiro.rs/kiro.rs/desktop/target/release/kiro-rs.app)
+package (macos-latest, macOS, dmg)	Package (dmg)	2026-09-15T03:42:40.0089290Z ERROR No matching IconType
+package (macos-latest, macOS, dmg)	Package (dmg)	2026-09-15T03:42:40.0138940Z ##[error]Process completed with exit code 1.

@@ -1,0 +1,13 @@
+run: 34924436577 (push, dev-desktop @ 0e02ba1)：首跑暴露 CI apt 清单缺 libfontconfig-dev，修复见 desktop-release.yaml
+desktop-gate	Desktop warning gate	2026-09-15T03:18:30.9034747Z   Downloaded serde_path_to_error v0.1.20
+desktop-gate	Desktop warning gate	2026-09-15T03:18:31.0895254Z   Downloaded yeslogic-fontconfig-sys v6.0.1
+desktop-gate	Desktop warning gate	2026-09-15T03:18:31.6865766Z   Downloaded fontconfig-parser v0.5.8
+desktop-gate	Desktop warning gate	2026-09-15T03:18:31.7462467Z   Downloaded thiserror v1.0.69
+desktop-gate	Desktop warning gate	2026-09-15T03:18:31.8443910Z   Downloaded quick-error v1.2.3
+desktop-gate	Desktop warning gate	2026-09-15T03:18:31.8457661Z   Downloaded quick-error v2.0.1
+desktop-gate	Desktop warning gate	2026-09-15T03:18:31.9920167Z   Downloaded thiserror-impl v1.0.69
+desktop-gate	Desktop warning gate	2026-09-15T03:18:31.9934287Z   Downloaded thiserror-impl v2.0.20
+desktop-gate	Desktop warning gate	2026-09-15T03:18:32.0748441Z   Downloaded thiserror v2.0.20
+desktop-gate	Desktop warning gate	2026-09-15T03:18:51.5712446Z    Compiling thiserror v2.0.20
+desktop-gate	Desktop warning gate	2026-09-15T03:18:52.8343241Z    Compiling thiserror-impl v2.0.20
+desktop-gate	Desktop warning gate	2026-09-15T03:19:09.2522802Z     Checking fontconfig-parser v0.5.8
