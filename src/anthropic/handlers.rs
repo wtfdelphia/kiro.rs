@@ -222,6 +222,42 @@ fn models_from_catalog(
 fn static_fallback_models() -> Vec<Model> {
     vec![
         Model {
+            id: "claude-opus-5-5".to_string(),
+            object: "model".to_string(),
+            created: 1790035200, // Sep 22, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
+            id: "claude-opus-5-5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1790035200, // Sep 22, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5.5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
+            id: "claude-fable-5-1".to_string(),
+            object: "model".to_string(),
+            created: 1756684800, // Sep 1, 2025（上游注释误标 2026，实测为此值）
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Fable 5.1".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
+            id: "claude-fable-5-1-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1756684800, // Sep 1, 2025（上游注释误标 2026，实测为此值）
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Fable 5.1 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
             id: "claude-sonnet-5".to_string(),
             object: "model".to_string(),
             created: 1782777600, // Jun 30, 2026
@@ -785,7 +821,8 @@ pub(crate) fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let is_adaptive_thinking = (model_lower.contains("opus")
         && (model_lower.contains("4-6") || model_lower.contains("4.6")))
         || model_lower.contains("sonnet-5")
-        || model_lower.contains("opus-5");
+        || model_lower.contains("opus-5")
+        || model_lower.contains("fable");
 
     let thinking_type = if is_adaptive_thinking {
         "adaptive"
@@ -1304,6 +1341,10 @@ mod tests {
         assert!(ids.contains(&"claude-sonnet-5-thinking"));
         assert!(ids.contains(&"claude-opus-5"));
         assert!(ids.contains(&"claude-opus-5-thinking"));
+        assert!(ids.contains(&"claude-opus-5-5"));
+        assert!(ids.contains(&"claude-opus-5-5-thinking"));
+        assert!(ids.contains(&"claude-fable-5-1"));
+        assert!(ids.contains(&"claude-fable-5-1-thinking"));
         assert!(ids.contains(&"claude-sonnet-4-6"));
         assert!(ids.contains(&"claude-haiku-4-5-20251001"));
         assert!(models.iter().all(|m| m.object == "model"));
@@ -1343,6 +1384,32 @@ mod tests {
             payload.output_config.map(|c| c.effort),
             Some("high".to_string())
         );
+    }
+
+    #[test]
+    fn fable_thinking_uses_adaptive_and_high_effort() {
+        let mut payload = thinking_payload("claude-fable-5-1-thinking");
+
+        override_thinking_from_model_name(&mut payload);
+
+        let thinking = payload.thinking.expect("thinking must be set");
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.budget_tokens, 20000);
+        assert_eq!(
+            payload.output_config.map(|c| c.effort),
+            Some("high".to_string())
+        );
+    }
+
+    #[test]
+    fn opus_5_5_thinking_uses_adaptive_via_opus_5_match() {
+        // 5.5 经由既有 opus-5 包含匹配落入 adaptive，无需独立分支
+        let mut payload = thinking_payload("claude-opus-5-5-thinking");
+
+        override_thinking_from_model_name(&mut payload);
+
+        let thinking = payload.thinking.expect("thinking must be set");
+        assert_eq!(thinking.thinking_type, "adaptive");
     }
 
     #[test]
