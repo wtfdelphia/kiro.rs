@@ -184,7 +184,11 @@ pub fn normalize_claude_model(model: &str) -> Option<String> {
         .strip_suffix(THINKING_SUFFIX)
         .unwrap_or(model_lower.as_str());
 
-    if base.contains("sonnet") {
+    if base.contains("fable") {
+        // Kiro 侧 id 为点号形式 claude-fable-5.1（上游实测连字符形式被拒）。
+        // 目前 Kiro 仅上线 5.1 一个 Fable 版本，与 haiku 分支一致无条件映射。
+        Some("claude-fable-5.1".to_string())
+    } else if base.contains("sonnet") {
         if base.contains("sonnet-5") {
             Some("claude-sonnet-5".to_string())
         } else if base.contains("4-6") || base.contains("4.6") {
@@ -201,7 +205,10 @@ pub fn normalize_claude_model(model: &str) -> Option<String> {
         }
     } else if base.contains("opus") {
         // 具体版本先于宽松版本：避免将来的 opus-5-x 被 4-x 分支提前截获。
-        if base.contains("opus-5") {
+        // 5.5 必须先于 5 判定：contains("opus-5") 会同时匹配 opus-5.5 / opus-5-5。
+        if base.contains("opus-5-5") || base.contains("opus-5.5") {
+            Some("claude-opus-5.5".to_string())
+        } else if base.contains("opus-5") {
             Some("claude-opus-5".to_string())
         } else if base.contains("4-8") || base.contains("4.8") {
             Some("claude-opus-4.8".to_string())
@@ -351,11 +358,13 @@ pub fn resolve_model(
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// Sonnet 5 / Opus 4.7 / 4.8 / Opus 5 同 1M
+/// Sonnet 5 / Opus 4.7 / 4.8 / Opus 5 / 5.5 / Fable 5.1 同 1M
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
         Some(mapped)
-            if mapped == "claude-sonnet-5"
+            if mapped == "claude-fable-5.1"
+                || mapped == "claude-opus-5.5"
+                || mapped == "claude-sonnet-5"
                 || mapped == "claude-opus-5"
                 || mapped == "claude-sonnet-4.6"
                 || mapped == "claude-opus-4.6"
@@ -628,7 +637,11 @@ fn process_message_content(
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
-                                let result_content = extract_tool_result_content(&block.content);
+                                // tool_result 内容中可能夹带 image 块（如读图、截图类工具），
+                                // 需一并提取，否则图片会被静默丢弃
+                                let (result_content, result_images) =
+                                    extract_tool_result_content(&block.content);
+                                images.extend(result_images);
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mut result = if is_error {
@@ -668,21 +681,44 @@ fn get_image_format(media_type: &str) -> Option<String> {
 }
 
 /// 提取工具结果内容
-fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
-    match content {
+///
+/// 返回 (文本内容, 图片列表)。
+///
+/// tool_result 的 content 数组里除 text 块外，还可能包含 image 块——
+/// 例如读取图片文件、渲染 PDF 页、浏览器截图这类工具的返回。Kiro 的
+/// ToolResult 结构只承载文本，故此处把 image 块单独提出来，由调用方
+/// 合并进 UserInputMessage.images 一起上送，避免图片被静默丢弃。
+fn extract_tool_result_content(content: &Option<serde_json::Value>) -> (String, Vec<KiroImage>) {
+    let mut images = Vec::new();
+    let text = match content {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Array(arr)) => {
             let mut parts = Vec::new();
             for item in arr {
                 if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                     parts.push(text.to_string());
+                    continue;
+                }
+                // 形如 {"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}
+                if item.get("type").and_then(|v| v.as_str()) == Some("image") {
+                    if let Some(source) = item.get("source") {
+                        let media_type = source
+                            .get("media_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        let data = source.get("data").and_then(|v| v.as_str());
+                        if let (Some(format), Some(data)) = (get_image_format(media_type), data) {
+                            images.push(KiroImage::from_base64(format, data));
+                        }
+                    }
                 }
             }
             parts.join("\n")
         }
         Some(v) => v.to_string(),
         None => String::new(),
-    }
+    };
+    (text, images)
 }
 
 /// 验证并过滤 tool_use/tool_result 配对
@@ -1383,6 +1419,105 @@ mod tests {
             Some("claude-opus-5".to_string())
         );
         assert_eq!(get_context_window_size("claude-opus-5"), 1_000_000);
+    }
+    #[test]
+    fn test_map_model_opus_5_5() {
+        for name in [
+            "claude-opus-5-5",
+            "claude-opus-5.5",
+            "claude-opus-5-5-thinking",
+            "claude-opus-5.5-20260922",
+        ] {
+            assert_eq!(
+                map_model(name),
+                Some("claude-opus-5.5".to_string()),
+                "{name} should map to claude-opus-5.5"
+            );
+        }
+        assert_eq!(get_context_window_size("claude-opus-5-5"), 1_000_000);
+    }
+
+    #[test]
+    fn test_map_model_opus_5_not_captured_by_5_5() {
+        // 5.5 分支不得吞掉 opus-5
+        assert_eq!(
+            map_model("claude-opus-5"),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-5-thinking"),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4-5-20251101"),
+            Some("claude-opus-4.5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_map_model_fable_5_1() {
+        // 客户端连字符拼写与 Kiro 点号拼写均归一到点号形式
+        assert_eq!(
+            map_model("claude-fable-5-1"),
+            Some("claude-fable-5.1".to_string())
+        );
+        assert_eq!(
+            map_model("claude-fable-5.1"),
+            Some("claude-fable-5.1".to_string())
+        );
+        // thinking 后缀不影响归一
+        assert_eq!(
+            map_model("claude-fable-5-1-thinking"),
+            Some("claude-fable-5.1".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-fable-5-1"), 1_000_000);
+    }
+
+    #[test]
+    fn test_tool_result_images_are_extracted() {
+        // tool_result 内容夹带 image 块时，图片必须随文本一起提取，不得丢弃
+        let content = serde_json::json!([
+            {
+                "type": "tool_result",
+                "tool_use_id": "tool_1",
+                "content": [
+                    { "type": "text", "text": "截图如下" },
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "aGVsbG8="
+                        }
+                    }
+                ]
+            }
+        ]);
+        let (text, images, tool_results) = process_message_content(&content).unwrap();
+        assert_eq!(tool_results.len(), 1);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format, "png");
+        assert_eq!(images[0].source.bytes, "aGVsbG8=");
+        assert!(text.is_empty(), "图片块不应产生文本");
+    }
+
+    #[test]
+    fn test_tool_result_without_images_unchanged() {
+        // 无 image 块时行为与修复前一致：只提取文本
+        let content = serde_json::json!([
+            {
+                "type": "tool_result",
+                "tool_use_id": "tool_1",
+                "content": [{ "type": "text", "text": "done" }]
+            }
+        ]);
+        let (_text, images, tool_results) = process_message_content(&content).unwrap();
+        assert_eq!(tool_results.len(), 1);
+        assert!(images.is_empty());
+        let text = tool_results[0].content[0]
+            .get("text")
+            .and_then(|v| v.as_str());
+        assert_eq!(text, Some("done"));
     }
 
     #[test]
